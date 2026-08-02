@@ -1,4 +1,4 @@
-use alloc::format;
+use alloc::{format, string::ToString};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use arm_scmi_rs::{Scmi, Shmem, Smc};
@@ -6,10 +6,11 @@ use ax_kspin::SpinNoIrq as Mutex;
 use fdt_edit::Phandle;
 use log::{info, warn};
 
-use crate::{DriverGeneric, mmio::iomap, probe::OnProbeError, register::ProbeFdt};
+use crate::{DriverGeneric, KError, mmio::iomap, probe::OnProbeError, register::ProbeFdt};
 
 const SCMI_SHMEM_SIZE: usize = 0x100;
 const RK3588_SCMI_SHMEM_BASE: usize = 0x10f000;
+const SCMI_CLOCK_PROTOCOL_ID: u32 = 0x14;
 
 static SCMI: Mutex<Option<Scmi<Smc>>> = Mutex::new(None);
 static SCMI_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -73,11 +74,49 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     *SCMI.lock() = Some(scmi);
     SCMI_REGISTERED.store(true, Ordering::Release);
     plat_dev.register(ScmiDevice);
+    if let Some(clock_phandle) = clock_protocol_phandle(&info)? {
+        plat_dev
+            .register_fdt_phandle(
+                clock_phandle,
+                rdif_clk::Clk::new(ScmiClockProvider { clock_phandle }),
+            )
+            .map_err(|error| OnProbeError::other(error.to_string()))?;
+        info!(
+            "SCMI clock protocol registered: phandle={clock_phandle:?}, protocol={:#x}",
+            SCMI_CLOCK_PROTOCOL_ID
+        );
+    } else {
+        warn!("[{}] has no SCMI clock protocol", info.node.name());
+    }
     info!(
         "SCMI SMC registered: smc_id={:#x}, shmem_phandle={}, shmem={:#x}+{:#x}",
         smc_id, shmem_phandle, shmem_addr, shmem_size
     );
     Ok(())
+}
+
+fn clock_protocol_phandle(
+    info: &crate::register::FdtInfo<'_>,
+) -> Result<Option<Phandle>, OnProbeError> {
+    let Some(protocol) = rdrive::probe::fdt::child_nodes(info.node)
+        .into_iter()
+        .find(|child| {
+            child
+                .as_node()
+                .get_property("reg")
+                .and_then(|property| property.get_u32())
+                == Some(SCMI_CLOCK_PROTOCOL_ID)
+        })
+    else {
+        return Ok(None);
+    };
+    let phandle = protocol.as_node().phandle().ok_or_else(|| {
+        OnProbeError::other(format!(
+            "[{}] SCMI clock protocol has no phandle",
+            protocol.name()
+        ))
+    })?;
+    Ok(Some(phandle))
 }
 
 pub fn clock_rate(_phandle: Phandle, clock_id: u32) -> Option<u64> {
@@ -206,4 +245,34 @@ impl DriverGeneric for ScmiDevice {
     fn name(&self) -> &str {
         "arm-scmi-smc"
     }
+}
+
+struct ScmiClockProvider {
+    clock_phandle: Phandle,
+}
+
+impl DriverGeneric for ScmiClockProvider {
+    fn name(&self) -> &str {
+        "arm-scmi-clock"
+    }
+}
+
+impl rdif_clk::Interface for ScmiClockProvider {
+    fn perper_enable(&mut self) {}
+
+    fn enable(&mut self, id: rdif_clk::ClockId) -> Result<(), KError> {
+        enable_clock(self.clock_phandle, clock_id(id)?).ok_or(KError::Io)
+    }
+
+    fn get_rate(&self, id: rdif_clk::ClockId) -> Result<u64, KError> {
+        clock_rate(self.clock_phandle, clock_id(id)?).ok_or(KError::Io)
+    }
+
+    fn set_rate(&mut self, id: rdif_clk::ClockId, rate: u64) -> Result<(), KError> {
+        set_clock_rate(self.clock_phandle, clock_id(id)?, rate).ok_or(KError::Io)
+    }
+}
+
+fn clock_id(id: rdif_clk::ClockId) -> Result<u32, KError> {
+    u32::try_from(id.raw()).map_err(|_| KError::InvalidArg { name: "clock_id" })
 }
