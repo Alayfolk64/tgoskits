@@ -1,7 +1,7 @@
 use pcie::PcieController;
 pub use rdif_base::DriverGeneric;
 
-use crate::{Descriptor, Phandle, error::RegisterFdtPhandleError};
+use crate::{Descriptor, error::FdtChildProviderError, probe::fdt::FdtChild};
 
 pub struct Empty;
 
@@ -36,33 +36,35 @@ impl PlatformDevice {
         });
     }
 
-    /// Registers a capability against an existing FDT provider phandle.
+    /// Publishes a capability on an available direct FDT child.
     ///
-    /// This is intended for firmware transports whose child protocol node is
-    /// the provider referenced by consumers, while the parent transport node
-    /// owns probe and initialization.
+    /// The child handle must have been prepared from the [`crate::register::FdtInfo`]
+    /// associated with this platform device. Rdrive validates ownership and
+    /// publishes the child's own firmware identity and lifecycle state.
     ///
     /// # Errors
     ///
-    /// Returns [`RegisterFdtPhandleError::UnknownPhandle`] when `phandle` was
-    /// not present in the FDT used to initialize rdrive.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the same interface type is registered twice for the target
-    /// phandle, matching [`Self::register`].
-    pub fn register_fdt_phandle<T: DriverGeneric>(
+    /// Returns a typed error for invalid ownership, an unavailable child, or a
+    /// duplicate capability. The registry is unchanged on error.
+    pub fn register_fdt_child<T: DriverGeneric>(
         &self,
-        phandle: Phandle,
+        child: FdtChild,
         driver: T,
-    ) -> Result<(), RegisterFdtPhandleError> {
-        let device_id = crate::fdt_phandle_to_device_id(phandle)
-            .ok_or(RegisterFdtPhandleError::UnknownPhandle { phandle })?;
-        let mut descriptor = self.descriptor.clone();
-        descriptor.device_id = device_id;
-        descriptor.irq_parent = None;
-        crate::edit(|manager| manager.dev_container.insert(descriptor, driver));
-        Ok(())
+    ) -> Result<(), FdtChildProviderError> {
+        crate::probe::fdt::commit_child_provider(self, child, driver)
+    }
+
+    /// Atomically publishes the parent transport and one FDT child capability.
+    ///
+    /// All ownership and duplicate checks run before either capability becomes
+    /// visible, so callers can safely retry a failed probe.
+    pub fn register_with_fdt_child<P: DriverGeneric, C: DriverGeneric>(
+        &self,
+        parent_driver: P,
+        child: FdtChild,
+        child_driver: C,
+    ) -> Result<(), FdtChildProviderError> {
+        crate::probe::fdt::commit_parent_and_child(self, parent_driver, child, child_driver)
     }
 
     pub fn register_pcie(&self, drv: PcieController) {
