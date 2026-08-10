@@ -74,7 +74,8 @@ test-suit/starryos/
       board-orangepi-5-plus.toml
     native-network-smoke/
       board-orangepi-5-plus.toml
-      iperf-smoke.sh
+      iperf-bench.sh
+      run-bench.sh
 ```
 
 `qemu/system` 是统一的 SMP4 聚合 QEMU case。`qemu/` 根目录只放四架构 build
@@ -349,7 +350,7 @@ os/StarryOS/configs/board/<board>.toml
 
 ```toml
 session_files = [
-  "iperf-smoke.sh",
+  "iperf-bench.sh",
   "tools/network/probe.sh",
 ]
 ```
@@ -415,14 +416,29 @@ App 的 `board-<name>.toml` 默认复用
 ```bash
 cargo xtask starry test board --board orangepi-5-plus
 cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
-cargo xtask starry test board -c native-network-smoke --board orangepi-5-plus --server 10.3.10.194 --port 2999
+./test-suit/starryos/board-orangepi-5-plus/native-network-smoke/run-bench.sh
 ```
 
 `native-hardware-smoke` 在一次启动中依次验证启动、PCIe、USB2、PWM 和 NPU。
-`native-network-smoke` 会等待 OrangePi 的 `eth0` 通过 DHCP 获得板测网段地址，再从
-session HTTP 端点下载 iperf 脚本，连接 `${boardServerIp}:5201` 执行 2 秒、1 Mbit/s
-的 iperf3 UDP JSON 测试，随后在 `eth1` 上验证 rtnetlink 地址增删。iperf 只验证
-下载、执行和网络连通性，不设置吞吐门槛；服务端需预先运行 iperf3 server。
+`run-bench.sh` 自动启动宿主机 iperf3 server（5201 端口已有可用服务时直接复用），
+并调用对应的 board case，因此完整测试只需上面一条命令。用例通过活动 board session
+的 `${sessionFile:iperf-bench.sh}` 等待网络并下载脚本，再使用 `${boardServerIp}`
+连接当前板卡实际可达的宿主机地址，不依赖固定网卡或固定网段；iperf 完成后继续在
+`eth1` 上验证 rtnetlink 地址增删。
+
+用例默认对 TCP TX 和 RX 各运行 3 轮，每轮使用
+`-t 10 -O 2 -l 128K`；iperf3 默认使用单流和 5201 端口。用例输出逐轮数据和中位数：
+
+```text
+STARRY_IPERF_BENCH_SAMPLE direction=tx round=1 mbps=...
+STARRY_IPERF_BENCH_RESULT direction=tx median_mbps=...
+STARRY_IPERF_BENCH_RESULT direction=rx median_mbps=...
+STARRY_IPERF_BENCH_PASSED
+```
+
+JSON 原始结果保存在板端 `/tmp/starry-iperf-bench/`。用例只要求两个方向完成并产生
+有效速率，不设置与机器绑定的吞吐门槛。脚本只接收 board session 动态提供的宿主机
+IP；端口和测试档位保持固定，避免不同运行使用不同参数。
 
 ROCK 4D 使用板卡服务名称 `Rock-4D`、仓库内的 RK3576 DTB 和 1,500,000 baud
 串口。维护的单核启动回归命令为：
