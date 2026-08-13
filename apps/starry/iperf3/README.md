@@ -7,22 +7,16 @@ runs, followed by the parsed median and a final summary table. Per-run text and
 the machine-readable summary remain under `/tmp/starry-iperf3-bench/` for later
 inspection.
 
-Start an iperf3 server on the host in one terminal:
-
-```bash
-iperf3 -s
-```
-
-Then run the complete benchmark from the repository root in another terminal:
+Run the complete benchmark from the repository root:
 
 ```bash
 cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
 ```
 
-The board session provides both the host address and the script URL. The app's
-`init.sh` is merged into `shell_init_cmd`, where it downloads and starts the
-benchmark script. The xtask command therefore needs neither a fixed IP address
-nor a separate board launcher.
+The board session provides both the address of the persistent iperf3 server and
+the script URL. The app's `init.sh` is merged into `shell_init_cmd`, where it
+downloads and starts the benchmark script. The xtask command therefore needs
+neither a fixed IP address nor a separate board launcher.
 
 The benchmark profile is intentionally fixed: 10 seconds, a 2-second omit,
 128K application blocks, three rounds, and a 15-second cooldown after each

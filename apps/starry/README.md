@@ -36,12 +36,11 @@ cargo xtask starry app board -t orangepi-5-plus-uvc
 ## iperf3
 
 The `iperf3` board app provides a repeatable Orange Pi 5 Plus TCP performance
-matrix. Start an iperf3 server on the host, then run the app through xtask. The
-board session supplies the board-visible host address, and the app prints three
-samples plus a median for each scenario:
+matrix. Run the app through xtask; the board session supplies the address of the
+persistent iperf3 server. The app prints three samples plus a median for each
+scenario:
 
 ```bash
-iperf3 -s
 cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
 ```
 

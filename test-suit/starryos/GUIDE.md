@@ -415,15 +415,14 @@ App 的 `board-<name>.toml` 默认复用
 ```bash
 cargo xtask starry test board --board orangepi-5-plus
 cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
-iperf3 -s
 cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
 ```
 
 `native-hardware-smoke` 在一次启动中依次验证启动、PCIe、USB2、PWM 和 NPU。
 `native-network-smoke` 只执行一条短 TCP TX 命令，随后在 `eth1` 上验证 rtnetlink
-地址增删，适合作为 CI 连通性检查。完整吞吐测试位于 `apps/starry/iperf3`。宿主机先
-运行 `iperf3 -s`，随后直接通过上面的 `cargo xtask starry app board` 命令启动板测；
-board 配置的 `shell_init_cmd` 通过活动 session 的 `${boardServerIp}` 和
+地址增删，适合作为 CI 连通性检查。完整吞吐测试位于 `apps/starry/iperf3`，直接通过
+上面的 `cargo xtask starry app board` 命令启动板测；ostool server 持续提供 iperf3
+服务，board 配置的 `shell_init_cmd` 通过活动 session 的 `${boardServerIp}` 和
 `${sessionFile:iperf-bench.sh}` 获取实际地址；app 的 `init.sh` 会按现有 xtask 流程合并
 到该命令中，下载并启动测试脚本，不依赖固定网卡、固定 IP、固定网段或额外的板测
 启动脚本。

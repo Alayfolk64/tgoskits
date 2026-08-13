@@ -17,4 +17,5 @@ fail_regex = [
   '(?m)^STARRY_IPERF3_BENCH_FAILED$',
   '(?i)(iperf3|sh): .*not found',
 ]
-timeout = 600
+# The fixed matrix opens 21 connections and cools down after every round.
+timeout = 900
