@@ -1,19 +1,19 @@
 board_type = "OrangePi-5-Plus"
 session_files = [
-  "iperf-bench.sh",
+  "iperf-smoke.sh",
 ]
 shell_prefix = "root@starry:/root #"
 shell_init_cmd = '''
 suite=STARRY_NATIVE_NETWORK
-iperf_marker=STARRY_IPERF_BENCH
+iperf_marker=STARRY_IPERF_SMOKE
 rtnl_marker=STARRY_RTNL
 ok=1
 
 echo RTL8125_NET_TEST_PASSED
 
 server_ip='${boardServerIp}'
-url='${sessionFile:iperf-bench.sh}'
-script=/tmp/iperf-bench.sh
+url='${sessionFile:iperf-smoke.sh}'
+script=/tmp/iperf-smoke.sh
 
 download_script() {
   if command -v curl >/dev/null 2>&1; then
@@ -93,10 +93,10 @@ fail_regex = [
   '(?i)SIGSEGV',
   'exit with code: 139',
   '(?m)^RTL8125_NET_TEST_FAILED\b',
-  '(?m)^STARRY_IPERF_BENCH_FAILED\s*$',
+  '(?m)^STARRY_IPERF_SMOKE_FAILED\s*$',
   "(?i)(cat|sh): .*not found",
   '(?m)^STARRY_RTNL_BAD_[A-Z_]+\s*$',
   '(?m)^STARRY_RTNL_FAILED\s*$',
   '(?m)^STARRY_NATIVE_NETWORK_FAILED\s*$',
 ]
-timeout = 600
+timeout = 300

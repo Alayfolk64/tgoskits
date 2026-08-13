@@ -74,8 +74,7 @@ test-suit/starryos/
       board-orangepi-5-plus.toml
     native-network-smoke/
       board-orangepi-5-plus.toml
-      iperf-bench.sh
-      run-bench.sh
+      iperf-smoke.sh
 ```
 
 `qemu/system` 是统一的 SMP4 聚合 QEMU case。`qemu/` 根目录只放四架构 build
@@ -416,29 +415,35 @@ App 的 `board-<name>.toml` 默认复用
 ```bash
 cargo xtask starry test board --board orangepi-5-plus
 cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
-./test-suit/starryos/board-orangepi-5-plus/native-network-smoke/run-bench.sh
+./apps/starry/iperf3/run-board.sh
 ```
 
 `native-hardware-smoke` 在一次启动中依次验证启动、PCIe、USB2、PWM 和 NPU。
-`run-bench.sh` 自动启动宿主机 iperf3 server（5201 端口已有可用服务时直接复用），
-并调用对应的 board case，因此完整测试只需上面一条命令。用例通过活动 board session
-的 `${sessionFile:iperf-bench.sh}` 等待网络并下载脚本，再使用 `${boardServerIp}`
-连接当前板卡实际可达的宿主机地址，不依赖固定网卡或固定网段；iperf 完成后继续在
-`eth1` 上验证 rtnetlink 地址增删。
+`native-network-smoke` 只执行一条短 TCP TX 命令，随后在 `eth1` 上验证 rtnetlink
+地址增删，适合作为 CI 连通性检查。完整吞吐测试位于 `apps/starry/iperf3`，执行上面
+一条 `run-board.sh` 命令即可启动或复用宿主机 iperf3 server，并通过活动 board
+session 的 `${boardServerIp}` 和 `${sessionFile:iperf-bench.sh}` 获取实际地址与脚本，
+不依赖固定网卡、固定 IP 或固定网段。
 
-用例默认对 TCP TX 和 RX 各运行 3 轮，每轮使用
-`-t 10 -O 2 -l 128K`；iperf3 默认使用单流和 5201 端口。用例输出逐轮数据和中位数：
+完整 benchmark 固定执行 T01--T07：单流 TX、单流 RX、单流双向、2/4/8 流 TX 和
+4 流 RX。每个场景使用 `-t 10 -O 2 -l 128K` 连续运行 3 次，直接打印每次结果、
+中位数和最终汇总表：
 
 ```text
-STARRY_IPERF_BENCH_SAMPLE direction=tx round=1 mbps=...
-STARRY_IPERF_BENCH_RESULT direction=tx median_mbps=...
-STARRY_IPERF_BENCH_RESULT direction=rx median_mbps=...
-STARRY_IPERF_BENCH_PASSED
+T01  Single-stream DUT TX
+Command: iperf3 -c <session-host> -t 10 -O 2 -P 1 -l 128K
+
+Run 1  DUT TX: ... Mbps
+Run 2  DUT TX: ... Mbps
+Run 3  DUT TX: ... Mbps
+
+Median DUT TX: ... Mbps
+STARRY_IPERF3_BENCH_PASSED
 ```
 
-JSON 原始结果保存在板端 `/tmp/starry-iperf-bench/`。用例只要求两个方向完成并产生
-有效速率，不设置与机器绑定的吞吐门槛。脚本只接收 board session 动态提供的宿主机
-IP；端口和测试档位保持固定，避免不同运行使用不同参数。
+JSON 原始结果保存在板端 `/tmp/starry-iperf3-bench/`。benchmark 只要求所有场景完成
+并产生有效速率，不设置与机器绑定的吞吐门槛；端口和测试档位固定，避免不同运行使用
+不同参数。
 
 ROCK 4D 使用板卡服务名称 `Rock-4D`、仓库内的 RK3576 DTB 和 1,500,000 baud
 串口。维护的单核启动回归命令为：
