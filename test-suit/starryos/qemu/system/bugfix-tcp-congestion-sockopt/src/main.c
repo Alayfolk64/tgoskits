@@ -49,6 +49,19 @@ int main(void)
         goto close_socket;
     }
 
+    unsigned char untouched = 0xa5;
+    socklen_t zero_length = 0;
+    errno = 0;
+    if (syscall(SYS_getsockopt, socket_fd, IPPROTO_TCP, TCP_CONGESTION,
+                &untouched, &zero_length) != 0 ||
+        zero_length != 0 || untouched != 0xa5) {
+        fprintf(stderr,
+                "FAIL: zero-length getsockopt(TCP_CONGESTION): errno=%d "
+                "len=%u value=%u\n",
+                errno, (unsigned int)zero_length, (unsigned int)untouched);
+        failures++;
+    }
+
     errno = 0;
     if (syscall(SYS_setsockopt, socket_fd, IPPROTO_TCP, TCP_CONGESTION,
                 algorithm, strlen(algorithm)) != 0) {
