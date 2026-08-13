@@ -3,7 +3,7 @@ use core::sync::atomic::{Ordering as AtomicOrdering, fence};
 
 use ax_sync::SpinLock as Mutex;
 use dma_api::CoherentArray;
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rdif_eth::{DmaBuffer, IRxQueue, ITxQueue, NetError, QueueConfig};
 
 use crate::{
@@ -79,10 +79,11 @@ impl ITxQueue for Rtl8125TxQueue {
         self.next_submit = next;
         self.submitted = self.submitted.saturating_add(1);
         self.regs.poll_tx();
-        if self.submitted <= EARLY_PACKET_LOG_COUNT
-            || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL)
+        if log::log_enabled!(log::Level::Trace)
+            && (self.submitted <= EARLY_PACKET_LOG_COUNT
+                || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL))
         {
-            info!(
+            trace!(
                 "RTL8125 tx submitted: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
                 buffer.len,
                 self.submitted,
@@ -104,10 +105,11 @@ impl ITxQueue for Rtl8125TxQueue {
         self.next_reclaim = (idx + 1) % QUEUE_SIZE;
         let bus_addr = self.bus_addrs[idx].take()?;
         self.reclaimed = self.reclaimed.saturating_add(1);
-        if self.reclaimed <= EARLY_PACKET_LOG_COUNT
-            || self.reclaimed.is_multiple_of(TX_RECLAIM_LOG_INTERVAL)
+        if log::log_enabled!(log::Level::Trace)
+            && (self.reclaimed <= EARLY_PACKET_LOG_COUNT
+                || self.reclaimed.is_multiple_of(TX_RECLAIM_LOG_INTERVAL))
         {
-            info!(
+            trace!(
                 "RTL8125 tx reclaimed: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
                 desc.len(),
                 self.submitted,
@@ -287,8 +289,10 @@ impl IRxQueue for Rtl8125RxQueue {
         }
         let len = desc.packet_len();
         self.reclaimed = self.reclaimed.saturating_add(1);
-        if self.reclaimed.is_multiple_of(RX_RECLAIM_LOG_INTERVAL) {
-            info!(
+        if log::log_enabled!(log::Level::Trace)
+            && self.reclaimed.is_multiple_of(RX_RECLAIM_LOG_INTERVAL)
+        {
+            trace!(
                 "RTL8125 rx packet: idx={idx}, len={len}, submitted={}, reclaimed={}, status={:?}",
                 self.submitted,
                 self.reclaimed,
