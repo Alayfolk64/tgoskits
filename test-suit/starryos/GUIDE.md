@@ -426,24 +426,33 @@ session 的 `${boardServerIp}` 和 `${sessionFile:iperf-bench.sh}` 获取实际�
 不依赖固定网卡、固定 IP 或固定网段。
 
 完整 benchmark 固定执行 T01--T07：单流 TX、单流 RX、单流双向、2/4/8 流 TX 和
-4 流 RX。每个场景使用 `-t 10 -O 2 -l 128K` 连续运行 3 次，直接打印每次结果、
-中位数和最终汇总表：
+4 流 RX。每个场景使用 `-t 10 -O 2 -l 128K` 运行 3 次，每个连接结束后固定冷却
+15 秒，避免上一轮 TCP teardown 干扰下一轮；脚本直接打印原始输出、中位数和最终
+汇总表：
 
 ```text
 T01  Single-stream DUT TX
 Command: iperf3 -c <session-host> -t 10 -O 2 -P 1 -l 128K
 
-Run 1  DUT TX: ... Mbps
-Run 2  DUT TX: ... Mbps
-Run 3  DUT TX: ... Mbps
+Run 1/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
+
+Run 2/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
+
+Run 3/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
 
 Median DUT TX: ... Mbps
 STARRY_IPERF3_BENCH_PASSED
 ```
 
-JSON 原始结果保存在板端 `/tmp/starry-iperf3-bench/`。benchmark 只要求所有场景完成
-并产生有效速率，不设置与机器绑定的吞吐门槛；端口和测试档位固定，避免不同运行使用
-不同参数。
+每轮 iperf3 原始文本和机器可读汇总保存在板端 `/tmp/starry-iperf3-bench/`。
+benchmark 只要求所有场景完成并产生有效速率，不设置与机器绑定的吞吐门槛；端口和
+测试档位固定，避免不同运行使用不同参数。
 
 ROCK 4D 使用板卡服务名称 `Rock-4D`、仓库内的 RK3576 DTB 和 1,500,000 baud
 串口。维护的单核启动回归命令为：

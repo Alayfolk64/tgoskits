@@ -5,6 +5,7 @@ duration=10
 omit=2
 block_size=128K
 rounds=3
+cooldown=15
 result_dir=/tmp/starry-iperf3-bench
 summary_file=$result_dir/summary
 
@@ -14,23 +15,29 @@ fail() {
     exit 1
 }
 
-to_mbps() {
-    awk -v rate="$1" 'BEGIN { printf "%.3f", rate / 1000000 }'
-}
-
-read_rate() {
-    awk -v field="$1" '
-        $0 ~ "\"" field "\"[[:space:]]*:" && /\{/ {
-            in_field = 1
-            next
+read_receiver_mbps() {
+    awk -v role="$1" '
+        $NF == "receiver" && (role == "" || index($0, "[" role "]") != 0) {
+            for (field = 2; field <= NF; field++) {
+                unit = $field
+                if (unit == "bits/sec" || unit == "Kbits/sec" ||
+                    unit == "Mbits/sec" || unit == "Gbits/sec") {
+                    rate = $(field - 1)
+                    if (unit == "bits/sec") {
+                        rate /= 1000000
+                    } else if (unit == "Kbits/sec") {
+                        rate /= 1000
+                    } else if (unit == "Gbits/sec") {
+                        rate *= 1000
+                    }
+                    receiver_mbps = rate
+                }
+            }
         }
-        in_field && /"bits_per_second"[[:space:]]*:/ {
-            rate = $0
-            sub(/^[^:]*:[[:space:]]*/, "", rate)
-            sub(/,.*/, "", rate)
-            gsub(/[[:space:]]/, "", rate)
-            print rate
-            exit
+        END {
+            if (receiver_mbps != "") {
+                printf "%.3f\n", receiver_mbps
+            }
         }
     ' "$2"
 }
@@ -49,54 +56,56 @@ run_iperf() {
     case "$case_mode" in
         tx)
             iperf3 -c "$server_ip" -t "$duration" -O "$omit" \
-                -P "$case_streams" -l "$block_size" -J
+                -P "$case_streams" -l "$block_size"
             ;;
         rx)
             iperf3 -c "$server_ip" -t "$duration" -O "$omit" \
-                -P "$case_streams" -l "$block_size" -R -J
+                -P "$case_streams" -l "$block_size" -R
             ;;
         bidir)
             iperf3 -c "$server_ip" -t "$duration" -O "$omit" \
-                -P "$case_streams" -l "$block_size" --bidir -J
+                -P "$case_streams" -l "$block_size" --bidir
             ;;
     esac
 }
 
 record_rate() {
     record_direction=$1
-    record_field=$2
-    record_rate=$(read_rate "$record_field" "$round_result")
-    [ -n "$record_rate" ] || round_failed "$round_result"
+    record_role=$2
+    record_mbps=$(read_receiver_mbps "$record_role" "$round_result")
+    [ -n "$record_mbps" ] || round_failed "$round_result"
 
-    record_mbps=$(to_mbps "$record_rate")
     echo "$record_mbps" >>"$result_dir/$case_id-$record_direction.samples"
-    printf 'Run %s  %-6s %10s Mbps\n' \
-        "$round" "DUT $record_direction:" "$record_mbps"
+    printf 'Result  %-6s %10s Mbps\n' \
+        "DUT $record_direction:" "$record_mbps"
 }
 
 round_failed() {
-    cat "$1" >&2
     fail "$case_id round $round did not produce a complete result"
 }
 
 run_round() {
     round=$1
-    round_result=$result_dir/$case_id-$round.json
+    round_result=$result_dir/$case_id-$round.txt
 
-    run_iperf >"$round_result" 2>&1 || round_failed "$round_result"
-    if grep -q '"error"[[:space:]]*:' "$round_result" ||
-        ! grep -q '"end"[[:space:]]*:' "$round_result"; then
-        round_failed "$round_result"
+    printf 'Run %s/%s\n\n' "$round" "$rounds"
+    run_iperf 2>&1 | tee "$round_result"
+    if ! grep -q '^iperf Done\.[[:space:]]*$' "$round_result"; then
+        round_failed
     fi
 
     case "$case_mode" in
-        tx) record_rate TX sum_received ;;
-        rx) record_rate RX sum_received ;;
+        tx) record_rate TX "" ;;
+        rx) record_rate RX "" ;;
         bidir)
-            record_rate TX sum_received
-            record_rate RX sum_received_bidir_reverse
+            record_rate TX TX-C
+            record_rate RX RX-C
             ;;
     esac
+    printf '\n'
+
+    printf 'Cooldown: %s seconds\n\n' "$cooldown"
+    sleep "$cooldown"
 }
 
 summarize_direction() {
@@ -182,6 +191,7 @@ main() {
     printf '\niperf3 benchmark\n'
     printf 'Server: %s:5201\n' "$server_ip"
     printf 'Profile: 10 seconds, 2-second omit, 128K block, 3 rounds\n'
+    printf 'Isolation: %s-second cooldown after every connection\n' "$cooldown"
 
     run_case T01 "Single-stream DUT TX" tx 1
     run_case T02 "Single-stream DUT RX" rx 1
