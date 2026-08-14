@@ -79,9 +79,8 @@ impl ITxQueue for Rtl8125TxQueue {
         self.next_submit = next;
         self.submitted = self.submitted.saturating_add(1);
         self.regs.poll_tx();
-        if log::log_enabled!(log::Level::Trace)
-            && (self.submitted <= EARLY_PACKET_LOG_COUNT
-                || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL))
+        if self.submitted <= EARLY_PACKET_LOG_COUNT
+            || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL)
         {
             trace!(
                 "RTL8125 tx submitted: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
@@ -105,9 +104,8 @@ impl ITxQueue for Rtl8125TxQueue {
         self.next_reclaim = (idx + 1) % QUEUE_SIZE;
         let bus_addr = self.bus_addrs[idx].take()?;
         self.reclaimed = self.reclaimed.saturating_add(1);
-        if log::log_enabled!(log::Level::Trace)
-            && (self.reclaimed <= EARLY_PACKET_LOG_COUNT
-                || self.reclaimed.is_multiple_of(TX_RECLAIM_LOG_INTERVAL))
+        if self.reclaimed <= EARLY_PACKET_LOG_COUNT
+            || self.reclaimed.is_multiple_of(TX_RECLAIM_LOG_INTERVAL)
         {
             trace!(
                 "RTL8125 tx reclaimed: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
@@ -289,9 +287,7 @@ impl IRxQueue for Rtl8125RxQueue {
         }
         let len = desc.packet_len();
         self.reclaimed = self.reclaimed.saturating_add(1);
-        if log::log_enabled!(log::Level::Trace)
-            && self.reclaimed.is_multiple_of(RX_RECLAIM_LOG_INTERVAL)
-        {
+        if self.reclaimed.is_multiple_of(RX_RECLAIM_LOG_INTERVAL) {
             trace!(
                 "RTL8125 rx packet: idx={idx}, len={len}, submitted={}, reclaimed={}, status={:?}",
                 self.submitted,
