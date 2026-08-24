@@ -5,7 +5,7 @@ duration=10
 omit=2
 block_size=128K
 rounds=3
-cooldown=5
+cooldown=15
 result_dir=/tmp/starry-iperf3-bench
 summary_file=$result_dir/summary
 
