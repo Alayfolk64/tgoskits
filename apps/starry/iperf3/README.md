@@ -19,6 +19,6 @@ downloads and starts the benchmark script. The xtask command therefore needs
 neither a fixed IP address nor a separate board launcher.
 
 The benchmark profile is intentionally fixed: 10 seconds, a 2-second omit,
-128K application blocks, three rounds, and a 5-second cooldown after each
+128K application blocks, three rounds, and a 15-second cooldown after each
 connection so TCP teardown from one round cannot affect the next.
 `native-network-smoke` remains the short CI-oriented connectivity check.
