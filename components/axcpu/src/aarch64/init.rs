@@ -95,6 +95,10 @@ pub unsafe fn init_mmu(root_paddr: PhysAddr) {
     // unconditionally during early process startup. Without them, the
     // first userspace cache-line lookup traps as EC=0x18 and the process
     // dies with SIGTRAP before reaching `main()`.
+    //
+    // Do not inherit firmware's alignment-check policy. Linux-compatible
+    // AArch64 userspace relies on ordinary unaligned accesses to Normal memory,
+    // while some RK3588 U-Boot builds hand off with SCTLR_EL1.A set.
     SCTLR_EL1.modify(
         SCTLR_EL1::M::Enable
             + SCTLR_EL1::C::Cacheable
@@ -103,8 +107,12 @@ pub unsafe fn init_mmu(root_paddr: PhysAddr) {
             + SCTLR_EL1::DZE::DontTrap
             + SCTLR_EL1::UCI::DontTrap,
     );
-    // Disable SPAN (bit 23; not exposed as a named field by aarch64-cpu).
-    SCTLR_EL1.set(SCTLR_EL1.get() | (1 << 23));
+    // Clear A explicitly instead of relying on a zero-valued FieldValue being
+    // retained while the enabled fields above are combined. Disable SPAN (bit
+    // 23; not exposed as a named field by aarch64-cpu) in the same write.
+    const ALIGNMENT_CHECK: u64 = 1 << 1;
+    const SPAN: u64 = 1 << 23;
+    SCTLR_EL1.set((SCTLR_EL1.get() & !ALIGNMENT_CHECK) | SPAN);
     barrier::isb(barrier::SY);
 }
 

@@ -93,6 +93,8 @@ pub mod time;
 pub mod usb;
 #[cfg(virtio_dev)]
 pub mod virtio;
+#[cfg(feature = "watchdog")]
+pub mod watchdog;
 
 /// RK3588 CPU DVFS ondemand governor, exposed as a stable, arch-neutral entry
 /// the kernel can drive from a periodic task without knowing the SoC specifics.

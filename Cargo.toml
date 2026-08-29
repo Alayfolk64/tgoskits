@@ -71,6 +71,7 @@ members = [
     "drivers/rtc/*",
     "drivers/serial/*",
     "drivers/soc/rockchip/*",
+    "drivers/watchdog/*",
     "drivers/test_crates/*",
     "drivers/tpu/*",
     "drivers/vpu/*",
@@ -232,6 +233,7 @@ rdif-serial = { version = "0.10", path = "drivers/interface/rdif-serial" }
 rdif-systick = { version = "0.6", path = "drivers/interface/rdif-systick" }
 rdif-timer = { version = "0.6", path = "drivers/interface/rdif-timer" }
 rdif-vsock = { version = "0.2", path = "drivers/interface/rdif-vsock" }
+rdif-watchdog = { version = "0.1", path = "drivers/interface/rdif-watchdog" }
 rk3588-pci = { version = "0.2", path = "drivers/pci/rk3588-pci" }
 rockchip-npu = { version = "0.3", path = "drivers/npu/rockchip-npu" }
 rockchip-rga = { version = "0.2", path = "drivers/gpu/rockchip-rga" }
@@ -256,6 +258,7 @@ ktest-helper = { version = "0.1", path = "drivers/usb/utils/ktest-helper" }
 usb-if = { version = "0.8", path = "drivers/usb/usb-if" }
 usb-serial = { version = "0.1", path = "drivers/usb/usb-serial" }
 dwmmc-host = { version = "0.4", path = "drivers/blk/dwmmc-host", default-features = false }
+dw-wdt = { version = "0.1", path = "drivers/watchdog/dw-wdt" }
 phytium-mci-host = { version = "0.4", path = "drivers/blk/phytium-mci-host", default-features = false }
 cv181x-sdhci = { version = "0.1", path = "drivers/blk/cv181x-sdhci", default-features = false }
 sdhci-host = { version = "0.5", path = "drivers/blk/sdhci-host", default-features = false }

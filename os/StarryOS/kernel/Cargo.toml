@@ -117,6 +117,8 @@ sg2002-cvi-usb-camera = [
     "dep:cvi-vdec-uapi",
     "dep:sg200x-jpu",
 ]
+selfbuild-watchdog = ["ax-driver/watchdog"]
+selfbuild-watchdog-reset-test = ["selfbuild-watchdog"]
 smp = ["ax-std/smp"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]

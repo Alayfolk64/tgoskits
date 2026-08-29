@@ -196,17 +196,22 @@ clk_gate_table!(
     PCLK_UART9 => (12, 10),
     SCLK_UART9 => (14, 5),
     // ========================================================================
+    // Watchdog clock gates
+    // ========================================================================
+    PCLK_WDT0 => (15, 0),
+    TCLK_WDT0 => (15, 1),
+    // ========================================================================
     // PWM 时钟门控
     // ========================================================================
-    PCLK_PWM1 => (15, 0),
-    CLK_PWM1 => (15, 3),
+    PCLK_PWM1 => (15, 3),
+    CLK_PWM1 => (15, 4),
     CLK_PWM1_CAPTURE => (15, 5),
     PCLK_PWM2 => (15, 6),
     CLK_PWM2 => (15, 7),
     CLK_PWM2_CAPTURE => (15, 8),
-    PCLK_PWM3 => (15, 1),
-    CLK_PWM3 => (15, 4),
-    CLK_PWM3_CAPTURE => (15, 9),
+    PCLK_PWM3 => (15, 9),
+    CLK_PWM3 => (15, 10),
+    CLK_PWM3_CAPTURE => (15, 11),
     // ========================================================================
     // ADC 时钟门控
     // ========================================================================
@@ -450,14 +455,15 @@ mod tests {
         // NVM/eMMC: 7
         // RGA2: 3 (hclk/aclk/core)
         // JPEG decoder (VDPU): 2
-        // 总计: 178
+        // Watchdog: 2
+        // 总计: 180
         assert_eq!(
             CLK_GATE_TABLE.len()
                 + CLK_PMU_GATE_TABLE.len()
                 + CLK_PHP_GATE_TABLE.len()
                 + CLK_COMPOSITE_TABLE.len()
                 + CLK_PMU_COMPOSITE_TABLE.len(),
-            178
+            180
         );
     }
 
@@ -541,11 +547,24 @@ mod tests {
         // 验证 PWM gate 配置
         let pclk_pwm1 = find_gate(PCLK_PWM1);
         assert_eq!(pclk_pwm1.reg_idx, 15);
-        assert_eq!(pclk_pwm1.bit, 0);
+        assert_eq!(pclk_pwm1.bit, 3);
 
         let clk_pwm1 = find_gate(CLK_PWM1);
         assert_eq!(clk_pwm1.reg_idx, 15);
-        assert_eq!(clk_pwm1.bit, 3);
+        assert_eq!(clk_pwm1.bit, 4);
+    }
+
+    #[test]
+    fn test_watchdog_gates_match_orangepi_6_1() {
+        let pclk_wdt0 = find_gate(PCLK_WDT0);
+        assert_eq!(pclk_wdt0.bank, GateBank::Main);
+        assert_eq!(pclk_wdt0.reg_idx, 15);
+        assert_eq!(pclk_wdt0.bit, 0);
+
+        let tclk_wdt0 = find_gate(TCLK_WDT0);
+        assert_eq!(tclk_wdt0.bank, GateBank::Main);
+        assert_eq!(tclk_wdt0.reg_idx, 15);
+        assert_eq!(tclk_wdt0.bit, 1);
     }
 
     #[test]

@@ -174,6 +174,12 @@ clk_id_group!(
     CLK_PWM3_CAPTURE = 91,
 );
 
+// =============================================================================
+// Watchdog clock IDs
+// =============================================================================
+
+clk_id_group!(PCLK_WDT0 = 107, TCLK_WDT0 = 108,);
+
 // PMU PWM 在 PMU CRU 中
 clk_id_group!(
     PCLK_PMU1PWM = 676,
@@ -759,6 +765,10 @@ mod tests {
             170,
             "CLK_TSADC should match u-boot (170)"
         );
+
+        // Watchdog
+        assert_eq!(PCLK_WDT0.value(), 107);
+        assert_eq!(TCLK_WDT0.value(), 108);
     }
 
     #[test]

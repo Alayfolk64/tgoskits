@@ -40,6 +40,8 @@ rknpu = ["ax-driver/rknpu", "starry-kernel/rknpu"]
 jpeg = ["ax-driver/jpeg", "starry-kernel/jpeg"]
 rk3588-pwm = ["starry-kernel/rk3588-pwm"]
 rga = ["ax-driver/rga", "starry-kernel/rga"]
+selfbuild-watchdog = ["starry-kernel/selfbuild-watchdog"]
+selfbuild-watchdog-reset-test = ["starry-kernel/selfbuild-watchdog-reset-test"]
 stack-protector = ["ax-std/stack-protector", "starry-kernel/stack-protector"]
 
 [[bin]]

@@ -379,6 +379,10 @@ impl Cru {
     ///
     /// 返回时钟频率 (Hz)，如果不支持该时钟则返回错误
     pub fn clk_get_rate(&self, id: crate::clock::ClkId) -> ClockResult<u64> {
+        if let Some(rate) = fixed_parent_clock_rate(id) {
+            return Ok(rate);
+        }
+
         // 1. PLL 时钟
         if is_pll_clk(id) {
             let pll_id = PllId::try_from(id).map_err(|_| ClockError::unsupported(id))?;
@@ -592,6 +596,13 @@ impl Cru {
     }
 }
 
+fn fixed_parent_clock_rate(id: ClkId) -> Option<u64> {
+    match id {
+        TCLK_WDT0 => Some(OSC_HZ),
+        _ => None,
+    }
+}
+
 /// 验证 PLL 频率
 ///
 /// 对比实际读取的 PLL 频率与 u-boot 配置的预期频率
@@ -673,6 +684,12 @@ mod tests {
         // ACLK_TOP 位掩码
         assert_eq!(ACLK_TOP_S400_SEL_MASK, 0x3 << 8);
         assert_eq!(ACLK_TOP_S200_SEL_MASK, 0x3 << 6);
+    }
+
+    #[test]
+    fn test_watchdog_timer_clock_uses_xin24m() {
+        assert_eq!(fixed_parent_clock_rate(TCLK_WDT0), Some(OSC_HZ));
+        assert_eq!(fixed_parent_clock_rate(PCLK_WDT0), None);
     }
 
     /// 模拟 u-boot 配置的寄存器值验证

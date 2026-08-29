@@ -830,6 +830,7 @@ dependencies = [
  "crab-usb",
  "cv181x-sdhci",
  "dma-api",
+ "dw-wdt",
  "dwmmc-host",
  "eth-intel",
  "fdt-edit",
@@ -855,6 +856,7 @@ dependencies = [
  "rdif-reset",
  "rdif-serial",
  "rdif-vsock",
+ "rdif-watchdog",
  "rdrive",
  "rdrive-macros",
  "realtek-rtl8125",
@@ -3058,6 +3060,14 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dw-wdt"
+version = "0.1.0"
+dependencies = [
+ "mmio-api",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "dwmmc-host"
@@ -6572,6 +6582,14 @@ dependencies = [
 [[package]]
 name = "rdif-vsock"
 version = "0.2.0"
+dependencies = [
+ "rdif-base",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rdif-watchdog"
+version = "0.1.0"
 dependencies = [
  "rdif-base",
  "thiserror 2.0.20",

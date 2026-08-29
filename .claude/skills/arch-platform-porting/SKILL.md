@@ -212,7 +212,29 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
   Starry app board cases default to the matching
   `os/StarryOS/configs/board/<board>.toml`; add an app-local
   `build-<target>.toml` only when every board sharing that target can safely
-  use the same CPU/MMU/SoC feature set.
+  use the same CPU/MMU/SoC feature set. If one app needs additional opt-in
+  platform policy, give its board runner config a distinct `board-*.toml`
+  basename while retaining the real `board_type`; the missing global basename
+  match makes app discovery select that app's local build config.
+- **Long OrangePi board workloads without a power relay**: use the direct
+  1,500,000-baud UART for runtime evidence, and use board Linux plus SSH/rsync to
+  stage large persistent assets. Do not race a zero-second U-Boot window or send
+  hand-written U-Boot boot sequences while the normal Linux path is available.
+  Verify the Linux `boot.scr` backup, deploy the FIT through a temporary file and
+  same-filesystem atomic rename, start the UART monitor, and only then install
+  the already verified StarryOS script as `/boot/boot.scr` and reboot. As soon as
+  the Starry shell is available, restore the verified Linux script and sync it
+  before starting the workload. Select the Starry root partition by GPT
+  `PARTUUID`, because Linux, StarryOS, and U-Boot MMC indices are not
+  interchangeable. Build the seed kernel directly with the app's native-Cargo
+  helper when this physical-board workflow excludes `tg-xtask`. Use the RK3588
+  `snps,dw-wdt` as the kernel deadlock recovery
+  capability: discover/clock/map it through rdrive and `ax-driver`, feed it from
+  a CPU-0 sleepable kernel task, and bound the userspace command separately with
+  `timeout`. A missed-feed test must observe both the watchdog-arm serial marker
+  and subsequent Linux availability with a changed boot ID. Keep this policy
+  app-specific and fail closed when the watchdog, `tclk`, or root partition
+  identity is unavailable. See `docs/design/orangepi5plus-starry-selfbuild.md`.
 
 ## someboot Must-Haves
 

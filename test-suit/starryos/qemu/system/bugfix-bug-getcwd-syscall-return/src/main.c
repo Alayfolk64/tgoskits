@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -101,6 +102,46 @@ static void expect_null_buffer_efault(void)
     note_fail("raw getcwd null buffer", detail);
 }
 
+static void expect_getcwd_relative_to_chroot(void)
+{
+    char root[128];
+    snprintf(root, sizeof(root), "/tmp/starry-getcwd-chroot-%ld", (long)getpid());
+    if (mkdir(root, 0700) != 0) {
+        note_fail("mkdir chroot", strerror(errno));
+        return;
+    }
+
+    char nested[160];
+    snprintf(nested, sizeof(nested), "%s/nested", root);
+    if (mkdir(nested, 0700) != 0) {
+        note_fail("mkdir chroot nested", strerror(errno));
+        return;
+    }
+    if (syscall(SYS_chroot, root) != 0) {
+        note_fail("raw chroot", strerror(errno));
+        return;
+    }
+    if (chdir("/nested") != 0) {
+        note_fail("chdir inside chroot", strerror(errno));
+        return;
+    }
+
+    char buf[128];
+    errno = 0;
+    long ret = getcwd_raw(buf, sizeof(buf));
+    long expected = (long)strlen("/nested") + 1;
+    if (ret == expected && strcmp(buf, "/nested") == 0) {
+        note_pass("raw getcwd returns a path relative to the process root");
+        return;
+    }
+
+    char detail[256];
+    snprintf(detail, sizeof(detail),
+             "ret=%ld errno=%d (%s) buf='%s', expected ret=%ld buf='/nested'",
+             ret, errno, strerror(errno), buf, expected);
+    note_fail("raw getcwd after chroot", detail);
+}
+
 int main(void)
 {
     printf("=== bug-getcwd-syscall-return ===\n");
@@ -109,6 +150,7 @@ int main(void)
     expect_small_buffer_erange();
     expect_null_small_buffer_erange();
     expect_null_buffer_efault();
+    expect_getcwd_relative_to_chroot();
 
     printf("=== Results: %d passed, %d failed ===\n", passed, failed);
     if (failed == 0) {

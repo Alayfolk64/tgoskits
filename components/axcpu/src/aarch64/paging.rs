@@ -76,7 +76,10 @@ impl A64Pte {
     const PHYS_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
 
     fn attr(self) -> A64DescriptorAttr {
-        A64DescriptorAttr::from_bits_truncate(self.0)
+        // AttrIndx[2:0] occupies bits 4:2 but is decoded as a numeric field,
+        // not as named bitflags. Retain those bits so querying a Normal PTE
+        // cannot silently turn it into Device memory when its flags are reused.
+        A64DescriptorAttr::from_bits_retain(self.0)
     }
 
     fn leaf_attr(config: MappingFlags) -> A64DescriptorAttr {

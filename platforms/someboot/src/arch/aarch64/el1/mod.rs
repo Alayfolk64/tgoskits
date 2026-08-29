@@ -213,7 +213,12 @@ pub fn setup_sctlr() {
             + SCTLR_EL1::DZE::DontTrap
             + SCTLR_EL1::UCI::DontTrap,
     );
-    SCTLR_EL1.set(SCTLR_EL1.get() | (1 << 23));
+    // Firmware may hand off with alignment checking enabled. LinuxCurrent
+    // userspace permits ordinary unaligned accesses to Normal memory, so do
+    // not inherit SCTLR_EL1.A. Disable SPAN in the same register write.
+    const ALIGNMENT_CHECK: u64 = 1 << 1;
+    const SPAN: u64 = 1 << 23;
+    SCTLR_EL1.set((SCTLR_EL1.get() & !ALIGNMENT_CHECK) | SPAN);
     flush_tlb(None);
     barrier::dsb(barrier::SY);
     barrier::isb(barrier::SY);

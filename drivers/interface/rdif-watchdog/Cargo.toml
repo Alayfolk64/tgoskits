@@ -1,0 +1,14 @@
+[package]
+name = "rdif-watchdog"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driver interface for hardware watchdog timers"
+keywords = ["os", "driver", "watchdog"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+rdif-base.workspace = true
+thiserror.workspace = true

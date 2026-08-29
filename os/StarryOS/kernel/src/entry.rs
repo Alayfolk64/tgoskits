@@ -32,6 +32,8 @@ pub fn init(args: &[String], envs: &[String]) {
 
     pseudofs::mount_all().expect("Failed to mount pseudofs");
     spawn_alarm_task();
+    #[cfg(feature = "selfbuild-watchdog")]
+    spawn_selfbuild_watchdog();
     // DVFS: a one-shot OPP-calibration boot runs the sweep and skips the governor;
     // otherwise start the ondemand governor. Both run here (early init, before the
     // console tty handoff) so their kernel logs reach the serial console.
@@ -227,5 +229,67 @@ fn cpufreq_governor_loop() {
             *slot = ax_task::cpu_busy_ticks(cpu);
         }
         ax_driver::cpufreq::governor_poll(&busy);
+    }
+}
+
+#[cfg(feature = "selfbuild-watchdog")]
+const SELFBUILD_WATCHDOG_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+#[cfg(feature = "selfbuild-watchdog")]
+const SELFBUILD_WATCHDOG_FEED_PERIOD: core::time::Duration = core::time::Duration::from_secs(10);
+#[cfg(feature = "selfbuild-watchdog")]
+const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(10_200);
+
+/// Arm the board watchdog before PID 1 starts, then keep its lease in a
+/// sleepable CPU-0 task. A scheduler or kernel deadlock prevents the next ping
+/// and lets hardware reset the SoC. The finite lease also recovers a hung
+/// shutdown after the userspace command timeout has fired.
+#[cfg(feature = "selfbuild-watchdog")]
+fn spawn_selfbuild_watchdog() {
+    let armed = ax_driver::watchdog::arm_reset(SELFBUILD_WATCHDOG_TIMEOUT)
+        .unwrap_or_else(|error| panic!("self-build watchdog failed to arm: {error}"));
+    warn!(
+        "self-build watchdog armed: requested={:?} actual={:?} feed={:?} lease={:?}",
+        armed.requested(),
+        armed.actual(),
+        SELFBUILD_WATCHDOG_FEED_PERIOD,
+        SELFBUILD_WATCHDOG_LEASE
+    );
+
+    #[cfg(feature = "selfbuild-watchdog-reset-test")]
+    {
+        warn!("self-build watchdog reset test armed; intentionally not starting the feeder");
+    }
+
+    #[cfg(not(feature = "selfbuild-watchdog-reset-test"))]
+    ax_task::spawn_raw(
+        selfbuild_watchdog_loop,
+        String::from("selfbuild-wdt"),
+        ax_task::default_task_stack_size(),
+    );
+}
+
+#[cfg(all(
+    feature = "selfbuild-watchdog",
+    not(feature = "selfbuild-watchdog-reset-test")
+))]
+fn selfbuild_watchdog_loop() {
+    if !ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0)) {
+        error!("self-build watchdog failed to pin feeder to CPU 0; waiting for reset");
+        return;
+    }
+
+    let lease_started = ax_runtime::hal::time::monotonic_time();
+    loop {
+        ax_task::sleep(SELFBUILD_WATCHDOG_FEED_PERIOD);
+        if ax_runtime::hal::time::monotonic_time().saturating_sub(lease_started)
+            >= SELFBUILD_WATCHDOG_LEASE
+        {
+            warn!("self-build watchdog lease expired; waiting for hardware reset");
+            return;
+        }
+        if let Err(error) = ax_driver::watchdog::ping() {
+            error!("self-build watchdog ping failed: {error}; waiting for hardware reset");
+            return;
+        }
     }
 }

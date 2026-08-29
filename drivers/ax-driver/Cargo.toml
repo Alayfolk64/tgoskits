@@ -23,6 +23,7 @@ display = ["dep:rdif-display"]
 input = ["dep:rdif-input"]
 vsock = ["dep:rdif-vsock"]
 rtc = []
+watchdog = ["dep:dw-wdt", "dep:rdif-watchdog"]
 pinctrl = ["dep:rdif-pinctrl", "rdif-pinctrl/fdt"]
 
 virtio-core = ["dep:ax-alloc", "dep:virtio-drivers", "virtio-drivers/alloc"]
@@ -153,6 +154,7 @@ crab-usb = { workspace = true, optional = true }
 cv181x-sdhci = { workspace = true, optional = true }
 dma-api.workspace = true
 dwmmc-host = { workspace = true, optional = true }
+dw-wdt = { workspace = true, optional = true }
 eth-intel = { workspace = true, optional = true }
 fdt-edit = { workspace = true }
 fxmac_rs = { workspace = true, optional = true }
@@ -177,6 +179,7 @@ rdif-power = { workspace = true, optional = true }
 rdif-pwm = { workspace = true, optional = true }
 rdif-reset = { workspace = true, optional = true }
 rdif-vsock = { workspace = true, optional = true }
+rdif-watchdog = { workspace = true, optional = true }
 realtek-rtl8125 = { workspace = true, optional = true }
 rdrive.workspace = true
 rdrive-macros.workspace = true

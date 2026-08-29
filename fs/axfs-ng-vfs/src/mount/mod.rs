@@ -789,6 +789,27 @@ impl Location {
             .collect())
     }
 
+    /// Returns this location's absolute-looking path relative to `root`.
+    ///
+    /// `None` means that this location is not reachable from `root`. The walk
+    /// follows mount boundaries through [`Self::parent`], so callers can use
+    /// it for process-root-relative paths such as Linux `getcwd(2)` results.
+    pub fn path_from(&self, root: &Self) -> Option<PathBuf> {
+        let mut components = vec![];
+        let mut current = self.clone();
+        loop {
+            if current.ptr_eq(root) {
+                return Some(
+                    iter::once("/")
+                        .chain(components.iter().map(String::as_str).rev())
+                        .collect(),
+                );
+            }
+            components.push(current.name().into_owned());
+            current = current.parent()?;
+        }
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.mountpoint, &other.mountpoint) && self.entry.ptr_eq(&other.entry)
     }
@@ -1458,6 +1479,21 @@ mod tests {
             executable.absolute_path().unwrap().as_str(),
             "/nix/store/systemd"
         );
+    }
+
+    #[test]
+    fn path_from_rebases_a_descendant_at_the_supplied_root() {
+        let fs = mock_filesystem();
+        let mount = Mountpoint::new_root(&fs);
+        let global_root = mount.root_location();
+        let jail_entry = make_child_dir_entry(Some(global_root.entry().clone()), "jail");
+        let nested_entry = make_child_dir_entry(Some(jail_entry.clone()), "nested");
+        let jail = Location::new(mount.clone(), jail_entry);
+        let nested = Location::new(mount, nested_entry);
+
+        assert_eq!(nested.path_from(&jail).unwrap().as_str(), "/nested");
+        assert_eq!(jail.path_from(&jail).unwrap().as_str(), "/");
+        assert!(global_root.path_from(&jail).is_none());
     }
 
     #[test]
