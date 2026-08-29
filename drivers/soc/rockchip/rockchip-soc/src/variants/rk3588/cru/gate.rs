@@ -196,6 +196,11 @@ clk_gate_table!(
     PCLK_UART9 => (12, 10),
     SCLK_UART9 => (14, 5),
     // ========================================================================
+    // Watchdog clock gates
+    // ========================================================================
+    PCLK_WDT0 => (15, 0),
+    TCLK_WDT0 => (15, 1),
+    // ========================================================================
     // PWM 时钟门控
     // ========================================================================
     PCLK_PWM1 => (15, 3),
@@ -466,5 +471,16 @@ mod tests {
             (pwm3_capture.reg_idx, pwm3_capture.bit),
             (saradc.reg_idx, saradc.bit)
         );
+    }
+    #[test]
+    fn test_watchdog_gates_match_orangepi_6_1() {
+        for (id, bit) in [(PCLK_WDT0, 0), (TCLK_WDT0, 1)] {
+            let gate = CLK_GATE_TABLE
+                .iter()
+                .find(|gate| gate.clk_id == id)
+                .unwrap();
+            assert_eq!(gate.bank, GateBank::Main);
+            assert_eq!((gate.reg_idx, gate.bit), (15, bit));
+        }
     }
 }

@@ -110,6 +110,26 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 - **x86 调度基准启动**：`apps/arceos/scheduler-latency-bench/qemu-x86_64.toml` 对动态平台 PIE 使用 `uefi = true`、`to_bin = true`，与 ArceOS Rust 套件一致。直接把没有 PVH note 的映像交给 QEMU `-kernel` 会在进入内核前失败；比较旧提交与新提交时两侧使用同一份有效启动配置，不把启动失败计作性能数据。
 - **操作系统配置与测试用例**：只为已验证体系结构更新 ArceOS、StarryOS 和 Axvisor 配置。`qemu-<arch>.toml` 运行配置与 `build-*.toml` 构建配置分离。Starry 应用板卡用例默认使用匹配的 `os/StarryOS/configs/board/<board>.toml`；只有共享同一目标的全部板卡都能安全使用相同处理器、内存管理单元和片上系统功能集时，才加入应用局部 `build-<target>.toml`。板卡需要扫描输出桌面（card0/fb0 链路）时，构建特性必须同时包含 `ax-runtime/display` 与 `ax-driver/virtio-gpu`：`ax_runtime::devices::init_display` 由 `ax-runtime/display` 特性门控，缺配时 ax_display 永不初始化——`/dev/fb0` 不创建、card0 连接器模式回退 640x480、`present_fb` 静默空操作，用户态合成器整条管线正常但屏幕恒黑；对齐 `qemu-riscv64` 板卡与同目标 clippy 配置的特性集即可。
 
+- **Long OrangePi board workloads without a power relay**: use the direct
+  1,500,000-baud UART for runtime evidence, and use board Linux plus SSH/rsync to
+  stage large persistent assets. Do not race a zero-second U-Boot window or send
+  hand-written U-Boot boot sequences while the normal Linux path is available.
+  Verify the Linux `boot.scr` backup, deploy the FIT through a temporary file and
+  same-filesystem atomic rename, start the UART monitor, and only then install
+  the already verified StarryOS script as `/boot/boot.scr` and reboot. As soon as
+  the Starry shell is available, restore the verified Linux script and sync it
+  before starting the workload. Select the Starry root partition by GPT
+  `PARTUUID`, because Linux, StarryOS, and U-Boot MMC indices are not
+  interchangeable. Build the seed kernel directly with the app's native-Cargo
+  helper when this physical-board workflow excludes `tg-xtask`. Use the RK3588
+  `snps,dw-wdt` as the kernel deadlock recovery
+  capability: discover/clock/map it through rdrive and `ax-driver`, feed it from
+  a CPU-0 sleepable kernel task, and bound the userspace command separately with
+  `timeout`. A missed-feed test must observe both the watchdog-arm serial marker
+  and subsequent Linux availability with a changed boot ID. Keep this policy
+  app-specific and fail closed when the watchdog, `tclk`, or root partition
+  identity is unavailable. See `docs/design/orangepi5plus-starry-selfbuild.md`.
+
 ## someboot 必备条件
 
 - 保持固件入口二进制接口。统一可扩展固件接口入口携带 `image_handle` 和 `system_table`，直接启动参数不同。
