@@ -21,12 +21,20 @@ apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
 
 The application enables the RK3588 DesignWare hardware watchdog only for this
 build. It requests a 30-second reset timeout, feeds from CPU 0 every 10 seconds,
-and limits the guest command to 9,600 seconds. The Starry shell restores the
+and limits the guest command to 9,600 seconds. The feeder lease is 10,200
+seconds, leaving ten minutes for timeout recovery. The Starry shell restores the
 verified Linux boot script before starting the workload, so a later reset
-returns to Linux. The build workload is pinned to CPUs 4-7 and directly builds
-the `starryos` package instead of rebuilding the host-side runner. The seed
-kernel is also built directly with Cargo by `build_seed.sh`; neither path
-invokes `tg-xtask`.
+returns to Linux. The guest uses the system-default CPU affinity and
+parallelism: it first builds the debug `tg-xtask` host runner with plain
+`cargo build -p tg-xtask`, then invokes that exact binary to build
+StarryOS from the application build config. It emits minute-level compile-unit
+progress markers for Linux/StarryOS comparison. The seed kernel remains a
+separate native-Cargo bootstrap built by `build_seed.sh`.
+Profiling is deliberately bounded to the first command: `--profile stat` or
+`--profile record` measures at most 300 seconds of `cargo build -p tg-xtask`
+and exits without starting the StarryOS build. `record` uses flat 49 Hz cycle
+samples because the current StarryOS perf ABI does not support call-chain
+samples. The Linux and StarryOS runs keep the same system-default parallelism.
 The one-time boot selects the Linux root partition by GPT `PARTUUID`; Linux,
 StarryOS, and U-Boot do not share stable MMC device numbers. The end-to-end
 entry drives the UART, waits for Linux to return, and fetches and verifies the

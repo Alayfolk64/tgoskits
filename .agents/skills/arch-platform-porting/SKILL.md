@@ -120,8 +120,8 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
   the Starry shell is available, restore the verified Linux script and sync it
   before starting the workload. Select the Starry root partition by GPT
   `PARTUUID`, because Linux, StarryOS, and U-Boot MMC indices are not
-  interchangeable. Build the seed kernel directly with the app's native-Cargo
-  helper when this physical-board workflow excludes `tg-xtask`. Use the RK3588
+  interchangeable. Build the seed kernel through `tg-xtask` with the app-local
+  board build configuration; use direct UART only for serial interaction. Use the RK3588
   `snps,dw-wdt` as the kernel deadlock recovery
   capability: discover/clock/map it through rdrive and `ax-driver`, feed it from
   a CPU-0 sleepable kernel task, and bound the userspace command separately with

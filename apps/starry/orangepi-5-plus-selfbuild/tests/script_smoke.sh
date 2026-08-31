@@ -56,5 +56,6 @@ PY
 
 bash "$app_dir/tests/boot_script_identity.sh"
 bash "$app_dir/tests/guest_clock.sh"
+bash "$app_dir/tests/selfbuild_contract.sh"
 
 echo "orangepi5plus_selfbuild_script_smoke=PASS"

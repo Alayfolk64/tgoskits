@@ -13,8 +13,8 @@ kernel. A run succeeds only when all of the following are observable:
 
 - the host opens the direct UART before board Linux atomically selects a
   verified one-time U-Boot script, without racing the U-Boot input window;
-- the host seed kernel and guest rebuild use native Cargo commands without a
-  `tg-xtask` runner;
+- the host seed kernel uses the native-Cargo bootstrap, while the guest first
+  builds `tg-xtask` and uses that exact runner to build StarryOS;
 - the guest build exits successfully and prints the final PASS marker;
 - the resulting AArch64 ELF and raw binary are copied back to the Linux host;
 - source metadata and SHA-256 hashes make the input and output reproducible;
@@ -22,9 +22,11 @@ kernel. A run succeeds only when all of the following are observable:
   U-Boot entry without a manual power cycle.
 
 After correctness is stable, Linux and StarryOS use the same source snapshot,
-rootfs, toolchain, Cargo cache, CPU affinity, and job count for three cold runs.
-The median elapsed time is the baseline. StarryOS `perf` data is collected only
-after the full build passes.
+rootfs, toolchain, Cargo cache, system-default CPU affinity, and automatic Cargo
+parallelism for three cold runs. The median elapsed time is the baseline.
+Minute-level compile-unit markers show approximate progress for each phase.
+Profiling does not wait for the full build: a bounded first-phase window around
+`cargo build -p tg-xtask` is collected on Linux first and then StarryOS.
 
 ## Scope and non-goals
 
@@ -63,7 +65,8 @@ The implementation follows four boundaries:
    invalid clocks are errors; the driver does not guess a frequency.
 4. StarryOS owns the sleepable lease task because `ax-driver` cannot depend on
    `ax-task`. The self-build feature arms the watchdog before PID 1 starts and
-   pins the feeder to CPU 0. The compilation workload is pinned to CPUs 4-7.
+   pins the feeder to CPU 0. The compilation workload keeps the system-default
+   affinity and automatic build parallelism; Linux uses the same policy.
 
 The board DTB describes the watchdog at `0xfeaf0000` with a `0x100` register
 window and named `tclk`/`pclk` clocks. Register semantics and fixed timeout
@@ -127,7 +130,8 @@ headers, and SHA-256 before printing PASS.
 | feature isolation | targeted clippy/build with feature on and off | existing board/apps do not gain watchdog policy |
 | board recovery | deliberate missed-feed direct-serial run | watchdog arm marker followed by Linux availability and a changed boot ID |
 | self-build correctness | Linux-selected boot observed and driven over direct UART | Linux selector restored before build, PASS marker, fetched ELF/bin, matching metadata and hashes |
-| performance baseline | three cold Linux and StarryOS runs | recorded per-run logs and medians; profile linked to a passing run |
+| first-phase performance profile | matched cold Linux and StarryOS runs | bounded profile PASS, source identity, hardware counts or flat cycle samples, complete logs |
+| full performance baseline | three cold Linux and StarryOS runs | recorded per-run logs and medians |
 
 The physical-board checks are mandatory before claiming the application is
 fully working. Host-only compilation proves integration but not RK3588 clock or
