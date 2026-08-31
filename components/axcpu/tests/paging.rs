@@ -70,6 +70,21 @@ fn aarch64_explicit_memory_types_roundtrip() {
 }
 
 #[test]
+fn aarch64_unprogrammed_mair_indices_decode_as_device() {
+    let paddr = PhysAddr::from_usize(0x1_81ea_5000);
+    let normal_flags = MappingFlags::READ | MappingFlags::WRITE;
+    for index in 3..8 {
+        let pte = A64Pte::new_page(paddr, normal_flags, false).with_attr_index(index);
+
+        assert_eq!(
+            pte.config(false),
+            normal_flags | MappingFlags::DEVICE,
+            "AttrIndx {index} must match its zero-valued MAIR slot"
+        );
+    }
+}
+
+#[test]
 fn non_present_riscv_huge_leaf_retains_its_structure() {
     let paddr = PhysAddr::from_usize(0x4000_0000);
     let pte = Rv64Pte::new_page(paddr, MappingFlags::empty(), true);

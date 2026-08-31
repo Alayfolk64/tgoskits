@@ -56,14 +56,16 @@ impl A64DescriptorAttr {
         Self::from_bits_retain(bits)
     }
 
-    const fn mem_attr(self) -> Option<A64MemAttr> {
+    const fn mem_attr(self) -> A64MemAttr {
         let idx = (self.bits() & Self::ATTR_INDEX_MASK) >> 2;
-        Some(match idx {
-            0 => A64MemAttr::Device,
+        match idx {
             1 => A64MemAttr::Normal,
             2 => A64MemAttr::NormalNonCacheable,
-            _ => return None,
-        })
+            // MAIR slots 3..7 are left at zero by `MAIR_VALUE`, which is a
+            // Device-nGnRnE encoding. Decode them conservatively as Device
+            // instead of silently treating an unsupported index as Normal.
+            _ => A64MemAttr::Device,
+        }
     }
 }
 
@@ -74,6 +76,14 @@ pub struct A64Pte(u64);
 
 impl A64Pte {
     const PHYS_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+    #[cfg(test)]
+    pub(crate) fn with_attr_index(mut self, index: u64) -> Self {
+        assert!(index < 8);
+        self.0 &= !A64DescriptorAttr::ATTR_INDEX_MASK;
+        self.0 |= index << 2;
+        self
+    }
 
     fn attr(self) -> A64DescriptorAttr {
         // AttrIndx[2:0] occupies bits 4:2 but is decoded as a numeric field,
@@ -164,9 +174,9 @@ impl PageTableEntry for A64Pte {
             !attr.contains(A64DescriptorAttr::AP_RO),
         );
         match attr.mem_attr() {
-            Some(A64MemAttr::Device) => config |= MappingFlags::DEVICE,
-            Some(A64MemAttr::NormalNonCacheable) => config |= MappingFlags::UNCACHED,
-            _ => {}
+            A64MemAttr::Device => config |= MappingFlags::DEVICE,
+            A64MemAttr::Normal => {}
+            A64MemAttr::NormalNonCacheable => config |= MappingFlags::UNCACHED,
         }
         #[cfg(not(feature = "arm-el2"))]
         {
