@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
+use alloc::{boxed::Box, sync::Arc, vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use ax_sync::SpinLock as Mutex;
@@ -33,11 +33,7 @@ const RX_START_THRESHOLD: usize = QUEUE_SIZE;
 const MAX_PACKET: usize = 2048;
 const RX_BUF_SIZE: usize = 2048;
 const DMA_ALIGN: usize = 256;
-const DMA_CACHE_LINE_SIZE: usize = 64;
-const RX_DESC_PER_CACHE_LINE: usize = DMA_CACHE_LINE_SIZE / core::mem::size_of::<RxDesc>();
-const RX_DEFERRED_REFILL_CAPACITY: usize = QUEUE_SIZE;
 const LINK_DOWN_DROP_LOG_INTERVAL: u64 = 64;
-const EARLY_PACKET_LOG_COUNT: u64 = 8;
 const TX_SUBMIT_LOG_INTERVAL: u64 = 16;
 const TX_RECLAIM_LOG_INTERVAL: u64 = 64;
 const RX_RECLAIM_LOG_INTERVAL: u64 = 64;
@@ -289,7 +285,6 @@ impl NetDevice for Rtl8125 {
             submitted: 0,
             reclaimed: 0,
             rx_errors: 0,
-            deferred_refill: VecDeque::with_capacity(RX_DEFERRED_REFILL_CAPACITY),
         };
 
         Ok(NetDeviceParts {
