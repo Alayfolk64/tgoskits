@@ -135,6 +135,24 @@ chroot_bash() {
         /bin/bash -lc "$1"
 }
 
+ensure_lwprintf_cross_compiler() {
+    if ! chroot_bash 'command -v aarch64-linux-musl-gcc >/dev/null 2>&1'; then
+        chroot_bash 'command -v aarch64-linux-gnu-gcc >/dev/null 2>&1'
+        install -d -m 0755 "$rootfs/usr/local/bin"
+        ln -s /usr/bin/aarch64-linux-gnu-gcc \
+            "$rootfs/usr/local/bin/aarch64-linux-musl-gcc"
+    fi
+    chroot_bash 'aarch64-linux-musl-gcc -print-sysroot >/dev/null'
+}
+
+rust_toolchain_ready() {
+    chroot_bash "rustup run '$toolchain' rustc --version >/dev/null 2>&1 && \
+        rustup component list --toolchain '$toolchain' --installed | \
+            grep -q '^rust-src' && \
+        rustup component list --toolchain '$toolchain' --installed | \
+            grep -q '^llvm-tools'"
+}
+
 prepare_base_rootfs() {
     if [ -e "$rootfs" ]; then
         fail "incomplete rootfs exists without a valid marker: $rootfs"
@@ -180,8 +198,12 @@ else
     prepare_base_rootfs
 fi
 
-chroot_bash "rustup toolchain install '$toolchain' --profile minimal \
-    --component rust-src --component llvm-tools-preview && rustup default '$toolchain'"
+ensure_lwprintf_cross_compiler
+if ! rust_toolchain_ready; then
+    chroot_bash "rustup toolchain install '$toolchain' --profile minimal \
+        --component rust-src --component llvm-tools-preview"
+fi
+chroot_bash "rustup default '$toolchain'"
 if ! chroot_bash 'command -v rust-nm >/dev/null 2>&1 && command -v rust-objcopy >/dev/null 2>&1'; then
     chroot_bash 'cargo install --locked cargo-binutils'
 fi
