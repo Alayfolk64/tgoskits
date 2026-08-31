@@ -144,3 +144,84 @@ fn detect_gcc_runtime_dir_prefers_highest_version() {
     let selected = detect_gcc_runtime_dir(&sysroot, "usr/aarch64-alpine-linux-musl/bin").unwrap();
     assert_eq!(selected, gcc_root.join("15.2.0"));
 }
+
+#[test]
+fn build_prebuild_command_uses_guest_shell_and_case_envs() {
+    let root = tempdir().unwrap();
+    let case = fake_case(root.path(), "usb");
+    let layout =
+        case_assets::case_asset_layout(root.path(), "aarch64-unknown-none-softfloat", "usb")
+            .unwrap();
+    fs::create_dir_all(layout.staging_root.join("bin")).unwrap();
+    fs::write(layout.staging_root.join("bin/sh"), b"").unwrap();
+    fs::write(layout.staging_root.join("bin/busybox"), b"").unwrap();
+    let prebuild_env = GuestPrebuildEnv {
+        qemu_runner: Some(PathBuf::from("/usr/bin/qemu-aarch64-static")),
+        script_envs: {
+            let mut envs = case_script_envs(&case, &layout, &fake_config());
+            envs.push(("SUITE_PACKAGE_REGION".to_string(), "us".to_string()));
+            envs
+        },
+    };
+    let prebuild_script = case_c_source_dir(&case).join("prebuild.sh");
+
+    let command = build_prebuild_command(&case, &prebuild_script, &layout, &prebuild_env).unwrap();
+
+    assert_eq!(
+        command.get_program(),
+        std::ffi::OsStr::new("/usr/bin/qemu-aarch64-static")
+    );
+    assert_eq!(
+        command_args(&command),
+        vec![
+            "-L".to_string(),
+            layout.staging_root.display().to_string(),
+            layout
+                .staging_root
+                .join("bin/busybox")
+                .display()
+                .to_string(),
+            "sh".to_string(),
+            "-eu".to_string(),
+            prebuild_script.display().to_string(),
+        ]
+    );
+    assert_eq!(
+        command.get_current_dir(),
+        Some(case_c_source_dir(&case).as_path())
+    );
+    assert_eq!(
+        command_env(&command, "SUITE_CASE_OVERLAY_DIR"),
+        Some(layout.overlay_dir.display().to_string())
+    );
+    assert_eq!(
+        command_env(&command, "SUITE_PACKAGE_REGION"),
+        Some("us".to_string())
+    );
+    assert_eq!(
+        command_env(&command, "LD_LIBRARY_PATH"),
+        Some(guest_library_path(&layout.staging_root))
+    );
+}
+
+#[test]
+fn build_prebuild_command_uses_host_shell_without_qemu_user() {
+    let root = tempdir().unwrap();
+    let case = fake_case(root.path(), "cpu-feat");
+    let layout =
+        case_assets::case_asset_layout(root.path(), "aarch64-unknown-none-softfloat", "cpu-feat")
+            .unwrap();
+    let prebuild_env = GuestPrebuildEnv {
+        qemu_runner: None,
+        script_envs: case_script_envs(&case, &layout, &fake_config()),
+    };
+    let prebuild_script = case_c_source_dir(&case).join("prebuild.sh");
+
+    let command = build_prebuild_command(&case, &prebuild_script, &layout, &prebuild_env).unwrap();
+
+    assert_eq!(command.get_program(), OsStr::new("sh"));
+    assert_eq!(
+        command_args(&command),
+        vec!["-eu".to_string(), prebuild_script.display().to_string()]
+    );
+}
