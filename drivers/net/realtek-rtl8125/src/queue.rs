@@ -1,18 +1,19 @@
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
-use core::sync::atomic::{Ordering as AtomicOrdering, fence};
+use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering, fence};
 
 use ax_sync::SpinLock as Mutex;
 use dma_api::CoherentArray;
 use log::{debug, info, trace, warn};
 use rdif_eth::{
     DmaBuffer, IRxQueue, ITxQueue, NetError, NetQueueId, QueueConfig, RxCompletion, SubmitError,
+    TxChecksumCapabilities, TxNotify, TxSubmitOptions,
 };
 
 use crate::{
     DMA_ALIGN, EARLY_PACKET_LOG_COUNT, LINK_DOWN_DROP_LOG_INTERVAL, MAX_PACKET, QUEUE_ID0,
     QUEUE_SIZE, RX_BUF_SIZE, RX_DESC_PER_CACHE_LINE, RX_IDLE_LOG_INTERVAL,
     RX_OVERFLOW_REARM_IDLE_POLLS, RX_QUEUE_CONFIG_SIZE, RX_RECLAIM_LOG_INTERVAL,
-    RX_START_THRESHOLD, TX_LINK_SAMPLE_INTERVAL, TX_RECLAIM_LOG_INTERVAL, TX_SUBMIT_LOG_INTERVAL,
+    RX_START_THRESHOLD, TX_RECLAIM_LOG_INTERVAL, TX_SUBMIT_LOG_INTERVAL,
     descriptor::{RxDesc, TxDesc},
     read_status,
     registers::{Regs, irq_has_rx_overflow},
@@ -20,6 +21,30 @@ use crate::{
 };
 
 pub(crate) type QueueStart = Arc<Mutex<QueueStartState>>;
+
+#[derive(Default)]
+pub(crate) struct TxNotificationState {
+    pending: bool,
+}
+
+impl TxNotificationState {
+    fn descriptor_submitted(&mut self, notify: TxNotify) -> bool {
+        match notify {
+            TxNotify::Immediate => {
+                self.pending = false;
+                true
+            }
+            TxNotify::Deferred => {
+                self.pending = true;
+                false
+            }
+        }
+    }
+
+    fn take_pending(&mut self) -> bool {
+        core::mem::take(&mut self.pending)
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct QueueStartState {
@@ -36,10 +61,11 @@ pub(crate) struct Rtl8125TxQueue {
     pub(crate) buffers: [Option<DmaBuffer>; QUEUE_SIZE],
     pub(crate) next_submit: usize,
     pub(crate) next_reclaim: usize,
-    pub(crate) link_up: Option<bool>,
+    pub(crate) link_up: Arc<AtomicBool>,
     pub(crate) link_down_drops: u64,
     pub(crate) submitted: u64,
     pub(crate) reclaimed: u64,
+    pub(crate) notification: TxNotificationState,
 }
 
 impl ITxQueue for Rtl8125TxQueue {
@@ -56,44 +82,26 @@ impl ITxQueue for Rtl8125TxQueue {
         }
     }
 
+    fn checksum_capabilities(&self) -> TxChecksumCapabilities {
+        TxChecksumCapabilities::TCP_UDP
+    }
+
     fn submit(&mut self, buffer: DmaBuffer) -> core::result::Result<(), SubmitError> {
-        if buffer.len() > MAX_PACKET {
-            return Err(SubmitError::new(buffer, NetError::NotSupported));
-        }
+        self.submit_buffer(buffer, TxSubmitOptions::default())
+    }
 
-        if !self.observe_link_before_tx(buffer.len()) {
-            self.link_down_drops = self.link_down_drops.saturating_add(1);
-            return Err(SubmitError::new(buffer, NetError::LinkDown));
-        }
+    fn submit_with_options(
+        &mut self,
+        buffer: DmaBuffer,
+        options: TxSubmitOptions,
+    ) -> core::result::Result<(), SubmitError> {
+        self.submit_buffer(buffer, options)
+    }
 
-        let idx = self.next_submit;
-        let next = (idx + 1) % QUEUE_SIZE;
-        if self.buffers[idx].is_some() {
-            return Err(SubmitError::new(buffer, NetError::Retry));
+    fn flush(&mut self) {
+        if self.notification.take_pending() {
+            self.notify_device();
         }
-
-        let ring_end = idx == QUEUE_SIZE - 1;
-        let len = buffer.len();
-        let desc = TxDesc::new_cpu_owned(buffer.bus_addr(), len, ring_end);
-        self.desc.set_cpu(idx, desc);
-        release_dma_descriptor();
-        self.desc.set_cpu(idx, desc.release_to_hw());
-        self.buffers[idx] = Some(buffer);
-        self.next_submit = next;
-        self.submitted = self.submitted.saturating_add(1);
-        self.regs.poll_tx();
-        if self.submitted <= EARLY_PACKET_LOG_COUNT
-            || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL)
-        {
-            trace!(
-                "RTL8125 tx submitted: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
-                len,
-                self.submitted,
-                self.reclaimed,
-                read_status(self.regs),
-            );
-        }
-        Ok(())
     }
 
     fn reclaim(&mut self) -> Option<DmaBuffer> {
@@ -123,16 +131,68 @@ impl ITxQueue for Rtl8125TxQueue {
 }
 
 impl Rtl8125TxQueue {
+    fn submit_buffer(
+        &mut self,
+        buffer: DmaBuffer,
+        options: TxSubmitOptions,
+    ) -> core::result::Result<(), SubmitError> {
+        if buffer.len() > MAX_PACKET {
+            return Err(SubmitError::new(buffer, NetError::NotSupported));
+        }
+
+        if !self.observe_link_before_tx(buffer.len()) {
+            self.link_down_drops = self.link_down_drops.saturating_add(1);
+            return Err(SubmitError::new(buffer, NetError::LinkDown));
+        }
+
+        let idx = self.next_submit;
+        let next = (idx + 1) % QUEUE_SIZE;
+        if self.buffers[idx].is_some() {
+            return Err(SubmitError::new(buffer, NetError::Retry));
+        }
+
+        let ring_end = idx == QUEUE_SIZE - 1;
+        let len = buffer.len();
+        let Some(desc) = TxDesc::new_cpu_owned(buffer.bus_addr(), len, ring_end, options.checksum)
+        else {
+            return Err(SubmitError::new(buffer, NetError::NotSupported));
+        };
+        self.desc.set_cpu(idx, desc);
+        release_dma_descriptor();
+        self.desc.set_cpu(idx, desc.release_to_hw());
+        self.buffers[idx] = Some(buffer);
+        self.next_submit = next;
+        self.submitted = self.submitted.saturating_add(1);
+        if self.notification.descriptor_submitted(options.notify) {
+            self.notify_device();
+        }
+        if self.submitted <= EARLY_PACKET_LOG_COUNT
+            || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL)
+        {
+            trace!(
+                "RTL8125 tx submitted: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
+                len,
+                self.submitted,
+                self.reclaimed,
+                read_status(self.regs),
+            );
+        }
+        Ok(())
+    }
+
+    fn notify_device(&self) {
+        // Descriptor ownership must become visible before the MMIO doorbell.
+        fence(AtomicOrdering::Release);
+        self.regs.poll_tx();
+    }
+
     fn observe_link_before_tx(&mut self, len: usize) -> bool {
-        let must_sample = self.link_up != Some(true)
-            || self.submitted == 0
-            || self.submitted.is_multiple_of(TX_LINK_SAMPLE_INTERVAL);
-        if !must_sample {
+        if self.link_up.load(AtomicOrdering::Acquire) {
             return true;
         }
 
         let link_up = self.regs.link_up();
-        let changed = self.link_up.replace(link_up) != Some(link_up);
+        let changed = self.link_up.swap(link_up, AtomicOrdering::AcqRel) != link_up;
 
         if link_up {
             if changed {
@@ -390,4 +450,23 @@ pub(crate) fn boxed_tx(queue: Rtl8125TxQueue) -> Box<dyn ITxQueue> {
 
 pub(crate) fn boxed_rx(queue: Rtl8125RxQueue) -> Box<dyn IRxQueue> {
     Box::new(queue)
+}
+
+#[cfg(test)]
+mod tests {
+    use rdif_eth::TxNotify;
+
+    use super::TxNotificationState;
+
+    #[test]
+    fn deferred_descriptors_share_one_device_notification() {
+        let mut notification = TxNotificationState::default();
+
+        assert!(!notification.descriptor_submitted(TxNotify::Deferred));
+        assert!(!notification.descriptor_submitted(TxNotify::Deferred));
+        assert!(notification.take_pending());
+        assert!(!notification.take_pending());
+        assert!(notification.descriptor_submitted(TxNotify::Immediate));
+        assert!(!notification.take_pending());
+    }
 }
