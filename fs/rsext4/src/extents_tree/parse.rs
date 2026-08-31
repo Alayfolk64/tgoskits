@@ -400,6 +400,59 @@ mod tests {
     }
 
     #[test]
+    fn extent_insert_saturation_does_not_duplicate_tail_when_leaf_splits() {
+        let (mut dev, mut fs) = setup_fs(16 * 1024);
+        let mut inode = new_extent_inode();
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, Ext4Extent::new(0, 100, 1), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(2, 200, 1), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(4, 300, 1), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(6, 1_000, 32_767), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(32_773, 33_767, 2), &mut dev)
+                .unwrap();
+        }
+
+        let mut tree = ExtentTree::new(&mut inode);
+        let runs = tree.initialized_runs_in_range(&mut dev, 0, 32_774).unwrap();
+
+        assert_eq!(
+            runs,
+            [
+                ExtentRun {
+                    logical_start: 0,
+                    physical_start: AbsoluteBN::new(100),
+                    len: 1,
+                },
+                ExtentRun {
+                    logical_start: 2,
+                    physical_start: AbsoluteBN::new(200),
+                    len: 1,
+                },
+                ExtentRun {
+                    logical_start: 4,
+                    physical_start: AbsoluteBN::new(300),
+                    len: 1,
+                },
+                ExtentRun {
+                    logical_start: 6,
+                    physical_start: AbsoluteBN::new(1_000),
+                    len: 32_768,
+                },
+                ExtentRun {
+                    logical_start: 32_774,
+                    physical_start: AbsoluteBN::new(33_768),
+                    len: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn insert_rejects_empty_internal_root_without_mutating_inode() {
         let (mut dev, mut fs) = setup_fs(16 * 1024);
         let mut inode = new_extent_inode();

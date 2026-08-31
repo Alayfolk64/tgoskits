@@ -145,6 +145,7 @@ impl<'a> ExtentTree<'a> {
                 let pos = entries
                     .binary_search_by_key(&new_ext.ee_block, |e| e.ee_block)
                     .unwrap_or_else(|i| i);
+                let mut new_extent_consumed = false;
 
                 if pos > 0 {
                     let prev = &mut entries[pos - 1];
@@ -217,6 +218,7 @@ impl<'a> ExtentTree<'a> {
 
                                         let insert_pos = pos;
                                         entries.insert(insert_pos, tail);
+                                        new_extent_consumed = true;
                                         header.eh_entries = entries.len() as u16;
                                         debug!(
                                             "insert_recursive: previous extent saturated MAX_LEN, \
@@ -247,7 +249,9 @@ impl<'a> ExtentTree<'a> {
                     }
                 }
 
-                entries.insert(pos, new_ext);
+                if !new_extent_consumed {
+                    entries.insert(pos, new_ext);
+                }
                 header.eh_entries = entries.len() as u16;
                 debug!(
                     "insert_recursive: after insert (no split yet) leaf entries_len={} (max={}) \
