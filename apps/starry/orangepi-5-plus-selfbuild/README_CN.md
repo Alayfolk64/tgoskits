@@ -59,6 +59,8 @@ apps/starry/orangepi-5-plus-selfbuild/provision_rootfs.sh \
 - 仓库锁定的 Rust nightly、`rust-src`、LLVM tools、`cargo-binutils` 和
   `gen_ksym`；
 - C/C++、Clang/LLVM、CMake、binutils、U-Boot tools、`perf` 等构建工具；
+- `lwprintf-rs` 构建脚本所需的 `aarch64-linux-musl-gcc` 兼容命令（在该 glibc
+  rootfs 中指向 `aarch64-linux-gnu-gcc`，用于查询并使用同一 AArch64 sysroot）；
 - Cargo registry/git cache，以及 `-Z build-std=core,alloc` 所需的 nightly
   sysroot crate；
 - 当前工作区精确快照及 commit/ref/dirty/toolchain/SHA-256 元数据；
@@ -81,16 +83,18 @@ apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
 会立即恢复 Linux 默认启动脚本并失败退出。
 
 入口默认通过 `build_seed.sh` 使用原生 Cargo 构建 StarryOS 种子内核、生成
-kallsyms 并输出 raw AArch64 boot image；主机种子构建和板端自举编译都不调用
-`tg-xtask`。已有经过验证的种子内核时可加 `--skip-boot-build`。
+kallsyms 并输出 raw AArch64 boot image；它只是启动板端自举的 bootstrap。已有
+经过验证的种子内核时可加 `--skip-boot-build`。
 
-StarryOS 内直接执行 `cargo build -p starryos`，不会在每轮冷 target 中重新编译
-`tg-xtask` host runner。编译固定到 Cortex-A76 大核 CPU 4–7，默认 `JOBS=4`、
-`RUSTC_THREADS=2`、`RAYON_NUM_THREADS=2`，内核日志为 Warn；watchdog armed、
+板端 guest 每轮冷 target 先执行 `cargo build -p tg-xtask`，再直接调用生成的
+`$CARGO_TARGET_DIR/debug/tg-xtask starry build --config ...` 编译 StarryOS。Linux
+和 StarryOS 都继承系统默认 CPU affinity、Cargo jobs、rustc 与 Rayon 线程策略，
+不绑核也不设置并行度上限。日志每 60 秒输出当前阶段耗时、阶段/累计编译单元数和
+不同 crate 数，便于查看两侧大概进度。内核日志为 Warn；watchdog armed、
 FAIL/PASS 等验收信号仍可见。完整成功需要先在串口看到 guest PASS：
 
 ```text
-===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=... jobs=4 elapsed=...===
+===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=... parallelism=system-default elapsed=...===
 ```
 
 板卡随后自动回到 Linux；完整入口会自行取回并验证产物。也可以单独复核：
@@ -129,7 +133,8 @@ apps/starry/orangepi-5-plus-selfbuild/test_watchdog_reset.sh \
 
 ## Linux 基线、三轮中位数和 profiling
 
-Linux 单次基线使用同一 chroot、源码、工具链、cache、CPU 4–7 和并行度：
+Linux 单次基线使用同一 chroot、源码、工具链和 cache，并与 StarryOS 一样继承
+系统默认 CPU affinity、Cargo jobs、rustc 与 Rayon 线程策略：
 
 ```bash
 apps/starry/orangepi-5-plus-selfbuild/run_linux_baseline.sh \
@@ -148,18 +153,36 @@ Cargo target 目录；Linux 轮先 sync/drop_caches，StarryOS 轮通过重新�
 内核缓存。成功轮在复制 ELF/bin 后清理其 app 专属 target 目录，失败轮保留
 target 便于诊断，避免六轮构建耗尽板端存储。
 
-只有完整编译已经 PASS 后才开始 profiling：
+不需要等完整自举编译结束才做 profiling。profiling 只包住第一条命令
+`cargo build -p tg-xtask`，最多运行 300 秒；到时由 `timeout` 发送 SIGINT，让
+`perf` 正常落盘。第二条 `tg-xtask starry build ...` 不参与 profiling，也不会在
+profiling 模式下启动。
+
+先在 Linux 采一份，再用同一源码快照在 StarryOS 采一份：
 
 ```bash
-# 低开销总体计数
+# Linux：低开销硬件计数
+apps/starry/orangepi-5-plus-selfbuild/run_linux_baseline.sh \
+  --host <BOARD_IP> --skip-provision --profile stat
+
+# StarryOS：相同的硬件计数窗口
 apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
   --host <BOARD_IP> --skip-provision --profile stat
 
-# 99 Hz 调用栈采样
+# 需要定位热点函数时，两侧分别改为 --profile record
 apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
   --host <BOARD_IP> --skip-provision --profile record
 ```
 
-`perf-stat.txt` 或 `perf.data` 与对应的 PASS 日志和产物保存在同一 run 目录。
-先用测量定位最大瓶颈，再评估 MOSS BuildStorm 中出现过的缺页、分配器、page
-cache、ext4 或 TLB 假设；这些优化不会在正确性阶段被盲目移植。
+`stat` 保存 cycles、instructions、cache references/misses、branches/misses 和实际
+耗时；`record` 以 49 Hz 保存 cycle 采样，并在板载 Linux 恢复后生成
+`perf-report.txt`。当前 StarryOS perf ABI 不支持 `PERF_SAMPLE_CALLCHAIN`，因此
+这里有意不加 `-g`：它能给出平坦的用户态指令热点，不能给出完整调用链，也不能
+直接回答 off-CPU 等待、锁竞争、调度延迟、缺页原因或块 I/O 延迟。先用 Linux/
+StarryOS 的 IPC、cache/branch miss 比例和热点差异确定最大方向，再按证据补充
+MOSS BuildStorm 风格的缺页、锁、调度、page cache 或 ext4 区间埋点。
+
+`perf-stat.txt` 或 `perf.data`、`profile.meta`、源码元数据、SHA-256 和完整日志保存
+在同一 run 目录，并取回到
+`target/starry-orangepi5plus-selfbuild/artifacts/<run-id>/`。profiling PASS 只表示
+受控窗口及数据落盘成功，不表示两阶段 StarryOS 自举已经完成。

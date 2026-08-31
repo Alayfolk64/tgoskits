@@ -49,13 +49,13 @@ mount --bind /proc "$root/proc" 2>/dev/null || true
 mount --bind /dev "$root/dev" 2>/dev/null || true
 mount --bind /sys "$root/sys" 2>/dev/null || true
 
-echo "===${marker}-CHROOT-BEGIN run=${run_id} profile=${profile} cpu_list=4-7==="
+echo "===${marker}-CHROOT-BEGIN run=${run_id} profile=${profile} cpu_policy=system-default==="
 chroot "$root" /usr/bin/timeout --signal=TERM --kill-after=60 "$guest_timeout" \
     /usr/bin/env \
     STARRY_SELFBUILD_MARKER="$marker" \
     STARRY_SELFBUILD_RUN_ID="$run_id" \
     STARRY_SELFBUILD_PROFILE="$profile" \
-    /usr/bin/taskset -c 4-7 /bin/bash "$guest"
+    /bin/bash "$guest"
 rc="$?"
 
 if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
@@ -65,6 +65,9 @@ elif [ "$rc" != "0" ]; then
 fi
 
 sync 2>/dev/null || true
-systemctl --force --force reboot 2>/dev/null || true
+umount "$root/sys" 2>/dev/null || true
+umount "$root/dev" 2>/dev/null || true
+umount "$root/proc" 2>/dev/null || true
+sync 2>/dev/null || true
 reboot -f 2>/dev/null || true
 exit "$rc"

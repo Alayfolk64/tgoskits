@@ -14,6 +14,8 @@ skip_provision=0
 skip_boot_build=0
 serial="${BOARD_SERIAL:-/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0}"
 serial_timeout=10800
+linux_return_attempts=180
+linux_return_interval=5
 
 usage() {
     cat <<'USAGE'
@@ -139,12 +141,12 @@ set -e
 trap - EXIT
 
 linux_ready=0
-for _ in $(seq 1 90); do
+for _ in $(seq 1 "$linux_return_attempts"); do
     if ssh -o ConnectTimeout=3 "${ssh_args[@]}" "$remote" true; then
         linux_ready=1
         break
     fi
-    sleep 5
+    sleep "$linux_return_interval"
 done
 [ "$linux_ready" = 1 ] || {
     echo "board Linux did not return after the StarryOS run" >&2

@@ -4,7 +4,6 @@ set -euo pipefail
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$app_dir/../../.." && pwd)"
 build_config="$app_dir/build-aarch64-unknown-none-softfloat.toml"
-rustc_threads="${RUSTC_THREADS:-2}"
 
 usage() {
     cat <<'USAGE'
@@ -29,9 +28,6 @@ case "$build_config" in
     *) build_config="$repo_root/$build_config" ;;
 esac
 [ -f "$build_config" ] || { echo "build config is missing: $build_config" >&2; exit 2; }
-case "$rustc_threads" in
-    ''|*[!0-9]*|0) echo "invalid RUSTC_THREADS: $rustc_threads" >&2; exit 2 ;;
-esac
 
 for command in cargo file gen_ksym python3 readelf rust-nm rust-objcopy rust-objdump; do
     command -v "$command" >/dev/null 2>&1 || {
@@ -78,7 +74,7 @@ export AR_aarch64_unknown_none_softfloat="${AR_aarch64_unknown_none_softfloat:-a
 export CC_AARCH64_UNKNOWN_NONE_SOFTFLOAT="$CC_aarch64_unknown_none_softfloat"
 export AR_AARCH64_UNKNOWN_NONE_SOFTFLOAT="$AR_aarch64_unknown_none_softfloat"
 
-target_rustflags="[\"-Crelocation-model=pic\",\"-Clink-args=-pie\",\"-Clink-args=--gc-sections\",\"-Clink-args=-znorelro\",\"-Clink-args=-znostart-stop-gc\",\"-Clink-args=-Tlinker.x\",\"-Clink-args=-u _head\",\"-Zthreads=${rustc_threads}\"]"
+target_rustflags="[\"-Crelocation-model=pic\",\"-Clink-args=-pie\",\"-Clink-args=--gc-sections\",\"-Clink-args=-znorelro\",\"-Clink-args=-znostart-stop-gc\",\"-Clink-args=-Tlinker.x\",\"-Clink-args=-u _head\"]"
 build_command=(cargo build -p starryos --bin starryos)
 build_command+=("--target" "$build_target" "--release")
 build_command+=("-Z" "build-std=core,alloc")

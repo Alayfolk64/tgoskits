@@ -5,6 +5,7 @@ app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$app_dir/../../.." && pwd)"
 out_dir="$repo_root/target/starry-orangepi5plus-selfbuild/artifacts"
 remote_output=/opt/starry-orangepi5plus-selfbuild/rootfs/output
+remote_rootfs=/opt/starry-orangepi5plus-selfbuild/rootfs
 linux_user="${BOARD_LINUX_USER:-orangepi}"
 ssh_port="${BOARD_SSH_PORT:-22}"
 host=""
@@ -60,6 +61,33 @@ rsync -a --info=stats2 \
     cd "$artifact_dir"
     sha256sum -c SHA256SUMS
 )
+if [ -s "$artifact_dir/profile.meta" ]; then
+    profile="$(sed -n 's/^profile=//p' "$artifact_dir/profile.meta")"
+    case "$profile" in
+        stat)
+            [ -s "$artifact_dir/perf-stat.txt" ] \
+                || { echo "perf stat output is missing" >&2; exit 1; }
+            ;;
+        record)
+            [ -s "$artifact_dir/perf.data" ] \
+                || { echo "perf record output is missing" >&2; exit 1; }
+            ssh "${ssh_args[@]}" "$remote" sudo -n chroot "$remote_rootfs" \
+                perf report --stdio --show-nr-samples --sort comm,dso,symbol \
+                -i "/output/runs/$run_id/perf.data" \
+                > "$artifact_dir/perf-report.txt"
+            [ -s "$artifact_dir/perf-report.txt" ] \
+                || { echo "perf report output is empty" >&2; exit 1; }
+            ssh "${ssh_args[@]}" "$remote" sudo -n \
+                rm -rf -- "$remote_rootfs/work/targets/$run_id"
+            echo "===STARRY-ORANGEPI5PLUS-SELFBUILD-PROFILE-TARGET-CLEANUP run=${run_id}==="
+            ;;
+        *) echo "unknown profiling mode: $profile" >&2; exit 1 ;;
+    esac
+    echo "selfbuild_profile=$profile"
+    echo "selfbuild_profile_artifact_dir=$artifact_dir"
+    echo "===STARRY-ORANGEPI5PLUS-SELFBUILD-HOST-PROFILE-PASS run=${run_id} profile=${profile}==="
+    exit 0
+fi
 [ -s "$artifact_dir/starryos.elf" ] || { echo "self-built ELF is missing" >&2; exit 1; }
 [ -s "$artifact_dir/starryos.bin" ] || { echo "self-built binary is missing" >&2; exit 1; }
 if command -v file >/dev/null 2>&1; then

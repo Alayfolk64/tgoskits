@@ -23,9 +23,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! mountpoint -q "$rootfs/proc"; then mount --bind /proc "$rootfs/proc"; mounted_proc=1; fi
-if ! mountpoint -q "$rootfs/dev"; then mount --rbind /dev "$rootfs/dev"; mounted_dev=1; fi
-if ! mountpoint -q "$rootfs/sys"; then mount --rbind /sys "$rootfs/sys"; mounted_sys=1; fi
+if ! mountpoint -q "$rootfs/proc"; then
+    mount --bind /proc "$rootfs/proc"
+    mount --make-rslave "$rootfs/proc"
+    mounted_proc=1
+fi
+if ! mountpoint -q "$rootfs/dev"; then
+    mount --rbind /dev "$rootfs/dev"
+    mount --make-rslave "$rootfs/dev"
+    mounted_dev=1
+fi
+if ! mountpoint -q "$rootfs/sys"; then
+    mount --rbind /sys "$rootfs/sys"
+    mount --make-rslave "$rootfs/sys"
+    mounted_sys=1
+fi
 
 sync
 echo 3 > /proc/sys/vm/drop_caches
@@ -34,4 +46,4 @@ chroot "$rootfs" /usr/bin/timeout --signal=TERM --kill-after=60 9600 \
     STARRY_SELFBUILD_MARKER="$marker" \
     STARRY_SELFBUILD_RUN_ID="$run_id" \
     STARRY_SELFBUILD_PROFILE="$profile" \
-    /usr/bin/taskset -c 4-7 /bin/bash "$guest"
+    /bin/bash "$guest"

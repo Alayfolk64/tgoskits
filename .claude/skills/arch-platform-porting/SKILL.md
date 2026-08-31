@@ -226,8 +226,11 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
   the Starry shell is available, restore the verified Linux script and sync it
   before starting the workload. Select the Starry root partition by GPT
   `PARTUUID`, because Linux, StarryOS, and U-Boot MMC indices are not
-  interchangeable. Build the seed kernel directly with the app's native-Cargo
-  helper when this physical-board workflow excludes `tg-xtask`. Use the RK3588
+  interchangeable. The seed may use the app's native-Cargo bootstrap, but a
+  full self-build validation must first compile the in-tree `tg-xtask` runner
+  and then use that exact binary for the StarryOS build. Keep Linux and
+  StarryOS on the same system-default CPU affinity and Cargo parallelism, and
+  record periodic compile-unit progress markers for long runs. Use the RK3588
   `snps,dw-wdt` as the kernel deadlock recovery
   capability: discover/clock/map it through rdrive and `ax-driver`, feed it from
   a CPU-0 sleepable kernel task, and bound the userspace command separately with
