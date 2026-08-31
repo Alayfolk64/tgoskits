@@ -199,9 +199,7 @@ impl Timerfd {
         } else {
             let deadline = if mode.is_absolute() {
                 match self.clockid {
-                    CLOCK_REALTIME | CLOCK_REALTIME_ALARM => {
-                        TimerDeadline::Realtime(new_value)
-                    }
+                    CLOCK_REALTIME | CLOCK_REALTIME_ALARM => TimerDeadline::Realtime(new_value),
                     _ => TimerDeadline::Monotonic(new_value),
                 }
             } else {
@@ -245,11 +243,20 @@ impl Timerfd {
 
 /// Marks cancel-on-set realtime timerfds after a discontinuous clock change.
 pub fn notify_realtime_clock_changed() {
-    TIMERFD_INSTANCES.lock().retain(|weak| {
-        let Some(timerfd) = weak.upgrade() else {
-            return false;
-        };
+    let timerfds = {
+        let mut registry = TIMERFD_INSTANCES.lock();
+        let mut timerfds = Vec::with_capacity(registry.len());
+        registry.retain(|weak| {
+            let Some(timerfd) = weak.upgrade() else {
+                return false;
+            };
+            timerfds.push(timerfd);
+            true
+        });
+        timerfds
+    };
 
+    for timerfd in timerfds {
         let mut state = timerfd.state.lock();
         if state.cancel_on_set && state.next_deadline.is_some() {
             state.canceled = true;
@@ -259,8 +266,7 @@ pub fn notify_realtime_clock_changed() {
             // The cancellation marker is visible before readers are woken.
             unsafe { timerfd.poll_rx.wake(IoEvents::IN) };
         }
-        true
-    });
+    }
 }
 
 impl Drop for Timerfd {
@@ -273,6 +279,14 @@ impl Drop for Timerfd {
         state.shutdown = true;
         drop(state);
         self.arm_event.notify(usize::MAX);
+
+        // `notify_realtime_clock_changed` snapshots strong references before
+        // taking any timerfd state lock, so unregistering here cannot recurse
+        // into `Drop` while the registry lock is held.
+        let self_ptr = core::ptr::from_ref(self);
+        TIMERFD_INSTANCES
+            .lock()
+            .retain(|weak| weak.as_ptr() != self_ptr && weak.strong_count() != 0);
     }
 }
 
@@ -462,5 +476,38 @@ impl Pollable for Timerfd {
             // Registration happens from file poll task context.
             unsafe { self.poll_rx.register(context.waker(), IoEvents::IN) };
         }
+    }
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    use super::*;
+
+    fn unspawned_timerfd() -> Arc<Timerfd> {
+        Arc::new(Timerfd {
+            clockid: CLOCK_REALTIME,
+            state: Mutex::new(State::default()),
+            expire_count: AtomicU64::new(0),
+            poll_rx: PollSet::new(),
+            non_blocking: AtomicBool::new(false),
+            arm_event: Arc::new(Event::new()),
+        })
+    }
+
+    #[test]
+    fn dropping_timerfd_unregisters_clock_change_observer() {
+        let timerfd = unspawned_timerfd();
+        let timerfd_ptr = Arc::as_ptr(&timerfd);
+        TIMERFD_INSTANCES.lock().push(Arc::downgrade(&timerfd));
+
+        drop(timerfd);
+
+        assert!(
+            !TIMERFD_INSTANCES
+                .lock()
+                .iter()
+                .any(|weak| weak.as_ptr() == timerfd_ptr),
+            "closed timerfd remained in the realtime clock observer registry"
+        );
     }
 }

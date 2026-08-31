@@ -149,11 +149,14 @@ the dispatcher selects the entry with the smallest current remaining duration
 and sleeps against a monotonic deadline. A clock-change event wakes it to
 re-evaluate realtime entries.
 
-Timerfds are tracked through a weak-reference registry. A realtime step filters
-that registry to armed absolute realtime timers with
-`TFD_TIMER_CANCEL_ON_SET`, marks them as canceled, wakes poll/read waiters, and
-lets one read consume `ECANCELED`. Relative and monotonic timerfds are never
-marked for cancellation.
+Timerfds are tracked through a weak-reference registry. Closing a timerfd
+immediately unregisters its weak reference, so creating and closing timerfds
+cannot retain dead `Arc` allocations until the next clock step. A realtime
+step snapshots live timerfds while holding the registry lock, then releases
+that lock before inspecting per-timer state. Armed absolute realtime timers
+with `TFD_TIMER_CANCEL_ON_SET` are marked as canceled, poll/read waiters are
+woken, and one read consumes `ECANCELED`. Relative and monotonic timerfds are
+never marked for cancellation.
 
 ### Concurrency and publication order
 
