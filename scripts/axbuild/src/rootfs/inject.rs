@@ -386,12 +386,14 @@ fn collect_overlay_debugfs_commands(
     for entry in &entries {
         let file_name = PathBuf::from(entry.file_name());
         let relative_path = relative_dir.join(&file_name);
+        let guest_path = Path::new("/").join(&relative_path);
+        let guest_argument = debugfs_path_argument(&guest_path)?;
         let file_type = entry
             .file_type()
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
 
         if file_type.is_dir() {
-            commands.push(format!("mkdir /{}", relative_path.display()));
+            commands.push(format!("mkdir {guest_argument}"));
             collect_overlay_debugfs_commands(overlay_dir, &relative_path, commands)?;
             continue;
         }
@@ -407,20 +409,16 @@ fn collect_overlay_debugfs_commands(
              supported",
             entry.path().display()
         );
-        commands.push(format!("rm /{}", relative_path.display()));
-        commands.push(format!(
-            "write {} /{}",
-            entry.path().display(),
-            relative_path.display()
-        ));
+        let host_argument = debugfs_path_argument(&entry.path())?;
+        commands.push(format!("rm {guest_argument}"));
+        commands.push(format!("write {host_argument} {guest_argument}"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let metadata = fs::metadata(entry.path())
                 .with_context(|| format!("failed to stat {}", entry.path().display()))?;
             commands.push(format!(
-                "sif /{} mode 0{:o}",
-                relative_path.display(),
+                "sif {guest_argument} mode 0{:o}",
                 metadata.permissions().mode()
             ));
         }
@@ -433,6 +431,8 @@ fn collect_overlay_debugfs_commands(
     for entry in &entries {
         let file_name = PathBuf::from(entry.file_name());
         let relative_path = relative_dir.join(&file_name);
+        let guest_path = Path::new("/").join(&relative_path);
+        let guest_argument = debugfs_path_argument(&guest_path)?;
         let file_type = entry
             .file_type()
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
@@ -448,16 +448,35 @@ fn collect_overlay_debugfs_commands(
             } else {
                 host_target.clone()
             };
-            commands.push(format!("rm /{}", relative_path.display()));
-            commands.push(format!(
-                "symlink /{} {}",
-                relative_path.display(),
-                guest_filespec.display()
-            ));
+            let target_argument = debugfs_path_argument(&guest_filespec)?;
+            commands.push(format!("rm {guest_argument}"));
+            commands.push(format!("symlink {guest_argument} {target_argument}"));
         }
     }
 
     Ok(())
+}
+
+/// Formats one pathname for the whitespace-delimited `debugfs` command parser.
+fn debugfs_path_argument(path: &Path) -> anyhow::Result<String> {
+    let value = path
+        .to_str()
+        .with_context(|| format!("debugfs path is not valid UTF-8: {}", path.display()))?;
+    ensure!(
+        !value.contains(['\n', '\r']),
+        "debugfs path contains a line break: {}",
+        path.display()
+    );
+
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '"' | '\\'))
+    {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!("\"{escaped}\""))
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 /// Executes a generated `debugfs` script against a writable rootfs image.
@@ -559,6 +578,30 @@ mod tests {
         assert!(commands.contains(&"mkdir /usr/bin".to_string()));
         assert!(commands.contains(&format!("write {} /usr/bin/test-bin", binary.display())));
         assert!(commands.contains(&"sif /usr/bin/test-bin mode 0100755".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_debugfs_commands_quote_paths_with_spaces() {
+        let root = tempdir().unwrap();
+        let overlay_dir = root.path().join("overlay root");
+        let spaced_dir = overlay_dir.join("dir with space");
+        fs::create_dir_all(&spaced_dir).unwrap();
+        let spaced_file = spaced_dir.join("file with space");
+        fs::write(&spaced_file, b"content").unwrap();
+
+        let mut commands = Vec::new();
+        collect_overlay_debugfs_commands(&overlay_dir, Path::new(""), &mut commands).unwrap();
+
+        assert!(commands.contains(&"mkdir \"/dir with space\"".to_string()));
+        assert!(commands.contains(&"rm \"/dir with space/file with space\"".to_string()));
+        assert!(commands.contains(&format!(
+            "write \"{}\" \"/dir with space/file with space\"",
+            spaced_file.display()
+        )));
+        assert!(commands
+            .iter()
+            .any(|command| command.starts_with("sif \"/dir with space/file with space\" mode ")));
     }
 
     /// Symlinks are written after regular files (two-pass) with the correct
