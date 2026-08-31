@@ -35,10 +35,91 @@ pub(crate) fn write_cross_bin_wrappers(
     Ok(())
 }
 
+pub(crate) fn write_native_llvm_bin_wrappers(
+    layout: &case_assets::CaseAssetLayout,
+    spec: CrossCompileSpec,
+) -> anyhow::Result<PathBuf> {
+    ensure!(
+        cfg!(target_os = "macos"),
+        "native LLVM cross tools are only supported on macOS"
+    );
+    fs::create_dir_all(&layout.cross_bin_dir)
+        .with_context(|| format!("failed to create {}", layout.cross_bin_dir.display()))?;
+
+    let clang = find_macos_llvm_tool("clang")?;
+    for (tool, llvm_name) in [
+        ("ld", "ld.lld"),
+        ("ar", "llvm-ar"),
+        ("ranlib", "llvm-ranlib"),
+        ("strip", "llvm-strip"),
+        ("nm", "llvm-nm"),
+        ("objcopy", "llvm-objcopy"),
+        ("objdump", "llvm-objdump"),
+        ("readelf", "llvm-readelf"),
+    ] {
+        let llvm_tool = find_macos_llvm_tool(llvm_name)?;
+        write_native_tool_wrapper(&layout.cross_bin_dir.join(tool), &llvm_tool, &[])?;
+        write_native_tool_wrapper(
+            &layout
+                .cross_bin_dir
+                .join(format!("{}-{tool}", spec.gnu_tool_prefix)),
+            &llvm_tool,
+            &[],
+        )?;
+    }
+
+    let assembler_args = [format!("--target={}", spec.llvm_target), "-c".to_string()];
+    write_native_tool_wrapper(&layout.cross_bin_dir.join("as"), &clang, &assembler_args)?;
+    write_native_tool_wrapper(
+        &layout
+            .cross_bin_dir
+            .join(format!("{}-as", spec.gnu_tool_prefix)),
+        &clang,
+        &assembler_args,
+    )?;
+
+    Ok(clang)
+}
+
+fn write_native_tool_wrapper(path: &Path, tool: &Path, arguments: &[String]) -> anyhow::Result<()> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| shell_single_quote(Path::new(argument)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let separator = if arguments.is_empty() { "" } else { " " };
+    write_wrapper_script(
+        path,
+        &format!(
+            "exec {}{separator}{arguments} \"$@\"\n",
+            shell_single_quote(tool)
+        ),
+    )
+}
+
+fn find_macos_llvm_tool(name: &str) -> anyhow::Result<PathBuf> {
+    let candidates = [
+        Some(Path::new("/opt/homebrew/opt/llvm/bin").join(name)),
+        Some(Path::new("/usr/local/opt/llvm/bin").join(name)),
+        find_optional_host_binary_candidates(&[name]),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.is_file())
+        .with_context(|| {
+            format!(
+                "required macOS LLVM tool `{name}` was not found in PATH, \
+                 /opt/homebrew/opt/llvm/bin, or /usr/local/opt/llvm/bin"
+            )
+        })
+}
+
 pub(crate) fn write_cmake_toolchain_file(
     layout: &case_assets::CaseAssetLayout,
     spec: CrossCompileSpec,
     clang: &Path,
+    use_lld: bool,
 ) -> anyhow::Result<()> {
     if let Some(parent) = layout.cmake_toolchain_file.parent() {
         fs::create_dir_all(parent)
@@ -57,6 +138,9 @@ pub(crate) fn write_cmake_toolchain_file(
         compile_flags.push(format!("-B{}", gcc_runtime_dir.display()));
         linker_flags = compile_flags.clone();
         linker_flags.push(format!("-L{}", gcc_runtime_dir.display()));
+    }
+    if use_lld {
+        linker_flags.push("-fuse-ld=lld".to_string());
     }
     let compile_flags = compile_flags.join(" ");
     let linker_flags = linker_flags.join(" ");

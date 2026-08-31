@@ -7,8 +7,10 @@ pub(super) fn prepare_guest_prebuild_env(
     extra_script_envs: Vec<(String, String)>,
     config: &CaseAssetConfig,
 ) -> anyhow::Result<GuestPrebuildEnv> {
-    let qemu_runner = find_host_binary_candidates(qemu_user_binary_names(arch)?)?;
-    write_guest_command_wrappers(layout, &qemu_runner)?;
+    let qemu_runner = find_qemu_user_binary(arch)?;
+    if let Some(qemu_runner) = &qemu_runner {
+        write_guest_command_wrappers(layout, qemu_runner)?;
+    }
 
     let mut script_envs = case_script_envs(case, layout, config);
     script_envs.extend(extra_script_envs);
@@ -33,16 +35,28 @@ pub(super) fn prepare_guest_package_env(
 pub(super) fn prepare_host_cross_build_env(
     arch: &str,
     layout: &case_assets::CaseAssetLayout,
-    qemu_runner: &Path,
+    qemu_runner: Option<&Path>,
 ) -> anyhow::Result<HostCrossBuildEnv> {
     let spec = cross_compile_spec(arch)?;
     let cmake = find_host_binary_candidates(&["cmake"])?;
-    let clang = find_host_binary_candidates(&["clang"])?;
     let pkg_config = find_host_binary_candidates(&["pkg-config"])?;
     let make_program = find_host_binary_candidates(&["make", "gmake"])?;
 
-    write_cross_bin_wrappers(layout, spec, qemu_runner)?;
-    write_cmake_toolchain_file(layout, spec, &clang)?;
+    let (clang, use_lld) = match qemu_runner {
+        Some(qemu_runner) => {
+            write_cross_bin_wrappers(layout, spec, qemu_runner)?;
+            (find_host_binary_candidates(&["clang"])?, false)
+        }
+        None => {
+            ensure!(
+                cfg!(target_os = "macos"),
+                "native LLVM cross tools are only supported on macOS"
+            );
+            let clang = write_native_llvm_bin_wrappers(layout, spec)?;
+            (clang, true)
+        }
+    };
+    write_cmake_toolchain_file(layout, spec, &clang, use_lld)?;
 
     let pkgconfig_libdir = format!(
         "{}:{}",

@@ -20,20 +20,27 @@ pub(super) fn build_prebuild_command_with_work_dir(
     layout: &case_assets::CaseAssetLayout,
     prebuild_env: &GuestPrebuildEnv,
 ) -> anyhow::Result<Command> {
-    let guest_busybox = layout.staging_root.join("bin/busybox");
-    let guest_shell = layout.staging_root.join("bin/sh");
-    let mut command = Command::new(&prebuild_env.qemu_runner);
-    command.arg("-L").arg(&layout.staging_root);
-    if guest_busybox.is_file() {
-        command.arg(&guest_busybox).arg("sh");
+    let mut command = if let Some(qemu_runner) = &prebuild_env.qemu_runner {
+        let guest_busybox = layout.staging_root.join("bin/busybox");
+        let guest_shell = layout.staging_root.join("bin/sh");
+        let mut command = Command::new(qemu_runner);
+        command.arg("-L").arg(&layout.staging_root);
+        if guest_busybox.is_file() {
+            command.arg(&guest_busybox).arg("sh");
+        } else {
+            ensure!(
+                guest_shell.is_file(),
+                "staging root is missing guest shell `{}`",
+                guest_shell.display()
+            );
+            command.arg(&guest_shell);
+        }
+        command
     } else {
-        ensure!(
-            guest_shell.is_file(),
-            "staging root is missing guest shell `{}`",
-            guest_shell.display()
-        );
-        command.arg(&guest_shell);
-    }
+        // QEMU linux-user is unavailable on macOS. Host-compatible prebuild scripts can still
+        // prepare sources and metadata; scripts that require guest commands fail normally.
+        Command::new("sh")
+    };
     command
         .arg("-eu")
         .arg(prebuild_script)

@@ -135,7 +135,7 @@ fn build_prebuild_command_uses_guest_shell_and_case_envs() {
     fs::write(layout.staging_root.join("bin/sh"), b"").unwrap();
     fs::write(layout.staging_root.join("bin/busybox"), b"").unwrap();
     let prebuild_env = GuestPrebuildEnv {
-        qemu_runner: PathBuf::from("/usr/bin/qemu-aarch64-static"),
+        qemu_runner: Some(PathBuf::from("/usr/bin/qemu-aarch64-static")),
         script_envs: {
             let mut envs = case_script_envs(&case, &layout, &fake_config());
             envs.push(("SUITE_PACKAGE_REGION".to_string(), "us".to_string()));
@@ -180,6 +180,28 @@ fn build_prebuild_command_uses_guest_shell_and_case_envs() {
     assert_eq!(
         command_env(&command, "LD_LIBRARY_PATH"),
         Some(guest_library_path(&layout.staging_root))
+    );
+}
+
+#[test]
+fn build_prebuild_command_uses_host_shell_without_qemu_user() {
+    let root = tempdir().unwrap();
+    let case = fake_case(root.path(), "cpu-feat");
+    let layout =
+        case_assets::case_asset_layout(root.path(), "aarch64-unknown-none-softfloat", "cpu-feat")
+            .unwrap();
+    let prebuild_env = GuestPrebuildEnv {
+        qemu_runner: None,
+        script_envs: case_script_envs(&case, &layout, &fake_config()),
+    };
+    let prebuild_script = case_c_source_dir(&case).join("prebuild.sh");
+
+    let command = build_prebuild_command(&case, &prebuild_script, &layout, &prebuild_env).unwrap();
+
+    assert_eq!(command.get_program(), OsStr::new("sh"));
+    assert_eq!(
+        command_args(&command),
+        vec!["-eu".to_string(), prebuild_script.display().to_string()]
     );
 }
 
@@ -530,6 +552,7 @@ fn write_cmake_toolchain_file_contains_clang_cross_settings() {
         &layout,
         cross_compile_spec("aarch64").unwrap(),
         Path::new("/usr/bin/clang"),
+        true,
     )
     .unwrap();
 
@@ -540,6 +563,7 @@ fn write_cmake_toolchain_file_contains_clang_cross_settings() {
     assert!(content.contains("--gcc-toolchain="));
     assert!(content.contains("-B"));
     assert!(content.contains("-L"));
+    assert!(content.contains("-fuse-ld=lld"));
     assert!(content.contains("CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER"));
 }
 

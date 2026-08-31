@@ -127,6 +127,18 @@ pub(crate) fn qemu_user_binary_names(arch: &str) -> anyhow::Result<&'static [&'s
     Ok(cross_compile_spec(arch)?.qemu_user_binaries)
 }
 
+pub(crate) fn find_qemu_user_binary(arch: &str) -> anyhow::Result<Option<PathBuf>> {
+    let candidates = qemu_user_binary_names(arch)?;
+    let found = find_optional_host_binary_candidates(candidates);
+    if found.is_some() || cfg!(target_os = "macos") {
+        return Ok(found);
+    }
+    Err(anyhow::anyhow!(
+        "required host binary was not found in PATH; tried: {}",
+        candidates.join(", ")
+    ))
+}
+
 pub(super) fn write_guest_exec_wrapper(
     path: &Path,
     qemu_runner: &Path,

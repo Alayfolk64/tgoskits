@@ -72,15 +72,20 @@ pub(crate) fn run_cargo_status_with_env(
 }
 
 pub(crate) fn find_host_binary_candidates(candidates: &[&str]) -> Result<std::path::PathBuf> {
+    find_optional_host_binary_candidates(candidates).ok_or_else(|| {
+        anyhow::anyhow!(
+            "required host binary was not found in PATH; tried: {}",
+            candidates.join(", ")
+        )
+    })
+}
+
+pub(crate) fn find_optional_host_binary_candidates(
+    candidates: &[&str],
+) -> Option<std::path::PathBuf> {
     candidates
         .iter()
         .find_map(|candidate| find_optional_host_binary(candidate))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "required host binary was not found in PATH; tried: {}",
-                candidates.join(", ")
-            )
-        })
 }
 
 fn find_optional_host_binary(name: &str) -> Option<std::path::PathBuf> {
