@@ -10,4 +10,4 @@ fail_regex = [
   '(?i)SIGSEGV',
   '(?i)\bpanic(?:ked)?\b',
 ]
-timeout = 10800
+timeout = 22800

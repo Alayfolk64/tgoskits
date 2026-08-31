@@ -14,8 +14,8 @@ ELF 和 raw binary，回到 Linux 后取回产物并验证 SHA-256。暂不把�
 ## 恢复模型
 
 应用单独开启 `selfbuild-watchdog`：RK3588 的 `snps,dw-wdt` 请求 30 秒超时，
-硬件按 TOP 粒度向上取整；CPU 0 每 10 秒喂狗。喂狗租约为 10,200 秒，chroot
-里的编译命令由 `timeout` 限制为 9,600 秒。因此内核死锁由硬件 watchdog
+硬件按 TOP 粒度向上取整；CPU 0 每 10 秒喂狗。喂狗租约为 22,200 秒，chroot
+里的编译命令由 `timeout` 限制为 21,600 秒。因此内核死锁由硬件 watchdog
 复位，用户态活锁由 `timeout` 终止；正常结束后主动 reboot。U-Boot 必须默认
 进入 Linux：若当前 `/boot/boot.scr` 是已知的
 Starry 脚本且存在经过内容检查的 `boot.scr.tgoskits-backup`，准备脚本会先保留

@@ -4,7 +4,7 @@ marker=STARRY-ORANGEPI5PLUS-SELFBUILD
 root=/opt/starry-orangepi5plus-selfbuild/rootfs
 run_config="$root/etc/starry-selfbuild/run.conf"
 guest=/opt/tgoskits/apps/starry/orangepi-5-plus-selfbuild/guest-selfbuild.sh
-guest_timeout=9600
+guest_timeout=21600
 restore_boot=/opt/starry-orangepi5plus-selfbuild/restore_linux_boot.sh
 
 fail() {

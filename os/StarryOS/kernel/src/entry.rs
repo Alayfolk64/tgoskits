@@ -237,7 +237,7 @@ const SELFBUILD_WATCHDOG_TIMEOUT: core::time::Duration = core::time::Duration::f
 #[cfg(feature = "selfbuild-watchdog")]
 const SELFBUILD_WATCHDOG_FEED_PERIOD: core::time::Duration = core::time::Duration::from_secs(10);
 #[cfg(feature = "selfbuild-watchdog")]
-const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(10_200);
+const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(22_200);
 
 /// Arm the board watchdog before PID 1 starts, then keep its lease in a
 /// sleepable CPU-0 task. A scheduler or kernel deadlock prevents the next ping

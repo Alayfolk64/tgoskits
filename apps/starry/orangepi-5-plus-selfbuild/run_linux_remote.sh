@@ -41,7 +41,7 @@ fi
 
 sync
 echo 3 > /proc/sys/vm/drop_caches
-chroot "$rootfs" /usr/bin/timeout --signal=TERM --kill-after=60 9600 \
+chroot "$rootfs" /usr/bin/timeout --signal=TERM --kill-after=60 21600 \
     /usr/bin/env \
     STARRY_SELFBUILD_MARKER="$marker" \
     STARRY_SELFBUILD_RUN_ID="$run_id" \

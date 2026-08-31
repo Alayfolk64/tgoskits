@@ -21,7 +21,7 @@ apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
 
 The application enables the RK3588 DesignWare hardware watchdog only for this
 build. It requests a 30-second reset timeout, feeds from CPU 0 every 10 seconds,
-and limits the guest command to 9,600 seconds. The feeder lease is 10,200
+and limits the guest command to 21,600 seconds. The feeder lease is 22,200
 seconds, leaving ten minutes for timeout recovery. The Starry shell restores the
 verified Linux boot script before starting the workload, so a later reset
 returns to Linux. The guest uses the system-default CPU affinity and

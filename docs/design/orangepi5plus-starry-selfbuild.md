@@ -78,8 +78,8 @@ and both requested and actual durations are logged.
 ## Recovery policy
 
 The self-build application requests a 30-second watchdog period and feeds it
-every 10 seconds from CPU 0. The lease is 10,200 seconds and the guest command
-has a 9,600-second timeout. The lease is the outer bound when shutdown or the
+every 10 seconds from CPU 0. The lease is 22,200 seconds and the guest command
+has a 21,600-second timeout. The lease is the outer bound when shutdown or the
 direct serial session can no longer make progress.
 If StarryOS deadlocks, the hardware watchdog resets the SoC. If the build
 livelocks, `timeout` terminates it and the guest records FAIL. If shutdown then

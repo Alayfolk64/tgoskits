@@ -56,10 +56,12 @@ case "$watchdog_lease" in
     ''|*[!0-9]*) fail "cannot read watchdog lease" ;;
 esac
 
-# Keep the original command budget, followed by ten minutes for shutdown
-# recovery and another ten minutes for the host serial/Linux-return path.
-[ "$guest_timeout" -ge 9600 ] \
-    || fail "guest timeout is below the cold-build budget"
+# The first physical-board cold target run exceeded 9,600 seconds while Cargo
+# was still compiling dependencies. Keep a six-hour command budget, followed
+# by ten minutes for shutdown recovery and another ten minutes for the host
+# serial/Linux-return path.
+[ "$guest_timeout" -ge 21600 ] \
+    || fail "guest timeout is below the measured cold-build budget"
 [ "$linux_timeout" -ge "$guest_timeout" ] \
     || fail "Linux baseline timeout is shorter than the guest timeout"
 [ "$watchdog_lease" -ge "$((guest_timeout + 600))" ] \
