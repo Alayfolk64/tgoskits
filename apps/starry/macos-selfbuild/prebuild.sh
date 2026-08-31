@@ -7,6 +7,7 @@ overlay_dir="${STARRY_OVERLAY_DIR:-}"
 rootfs="${STARRY_ROOTFS:-}"
 rootfs_size_mib="${ROOTFS_SIZE_MIB:-16384}"
 out_dir="$workspace/target/starry-macos-selfbuild"
+selfbuild_mode="${STARRY_MACOS_SELFBUILD_MODE:-full}"
 export COPYFILE_DISABLE=1
 
 usage() {
@@ -39,6 +40,11 @@ if [[ "$#" -gt 0 ]]; then
     usage >&2
     exit 2
 fi
+
+case "$selfbuild_mode" in
+    full|tg-xtask-profile) ;;
+    *) echo "unknown STARRY_MACOS_SELFBUILD_MODE: $selfbuild_mode" >&2; exit 2 ;;
+esac
 
 if [[ -z "$overlay_dir" ]]; then
     echo "error: STARRY_OVERLAY_DIR is required" >&2
@@ -279,11 +285,16 @@ tar_create -C "$out_dir" -rf "$src_tar" .tgoskits-source-meta
 cargo_registry_cache_count=0
 copy_cargo_registry_cache
 
-install -m 0755 "$app_dir/guest-selfbuild.sh" "$overlay_dir/opt/starry-macos-run.sh"
+case "$selfbuild_mode" in
+    full) guest_runner="$app_dir/guest-selfbuild.sh" ;;
+    tg-xtask-profile) guest_runner="$app_dir/guest-tg-xtask-profile.sh" ;;
+esac
+install -m 0755 "$guest_runner" "$overlay_dir/opt/starry-macos-run.sh"
 install -m 0644 "$src_tar" "$overlay_dir/opt/tgoskits-src.tar"
 install -m 0644 "$meta_file" "$overlay_dir/opt/tgoskits-src.meta"
 
 echo "macos-selfbuild overlay ready in $overlay_dir"
+echo "selfbuild_mode=$selfbuild_mode"
 echo "source_commit=$source_commit"
 echo "source_ref=$source_ref"
 echo "source_dirty=$dirty"
