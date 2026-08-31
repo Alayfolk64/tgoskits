@@ -1412,4 +1412,31 @@ mod tests {
         dev.read_block(child_block).unwrap();
         assert_eq!(dev.buffer(), child_before);
     }
+    #[test]
+    fn extent_insert_saturation_does_not_duplicate_tail_when_leaf_splits() {
+        let (mut dev, mut fs) = setup_fs(64 * 1024);
+        let mut inode = new_extent_inode();
+        let expected = [
+            (0, 100, 1),
+            (2, 200, 1),
+            (4, 300, 1),
+            (6, 1_000, 32_767),
+            (32_773, 33_767, 2),
+        ];
+        {
+            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            for (logical, physical, len) in expected {
+                tree.insert_extent(&mut fs, Ext4Extent::new(logical, physical, len), &mut dev)
+                    .unwrap();
+            }
+            assert_eq!(tree.load_root_from_inode().unwrap().header().eh_depth, 1);
+        }
+        let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        let extents = tree.all_extents(&mut dev).unwrap();
+        let actual: Vec<_> = extents
+            .iter()
+            .map(|extent| (extent.ee_block, extent.start_block(), extent.len() as u16))
+            .collect();
+        assert_eq!(actual, expected);
+    }
 }
