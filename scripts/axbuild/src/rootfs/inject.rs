@@ -152,19 +152,42 @@ impl RootfsExtraction<'_> {
     fn run(&self) -> anyhow::Result<()> {
         let mut command = self.command();
         let rendered_command = format!("{command:?}");
-        let output = command.output().with_context(|| {
-            if let Some(fakeroot) = self.fakeroot_program {
-                format!(
-                    "failed to spawn fakeroot `{}`; rootfs extraction without full host ownership \
-                     privileges requires fakeroot",
-                    fakeroot.display()
-                )
-            } else {
-                format!("failed to spawn debugfs for {}", self.rootfs_img.display())
-            }
-        })?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                if let Some(fakeroot) = self.fakeroot_program {
+                    format!(
+                        "failed to spawn fakeroot `{}`; rootfs extraction without full host \
+                         ownership privileges requires fakeroot",
+                        fakeroot.display()
+                    )
+                } else {
+                    format!("failed to spawn debugfs for {}", self.rootfs_img.display())
+                }
+            })?;
+        let script_result = (|| {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("failed to open debugfs extraction stdin")?;
+            writeln!(stdin, "rdump / {}", debugfs_path_argument(self.output_dir)?)
+                .context("failed to write debugfs extraction command")?;
+            writeln!(stdin, "quit").context("failed to finalize debugfs extraction command")
+        })();
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for debugfs rootfs extraction")?;
+        script_result?;
 
-        if output.status.success() {
+        let extracted_entries = fs::read_dir(self.output_dir)
+            .with_context(|| format!("failed to inspect {}", self.output_dir.display()))?
+            .next()
+            .transpose()
+            .with_context(|| format!("failed to inspect {}", self.output_dir.display()))?;
+        if output.status.success() && extracted_entries.is_some() {
             return Ok(());
         }
 
@@ -175,12 +198,19 @@ impl RootfsExtraction<'_> {
         io::stderr()
             .write_all(&output.stderr)
             .context("failed to replay rootfs extraction stderr")?;
+        if output.status.success() {
+            bail!(
+                "failed to extract {} into {}: debugfs reported success but produced no entries",
+                self.rootfs_img.display(),
+                self.output_dir.display()
+            );
+        }
         bail!(
             "failed to extract {} into {}: command exited with status {}",
             self.rootfs_img.display(),
             self.output_dir.display(),
             output.status
-        );
+        )
     }
 
     fn command(&self) -> Command {
@@ -191,10 +221,7 @@ impl RootfsExtraction<'_> {
         } else {
             Command::new(self.debugfs_program)
         };
-        command
-            .arg("-R")
-            .arg(format!("rdump / {}", self.output_dir.display()))
-            .arg(self.rootfs_img);
+        command.arg(self.rootfs_img);
         command
     }
 }
@@ -732,11 +759,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fakeroot_command_keeps_debugfs_script_out_of_argv() {
+        let extraction = RootfsExtraction {
+            rootfs_img: Path::new("rootfs.img"),
+            output_dir: Path::new("staging-root"),
+            debugfs_program: Path::new("debugfs"),
+            fakeroot_program: Some(Path::new("fakeroot")),
+        };
+        let command = extraction.command();
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !args.iter().any(|argument| argument.starts_with("rdump ")),
+            "debugfs commands containing spaces are split by BSD getopt in macOS fakeroot: \
+             {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn non_root_extraction_starts_debugfs_inside_fakeroot() {
         let root = tempdir().unwrap();
         let fakeroot = root.path().join("fakeroot");
         let debugfs = root.path().join("debugfs");
         let marker = root.path().join("debugfs-ran-inside-fakeroot");
+        let output_dir = root.path().join("staging");
+        let extracted = output_dir.join("extracted");
         write_executable(
             &fakeroot,
             "#!/bin/sh\ntest \"$1\" = \"--\" || exit 91\nshift\nexport \
@@ -745,12 +796,13 @@ mod tests {
         write_executable(
             &debugfs,
             &format!(
-                "#!/bin/sh\ntest \"${{AXBUILD_TEST_FAKEROOT:-}}\" = \"1\" || exit 92\ntouch '{}'\n",
-                marker.display()
+                "#!/bin/sh\ntest \"${{AXBUILD_TEST_FAKEROOT:-}}\" = \"1\" || exit 92\ncat \
+                 >/dev/null\ntouch '{}' '{}'\n",
+                marker.display(),
+                extracted.display()
             ),
         );
 
-        let output_dir = root.path().join("staging");
         fs::create_dir(&output_dir).unwrap();
         RootfsExtraction {
             rootfs_img: Path::new("rootfs.img"),
