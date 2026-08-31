@@ -1252,6 +1252,7 @@ dependencies = [
  "axpanic",
  "axpoll",
  "cfg-if",
+ "event-listener",
  "extern-trait",
  "futures-util",
  "lock_api",

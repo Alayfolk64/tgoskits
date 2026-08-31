@@ -6,7 +6,7 @@ use core::{
     time::Duration,
 };
 
-use ax_runtime::hal::time::{NANOS_PER_SEC, monotonic_time_nanos, wall_time};
+use ax_runtime::hal::time::{NANOS_PER_SEC, TimeValue, monotonic_time};
 use linux_raw_sys::general::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
@@ -16,7 +16,7 @@ use starry_signal::{SignalInfo, Signo};
 
 use super::{
     PidIdentity,
-    timer::{AlarmTarget, register_alarm_for},
+    timer::{AlarmDeadline, AlarmTarget, register_alarm_for},
 };
 use crate::{StarryError, StarryResult, sync::IrqMutex as Mutex};
 
@@ -31,8 +31,8 @@ struct PosixTimer {
     sigev_value: i64,
     /// Interval for periodic timers (0 = one-shot).
     interval_ns: u64,
-    /// Absolute deadline (monotonic nanos) for the next expiry, or 0 if disarmed.
-    deadline_ns: u64,
+    /// Absolute deadline and its clock domain, or `None` if disarmed.
+    deadline: Option<AlarmDeadline>,
 }
 
 /// The value/interval pair passed to `timer_settime`.
@@ -79,16 +79,6 @@ fn is_valid_clock(clock_id: u32) -> bool {
     )
 }
 
-fn clock_now_ns(clock_id: u32) -> u64 {
-    match clock_id {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
-            let t = wall_time();
-            t.as_secs() * NANOS_PER_SEC + t.subsec_nanos() as u64
-        }
-        _ => monotonic_time_nanos() as u64,
-    }
-}
-
 impl PosixTimerTable {
     /// Create a new POSIX timer. Returns the timer ID.
     pub fn create(
@@ -123,7 +113,7 @@ impl PosixTimerTable {
             signo,
             sigev_value,
             interval_ns: 0,
-            deadline_ns: 0,
+            deadline: None,
         };
         self.timers.lock().insert(id, timer);
         Ok(id)
@@ -172,12 +162,10 @@ impl PosixTimerTable {
 
         // Compute old remaining time
         let old_interval = timer.interval_ns;
-        let old_remaining = if timer.deadline_ns > 0 {
-            let now = clock_now_ns(timer.clock_id);
-            timer.deadline_ns.saturating_sub(now)
-        } else {
-            0
-        };
+        let old_remaining = timer
+            .deadline
+            .map(|deadline| deadline.remaining().as_nanos() as u64)
+            .unwrap_or(0);
 
         // Compute new values
         let new_value_ns = value_sec as u64 * NANOS_PER_SEC + value_nsec as u64;
@@ -187,31 +175,32 @@ impl PosixTimerTable {
 
         if new_value_ns == 0 {
             // Disarm
-            timer.deadline_ns = 0;
+            timer.deadline = None;
         } else {
-            let now = clock_now_ns(timer.clock_id);
             let abs_flag = flags & 1; // TIMER_ABSTIME = 1
-            if abs_flag != 0 {
+            let deadline = if abs_flag != 0 {
                 // Absolute time: use the requested time directly.
                 // If it's already in the past, poll_expired will fire
                 // immediately (now >= deadline) per POSIX.
-                timer.deadline_ns = new_value_ns;
+                let deadline = TimeValue::from_nanos(new_value_ns);
+                if matches!(timer.clock_id, CLOCK_REALTIME | CLOCK_REALTIME_COARSE) {
+                    AlarmDeadline::Realtime(deadline)
+                } else {
+                    AlarmDeadline::Monotonic(deadline)
+                }
             } else {
-                // Relative time
-                timer.deadline_ns = now + new_value_ns;
-            }
-            // Register with the alarm system so poll_timer fires
-            if timer.deadline_ns > 0 {
-                let remaining = timer
-                    .deadline_ns
-                    .saturating_sub(clock_now_ns(timer.clock_id));
-                // Register alarm even if remaining == 0 (already expired)
-                // so that poll_expired runs on the next tick.
-                register_alarm_for(
-                    wall_time() + Duration::from_nanos(remaining),
-                    AlarmTarget::Process(Arc::downgrade(owner)),
-                );
-            }
+                // Relative timers use monotonic time regardless of the clock
+                // selected at timer_create, so a wall-clock step cannot alter
+                // their remaining interval.
+                AlarmDeadline::Monotonic(
+                    monotonic_time().saturating_add(Duration::from_nanos(new_value_ns)),
+                )
+            };
+            timer.deadline = Some(deadline);
+            register_alarm_for(
+                deadline,
+                AlarmTarget::Process(Arc::downgrade(owner)),
+            );
         }
 
         Ok((old_interval, old_remaining))
@@ -222,12 +211,10 @@ impl PosixTimerTable {
         let timers = self.timers.lock();
         let timer = timers.get(&id).ok_or(())?;
 
-        let remaining = if timer.deadline_ns > 0 {
-            let now = clock_now_ns(timer.clock_id);
-            timer.deadline_ns.saturating_sub(now)
-        } else {
-            0
-        };
+        let remaining = timer
+            .deadline
+            .map(|deadline| deadline.remaining().as_nanos() as u64)
+            .unwrap_or(0);
 
         Ok((timer.interval_ns, remaining))
     }
@@ -239,12 +226,11 @@ impl PosixTimerTable {
     pub fn poll_expired(&self, owner: &Arc<PidIdentity>, mut emitter: impl FnMut(SignalInfo)) {
         let mut timers = self.timers.lock();
         for timer in timers.values_mut() {
-            if timer.deadline_ns == 0 {
+            let Some(deadline) = timer.deadline else {
                 continue;
-            }
+            };
 
-            let now = clock_now_ns(timer.clock_id);
-            if now >= timer.deadline_ns {
+            if deadline.is_due() {
                 // Timer expired
                 if let Some(signo) = timer.signo {
                     emitter(SignalInfo::new_timer(signo, timer.sigev_value));
@@ -252,17 +238,15 @@ impl PosixTimerTable {
                 if timer.interval_ns > 0 {
                     // Periodic: advance deadline by interval (avoids drift)
                     // and register the next alarm for the user task.
-                    timer.deadline_ns += timer.interval_ns;
-                    let remaining = timer
-                        .deadline_ns
-                        .saturating_sub(clock_now_ns(timer.clock_id));
+                    let deadline = deadline.saturating_add(Duration::from_nanos(timer.interval_ns));
+                    timer.deadline = Some(deadline);
                     register_alarm_for(
-                        wall_time() + Duration::from_nanos(remaining),
+                        deadline,
                         AlarmTarget::Process(Arc::downgrade(owner)),
                     );
                 } else {
                     // One-shot: disarm
-                    timer.deadline_ns = 0;
+                    timer.deadline = None;
                 }
             }
         }

@@ -8,19 +8,17 @@
 //! Implementation model: each `Timerfd::new` spawns exactly one long-lived
 //! background task (via `ax_task::spawn_raw`) that owns a weak reference to
 //! the Timerfd. The task loops, reading the current deadline under the state
-//! lock, then parks on whichever fires first: the deadline (via
-//! `timeout_at_wall`) or an "arm event" poked by `settime` / `Drop`. One task
+//! lock, then parks on whichever fires first: the clock-domain deadline or an
+//! "arm event" poked by `settime` / `Drop`. One task
 //! per timerfd over its whole lifetime — no per-settime stack leak.
 //!
 //! Missed-tick coalescing: if the scheduler delays the task by N intervals,
 //! `read` returns the full count (Linux semantics).
-//!
-//! Caveats vs. Linux:
-//!   - Clock stepping doesn't exist, so `TFD_TIMER_CANCEL_ON_SET` is a no-op.
 
 use alloc::{
     borrow::{Cow, ToOwned},
-    sync::Arc,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -28,10 +26,12 @@ use core::{
     time::Duration,
 };
 
+use ax_lazyinit::LazyLock;
 use ax_runtime::hal::time::{TimeValue, monotonic_time, wall_time};
-use ax_task::future::{block_on, poll_io, timeout_at_wall};
+use ax_task::future::{block_on, poll_io, timeout_at, timeout_at_wall};
 use axpoll::{IoEvents, PollSet, Pollable};
 use event_listener::{Event, listener};
+use syscalls::Errno;
 
 use crate::{
     StarryError, StarryResult,
@@ -52,24 +52,91 @@ pub const CLOCK_BOOTTIME_ALARM: u32 = 9;
 pub const TFD_TIMER_ABSTIME: u32 = 1;
 pub const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
 
+/// Interpretation of the initial timerfd expiration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerfdSetMode {
+    /// The value is an interval measured by the monotonic clock.
+    Relative,
+    /// The value is an absolute deadline in the timerfd's clock domain.
+    Absolute,
+    /// The value is an absolute deadline that is canceled by realtime changes.
+    AbsoluteCancelOnSet,
+}
+
+impl TimerfdSetMode {
+    fn is_absolute(self) -> bool {
+        !matches!(self, Self::Relative)
+    }
+
+    fn cancel_on_set(self) -> bool {
+        matches!(self, Self::AbsoluteCancelOnSet)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerDeadline {
+    Monotonic(TimeValue),
+    Realtime(TimeValue),
+}
+
+impl TimerDeadline {
+    fn now(self) -> TimeValue {
+        match self {
+            Self::Monotonic(_) => monotonic_time(),
+            Self::Realtime(_) => wall_time(),
+        }
+    }
+
+    fn value(self) -> TimeValue {
+        match self {
+            Self::Monotonic(value) | Self::Realtime(value) => value,
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.value()
+            .checked_sub(self.now())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn lag(self) -> Option<Duration> {
+        self.now().checked_sub(self.value())
+    }
+
+    fn saturating_add(self, duration: Duration) -> Self {
+        match self {
+            Self::Monotonic(value) => Self::Monotonic(value.saturating_add(duration)),
+            Self::Realtime(value) => Self::Realtime(value.saturating_add(duration)),
+        }
+    }
+
+    fn is_realtime(self) -> bool {
+        matches!(self, Self::Realtime(_))
+    }
+}
+
 /// Internal, mutex-protected state of a timerfd.
 #[derive(Default)]
 struct State {
-    /// Time of the next expiration in absolute wall time. `None` when disarmed.
-    next_deadline: Option<TimeValue>,
+    /// Time of the next expiration and its clock domain. `None` when disarmed.
+    next_deadline: Option<TimerDeadline>,
     /// Interval for periodic firing. `Duration::ZERO` means one-shot.
     interval: Duration,
+    /// Whether an armed realtime absolute timer is canceled by a clock step.
+    cancel_on_set: bool,
+    /// Whether the next read must consume a realtime clock cancellation.
+    canceled: bool,
     /// When `true`, the background task should exit on its next wake.
     shutdown: bool,
 }
 
+static TIMERFD_INSTANCES: LazyLock<Mutex<Vec<Weak<Timerfd>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
 /// A timerfd. Held behind `Arc` and referenced both from the fd table and
 /// from the background timer task (as a `Weak<Timerfd>`).
 pub struct Timerfd {
-    /// The clock domain the user passed to `timerfd_create`. Used by
-    /// `settime(TFD_TIMER_ABSTIME)` to translate a user-supplied
-    /// absolute deadline (which is always in this domain) into the
-    /// internal wall-time domain before arming the monotonic timer wheel.
+    /// The clock domain the user passed to `timerfd_create`.
     clockid: u32,
     state: Mutex<State>,
     expire_count: AtomicU64,
@@ -99,6 +166,7 @@ impl Timerfd {
             non_blocking: AtomicBool::new(false),
             arm_event: Arc::new(Event::new()),
         });
+        TIMERFD_INSTANCES.lock().push(Arc::downgrade(&this));
         // Hand a weak reference to the task so the Timerfd can be freed
         // (and the task told to exit) when userspace closes the fd.
         let weak = Arc::downgrade(&this);
@@ -113,50 +181,37 @@ impl Timerfd {
     /// Arm or disarm the timer. Returns the previous `(interval, remaining)`.
     pub fn settime(
         &self,
-        abstime: bool,
+        mode: TimerfdSetMode,
         new_value: Duration,
         new_interval: Duration,
     ) -> StarryResult<(Duration, Duration)> {
-        let now = wall_time();
-
         let mut state = self.state.lock();
         let old_interval = state.interval;
         let old_remaining = state
             .next_deadline
-            .map(|dl| dl.checked_sub(now).unwrap_or(Duration::ZERO))
+            .map(TimerDeadline::remaining)
             .unwrap_or(Duration::ZERO);
 
         if new_value.is_zero() {
             state.next_deadline = None;
             state.interval = Duration::ZERO;
+            state.cancel_on_set = false;
         } else {
-            let deadline = if abstime {
-                // User passed an absolute deadline in `self.clockid`'s
-                // domain. CLOCK_REALTIME already uses the same epoch
-                // as the timer wheel's wall_time, so the user value
-                // is the wall deadline directly. CLOCK_MONOTONIC /
-                // CLOCK_BOOTTIME are measured since boot; convert to
-                // wall_time by adding the same offset (now - monotonic
-                // now) that the kernel applies elsewhere. Without
-                // this, a `clock_gettime(CLOCK_MONOTONIC) + 100ms`
-                // deadline would be interpreted as a wall timestamp
-                // and almost always fire immediately.
-                let user_abs = TimeValue::from_secs(new_value.as_secs())
-                    + Duration::from_nanos(new_value.subsec_nanos() as u64);
+            let deadline = if mode.is_absolute() {
                 match self.clockid {
-                    CLOCK_REALTIME | CLOCK_REALTIME_ALARM => user_abs,
-                    _ => {
-                        let mono = monotonic_time();
-                        let wall_minus_mono = now.checked_sub(mono).unwrap_or(Duration::ZERO);
-                        user_abs.checked_add(wall_minus_mono).unwrap_or(user_abs)
+                    CLOCK_REALTIME | CLOCK_REALTIME_ALARM => {
+                        TimerDeadline::Realtime(new_value)
                     }
+                    _ => TimerDeadline::Monotonic(new_value),
                 }
             } else {
-                now + new_value
+                TimerDeadline::Monotonic(monotonic_time().saturating_add(new_value))
             };
             state.next_deadline = Some(deadline);
             state.interval = new_interval;
+            state.cancel_on_set = mode.cancel_on_set() && deadline.is_realtime();
         }
+        state.canceled = false;
         // Clear any expirations that accumulated under the previous
         // setting. man timerfd_read(2) is explicit: read returns the
         // number of expirations since "the last successful read or the
@@ -182,13 +237,30 @@ impl Timerfd {
         let interval = state.interval;
         let remaining = match state.next_deadline {
             None => Duration::ZERO,
-            Some(dl) => {
-                let now = wall_time();
-                dl.checked_sub(now).unwrap_or(Duration::ZERO)
-            }
+            Some(deadline) => deadline.remaining(),
         };
         (interval, remaining)
     }
+}
+
+/// Marks cancel-on-set realtime timerfds after a discontinuous clock change.
+pub fn notify_realtime_clock_changed() {
+    TIMERFD_INSTANCES.lock().retain(|weak| {
+        let Some(timerfd) = weak.upgrade() else {
+            return false;
+        };
+
+        let mut state = timerfd.state.lock();
+        if state.cancel_on_set && state.next_deadline.is_some() {
+            state.canceled = true;
+            timerfd.expire_count.store(1, Ordering::Release);
+            drop(state);
+            timerfd.arm_event.notify(usize::MAX);
+            // The cancellation marker is visible before readers are woken.
+            unsafe { timerfd.poll_rx.wake(IoEvents::IN) };
+        }
+        true
+    });
 }
 
 impl Drop for Timerfd {
@@ -237,10 +309,18 @@ async fn run_timer(weak: alloc::sync::Weak<Timerfd>) {
                 listener.await;
             }
             Some(dl) => {
-                // Race the wall-clock deadline against an arm_event (new
-                // settime or shutdown). `timeout_at_wall` returns
-                // Err(Elapsed) on deadline, Ok(()) if the listener fires first.
-                let fired_timer = timeout_at_wall(Some(dl), listener).await.is_err();
+                // Race the deadline against an arm_event (new settime,
+                // cancellation, or shutdown). Relative timers stay in the
+                // monotonic domain; only absolute realtime timers are rebuilt
+                // after a wall-clock step.
+                let fired_timer = match dl {
+                    TimerDeadline::Monotonic(deadline) => {
+                        timeout_at(Some(deadline), listener).await.is_err()
+                    }
+                    TimerDeadline::Realtime(deadline) => {
+                        timeout_at_wall(Some(deadline), listener).await.is_err()
+                    }
+                };
                 if !fired_timer {
                     // State changed; loop to re-read.
                     continue;
@@ -251,8 +331,6 @@ async fn run_timer(weak: alloc::sync::Weak<Timerfd>) {
                 let Some(tfd) = weak.upgrade() else {
                     return;
                 };
-                let now = wall_time();
-
                 let mut expirations: u64 = 1;
                 let mut next_deadline = dl;
                 if !interval.is_zero() {
@@ -262,14 +340,14 @@ async fn run_timer(weak: alloc::sync::Weak<Timerfd>) {
                     // truncate; u32::MAX ticks at a 1 ns interval is still
                     // ~4 seconds of lag, which is more than any real
                     // scheduler delay we need to represent faithfully.
-                    if let Some(lag) = now.checked_sub(dl) {
+                    if let Some(lag) = dl.lag() {
                         let extra_ticks = lag.as_nanos() / interval.as_nanos().max(1);
                         let extra = core::cmp::min(extra_ticks, u32::MAX as u128 - 1) as u32;
                         expirations += extra as u64;
                         // saturating_mul avoids panic on pathological
                         // (interval, extra) pairs.
                         let advance = interval.saturating_mul(extra + 1);
-                        next_deadline += advance;
+                        next_deadline = dl.saturating_add(advance);
                     }
                 }
 
@@ -309,6 +387,15 @@ impl FileLike for Timerfd {
             return Err(StarryError::InvalidInput);
         }
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+            {
+                let mut state = self.state.lock();
+                if state.canceled {
+                    state.canceled = false;
+                    self.expire_count.store(0, Ordering::Release);
+                    return Err(Errno::ECANCELED.into());
+                }
+            }
+
             // Race-free read: atomically claim the entire `expire_count`
             // snapshot via CAS so concurrent readers can't both observe
             // and copy the same ticks. Linux's `timerfd_read(2)` holds
