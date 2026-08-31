@@ -1,0 +1,26 @@
+args = [
+    "-nographic",
+    "-accel",
+    "hvf",
+    "-machine",
+    "virt,gic-version=3",
+    "-cpu",
+    "host",
+    "-m",
+    "8192M",
+    "-smp",
+    "8",
+]
+uefi = false
+to_bin = true
+rootfs_write_policy = "persist"
+shell_prefix = "root@starry:"
+shell_init_cmd = "/bin/sh /opt/starry-macos-run.sh"
+success_regex = ["(?m)^===STARRY-MACOS-TG-XTASK-PROFILE-PASS elapsed=[0-9]+ rc=(0|124) parallelism=system-default===$"]
+fail_regex = [
+    "(?i)\\bpanicked at\\b",
+    "(?i)\\bkernel panic\\b",
+    "(?i)\\bunhandled trap\\b",
+    "(?m)^===STARRY-MACOS-TG-XTASK-PROFILE-FAIL",
+]
+timeout = 1200

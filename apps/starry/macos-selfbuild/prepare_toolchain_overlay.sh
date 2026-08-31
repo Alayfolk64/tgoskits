@@ -540,6 +540,7 @@ build_toolchain_overlay() {
         clang-libclang
         lld
         llvm
+        perf
         rust
         cargo
         rust-src
