@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log", required=True, type=pathlib.Path)
     parser.add_argument("--ready-file", required=True, type=pathlib.Path)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--timeout", type=int, default=10_800)
+    parser.add_argument("--timeout", type=int, default=22_800)
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.run_id):
         parser.error("--run-id contains unsupported characters")

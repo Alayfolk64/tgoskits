@@ -13,7 +13,7 @@ profile=off
 skip_provision=0
 skip_boot_build=0
 serial="${BOARD_SERIAL:-/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0}"
-serial_timeout=10800
+serial_timeout=22800
 linux_return_attempts=180
 linux_return_interval=5
 
