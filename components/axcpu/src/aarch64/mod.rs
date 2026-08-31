@@ -5,6 +5,7 @@ pub mod init;
 pub mod pmu;
 
 pub(crate) mod paging;
+mod sctlr;
 
 mod trap;
 

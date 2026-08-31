@@ -29,6 +29,21 @@ int main(void)
     __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
     CHECK(ctr != 0, "MRS CTR_EL0 returned a non-zero value");
 
+    /* Linux-compatible EL0 permits ordinary unaligned accesses to Normal
+     * memory. Some firmware leaves SCTLR_EL1.A set, so the kernel must clear
+     * it explicitly instead of inheriting the boot-time policy. */
+    _Alignas(uint64_t) const uint8_t bytes[] = {
+        0xa5, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00
+    };
+    const uint8_t *unaligned = bytes + 1;
+    uint64_t unaligned_value = 0;
+    __asm__ volatile("ldr %0, [%1]"
+                     : "=r"(unaligned_value)
+                     : "r"(unaligned)
+                     : "memory");
+    CHECK(unaligned_value == UINT64_C(0x12345678),
+          "ordinary unaligned LDR returned without an alignment fault");
+
     /* DC ZVA 块大小由 DCZID_EL0.BS 给出, 单位是 4 字节字。
      * DCZID_EL0.DZP 置位时, 用户态不应执行 DC ZVA。 */
     uint64_t dczid = 0;
