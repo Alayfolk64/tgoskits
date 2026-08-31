@@ -1059,4 +1059,29 @@ mod tests {
         // children from inheriting a writer of the staged inode before close.
         fs::rename(staged_path, path).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn overlay_debugfs_commands_quote_paths_with_spaces() {
+        let root = tempdir().unwrap();
+        let overlay_dir = root.path().join("overlay root");
+        let spaced_dir = overlay_dir.join("dir with space");
+        fs::create_dir_all(&spaced_dir).unwrap();
+        let spaced_file = spaced_dir.join("file with space");
+        fs::write(&spaced_file, b"content").unwrap();
+
+        let mut commands = Vec::new();
+        collect_overlay_debugfs_commands(&overlay_dir, Path::new(""), &mut commands).unwrap();
+
+        assert!(commands.contains(&"mkdir \"/dir with space\"".to_string()));
+        assert!(commands.contains(&"rm \"/dir with space/file with space\"".to_string()));
+        assert!(commands.contains(&format!(
+            "write \"{}\" \"/dir with space/file with space\"",
+            spaced_file.display()
+        )));
+        assert!(commands
+            .iter()
+            .any(|command| command.starts_with("sif \"/dir with space/file with space\" mode ")));
+    }
+
+
 }
