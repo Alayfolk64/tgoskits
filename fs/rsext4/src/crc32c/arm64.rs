@@ -1,4 +1,4 @@
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[allow(dead_code)]
 use core::arch::asm;
 #[cfg(target_arch = "aarch64")]
@@ -41,24 +41,34 @@ use core::arch::aarch64::{__crc32cb, __crc32cd, __crc32ch, __crc32cw};
 #[inline]
 #[allow(dead_code)]
 pub fn has_hardware_crc32() -> bool {
-    use log::warn;
-
-    let mut reg_val: u64;
-    unsafe {
-        // mrs: Move from System Register to general purpose register
-        asm!("mrs {}, ID_AA64ISAR0_EL1", out(reg) reg_val);
+    #[cfg(target_os = "macos")]
+    {
+        // EL1 feature registers are not accessible from a macOS userspace
+        // host test. The table implementation is always available there.
+        false
     }
 
-    // Bits [19:16] encode CRC32 feature support.
-    let crc_field = (reg_val >> 16) & 0xF;
-    warn!("ID_AA64ISAR0_EL1[19:16]: {crc_field:#x}");
-    // `>= 1` means CRC32 and CRC32C instructions are present.
-    if crc_field >= 1 {
-        warn!("Hardware CRC32C support detected.");
-        true
-    } else {
-        warn!("No hardware CRC32C support.");
-        false
+    #[cfg(not(target_os = "macos"))]
+    {
+        use log::warn;
+
+        let mut reg_val: u64;
+        unsafe {
+            // mrs: Move from System Register to general purpose register
+            asm!("mrs {}, ID_AA64ISAR0_EL1", out(reg) reg_val);
+        }
+
+        // Bits [19:16] encode CRC32 feature support.
+        let crc_field = (reg_val >> 16) & 0xF;
+        warn!("ID_AA64ISAR0_EL1[19:16]: {crc_field:#x}");
+        // `>= 1` means CRC32 and CRC32C instructions are present.
+        if crc_field >= 1 {
+            warn!("Hardware CRC32C support detected.");
+            true
+        } else {
+            warn!("No hardware CRC32C support.");
+            false
+        }
     }
 }
 
