@@ -84,7 +84,6 @@ rust_dist_dir="$work_dir/rust-dist-${cache_rust_toolchain}"
 cargo_home_dir="$work_dir/cargo-home"
 prefetch_source_dir="$work_dir/prefetch-source"
 extra_fetch_dir="$work_dir/extra-fetch"
-extra_fetch_workspace_dir="$work_dir/extra-fetch-workspace"
 marker_file="$output_dir/.starry-macos-toolchain-overlay"
 
 sha256_file() {
@@ -108,6 +107,7 @@ alpine_arch=$alpine_arch
 guest_target=$guest_target
 cargo_lock_sha256=$cargo_lock_sha
 cargo_registry_index=$cargo_registry_index
+guest_packages_version=2
 EOF
 }
 
@@ -380,7 +380,7 @@ CARGO_CFG
 
     rm -rf "$prefetch_source_dir"
     mkdir -p "$prefetch_source_dir"
-    for path in Cargo.toml Cargo.lock rust-toolchain.toml .cargo apps bootloader components drivers memory net os platforms scripts test-suit tools vendor virtualization xtask; do
+    for path in Cargo.toml Cargo.lock rust-toolchain.toml .cargo apps bootloader components drivers fs memory net os platforms scripts test-suit tools vendor virtualization xtask; do
         if [[ -e "$source_dir/$path" ]]; then
             cp -a "$source_dir/$path" "$prefetch_source_dir/"
         fi
@@ -392,42 +392,9 @@ CARGO_CFG
     prefetch_manifest="$prefetch_source_dir/Cargo.toml"
 
     cargo_fetch "${cargo_env[@]}" \
-        cargo fetch --target "$guest_target" --manifest-path "$prefetch_manifest"
-
-    rm -rf "$extra_fetch_workspace_dir"
-    mkdir -p "$extra_fetch_workspace_dir/src"
-    cat >"$extra_fetch_workspace_dir/Cargo.toml" <<'EXTRA_CARGO'
-[package]
-name = "starry-selfbuild-extra-fetch-workspace"
-version = "0.0.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-EXTRA_CARGO
-    awk '
-        function emit() {
-            if (name != "" && version != "" && source ~ /^registry/) {
-                alias = name
-                gsub(/[^A-Za-z0-9_]/, "_", alias)
-                sub(/\+.*/, "", version)
-                printf "extra_%04d_%s = { package = \"%s\", version = \"=%s\" }\n", count, alias, name, version
-                count++
-            }
-        }
-        /^\[\[package\]\]/ { emit(); name = ""; version = ""; source = ""; next }
-        /^name = / { name = $0; sub(/^name = "/, "", name); sub(/"$/, "", name); next }
-        /^version = / { version = $0; sub(/^version = "/, "", version); sub(/"$/, "", version); next }
-        /^source = / { source = $0; sub(/^source = "/, "", source); sub(/"$/, "", source); next }
-        END { emit() }
-    ' "$source_dir/Cargo.lock" >>"$extra_fetch_workspace_dir/Cargo.toml"
-    cat >>"$extra_fetch_workspace_dir/Cargo.toml" <<'EXTRA_CARGO'
-
-[workspace]
-EXTRA_CARGO
-    : >"$extra_fetch_workspace_dir/src/lib.rs"
+        cargo fetch --locked --target "$guest_target" --manifest-path "$prefetch_manifest"
     cargo_fetch "${cargo_env[@]}" \
-        cargo fetch --manifest-path "$extra_fetch_workspace_dir/Cargo.toml"
+        cargo fetch --locked --manifest-path "$prefetch_manifest"
 
     if [[ -f "$output_dir/opt/rust-nightly/lib/rustlib/src/rust/library/sysroot/Cargo.toml" ]]; then
         cargo_fetch "${cargo_env[@]}" \
