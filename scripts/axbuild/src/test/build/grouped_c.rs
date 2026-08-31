@@ -337,7 +337,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             ("phase", "find-qemu-user".to_string()),
         ],
     );
-    let qemu_runner = find_host_binary_candidates(qemu_user_binary_names(arch)?)?;
+    let qemu_runner = find_qemu_user_binary(arch)?;
     timing_stage.finish();
 
     let root_prebuild_script = case.case_dir.join(CASE_PREBUILD_SCRIPT_NAME);
@@ -434,7 +434,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             ("phase", "prepare-cross-env".to_string()),
         ],
     );
-    let build_env = prepare_host_cross_build_env(arch, layout, &qemu_runner)?;
+    let build_env = prepare_host_cross_build_env(arch, layout, qemu_runner.as_deref())?;
     timing_stage.finish();
 
     if grouped_c_root_project_path(case).is_file() {

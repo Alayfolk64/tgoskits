@@ -23,7 +23,9 @@ use super::{
 };
 use crate::{
     context::CrossCompileSpec,
-    support::process::{ProcessExt, find_host_binary_candidates},
+    support::process::{
+        ProcessExt, find_host_binary_candidates, find_optional_host_binary_candidates,
+    },
 };
 
 const CASE_C_DIR_NAME: &str = "c";
@@ -44,7 +46,7 @@ pub(crate) struct HostCrossBuildEnv {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GuestPrebuildEnv {
-    qemu_runner: PathBuf,
+    qemu_runner: Option<PathBuf>,
     script_envs: Vec<(String, String)>,
 }
 
@@ -77,10 +79,14 @@ pub(crate) use python::{case_python_source_dir, prepare_python_case_assets_sync}
 pub(crate) use rust::{
     case_rust_source_dir, prepare_rust_case_assets_sync, prepare_rust_case_overlay_sync,
 };
-use toolchain::{cross_compile_spec, write_cmake_toolchain_file, write_cross_bin_wrappers};
+use toolchain::{
+    cross_compile_spec, write_cmake_toolchain_file, write_cross_bin_wrappers,
+    write_native_llvm_bin_wrappers,
+};
 use wrappers::{
-    apply_case_script_envs, case_script_envs, ensure_guest_tool_exists, guest_library_path,
-    qemu_user_binary_names, write_guest_command_wrappers, write_guest_exec_wrapper,
+    apply_case_script_envs, case_script_envs, ensure_guest_tool_exists, find_qemu_user_binary,
+    guest_library_path, qemu_user_binary_names, shell_single_quote, write_guest_command_wrappers,
+    write_guest_exec_wrapper, write_wrapper_script,
 };
 
 #[cfg(test)]

@@ -137,7 +137,7 @@ pub(crate) fn prepare_c_case_overlay_sync(
             ("phase", "find-qemu-user".to_string()),
         ],
     );
-    let qemu_runner = find_host_binary_candidates(qemu_user_binary_names(arch)?)?;
+    let qemu_runner = find_qemu_user_binary(arch)?;
     timing_stage.finish();
     let timing_stage = timing::TimingStage::new(
         "qemu-asset-c",
@@ -146,7 +146,7 @@ pub(crate) fn prepare_c_case_overlay_sync(
             ("phase", "prepare-cross-env".to_string()),
         ],
     );
-    let build_env = prepare_host_cross_build_env(arch, layout, &qemu_runner)?;
+    let build_env = prepare_host_cross_build_env(arch, layout, qemu_runner.as_deref())?;
     timing_stage.finish();
 
     let timing_stage = timing::TimingStage::new(
