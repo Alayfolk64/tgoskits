@@ -79,6 +79,10 @@ Linux performs the relevant operations in this order:
    distinguishes monotonic and realtime timers; a cancel-on-set realtime timer
    reports `ECANCELED` from
    [`read`](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L263-L307).
+6. Periodic POSIX timers use
+   [`hrtimer_forward`](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/kernel/time/posix-timers.c#L287-L327)
+   to move directly past every elapsed interval, merge the missed expirations
+   into one notification, and clamp the reported `si_overrun` to `INT_MAX`.
 
 The public ABI and errno descriptions are also documented by
 [`clock_settime(2)`](https://man7.org/linux/man-pages/man2/clock_settime.2.html)
@@ -149,6 +153,15 @@ the dispatcher selects the entry with the smallest current remaining duration
 and sleeps against a monotonic deadline. A clock-change event wakes it to
 re-evaluate realtime entries.
 
+When a periodic POSIX realtime timer becomes overdue after a wall-clock step,
+one expiration poll computes the full lag in units of the timer interval. It
+moves the deadline to the first interval strictly after the adjusted clock,
+queues one `SI_TIMER` notification, and records the additional expirations in
+`si_overrun`, clamped to `INT_MAX`. This prevents the alarm task from repeatedly
+re-registering a deadline that is still in the past. The existing missing
+`timer_getoverrun(2)` syscall is outside this clock-setting change; the overrun
+value is nevertheless visible through `siginfo_t` and `signalfd_siginfo`.
+
 Timerfds are tracked through a weak-reference registry. Closing a timerfd
 immediately unregisters its weak reference, so creating and closing timerfds
 cannot retain dead `Arc` allocations until the next clock step. A realtime
@@ -207,6 +220,9 @@ The deterministic regression is
 - `gettimeofday` and a written-and-closed file observe the adjusted clock;
 - a relative timerfd remains pending;
 - an absolute realtime cancel-on-set timerfd returns `ECANCELED`;
+- a periodic absolute realtime POSIX timer survives a 120-second forward step
+  by queuing one signal, reporting the merged count through `si_overrun`, and
+  publishing a next deadline in the future;
 - the original clock is restored using monotonic elapsed time.
 
 Before implementation, the AArch64 run failed deterministically with
@@ -236,7 +252,7 @@ is not part of this syscall change.
 | `timerfd_settime` | compatible for clock-step behavior | [`timerfd_create(2)`](https://man7.org/linux/man-pages/man2/timerfd_create.2.html), [Linux timerfd clock-change path](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L90-L173) | Relative timers stay monotonic; absolute realtime timers are re-evaluated; cancel-on-set is armed only for that domain. |
 | `timerfd_gettime` | compatible for adjusted deadlines | [`timerfd_create(2)`](https://man7.org/linux/man-pages/man2/timerfd_create.2.html) | Remaining time is computed in the deadline's explicit clock domain. |
 | `read` (timerfd) | compatible for cancel-on-set | [Linux timerfd read path](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L263-L307) | One read consumes the cancellation and returns `ECANCELED`. |
-| `timer_settime` | improved clock-step compatibility | [`timer_settime(2)`](https://man7.org/linux/man-pages/man2/timer_settime.2.html) | Relative timers use monotonic deadlines; absolute `CLOCK_REALTIME` timers retain realtime deadlines and are re-evaluated. |
+| `timer_settime` | improved clock-step compatibility | [`timer_settime(2)`](https://man7.org/linux/man-pages/man2/timer_settime.2.html), [Linux periodic rearm](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/kernel/time/posix-timers.c#L287-L327) | Relative timers use monotonic deadlines; absolute `CLOCK_REALTIME` timers retain realtime deadlines and are re-evaluated. Missed periodic expirations are merged into one notification, the next deadline skips all elapsed intervals, and `si_overrun` is clamped to `INT_MAX`. |
 | `timer_gettime` | no regression | [`timer_gettime(2)`](https://man7.org/linux/man-pages/man2/timer_gettime.2.html) | Remaining time is derived from the timer's tagged domain. |
 | `setitimer` | no regression | [`getitimer(2)`](https://man7.org/linux/man-pages/man2/getitimer.2.html) | `ITIMER_REAL` remains an elapsed-time interval across realtime changes. |
 | `getitimer` | no regression | [`getitimer(2)`](https://man7.org/linux/man-pages/man2/getitimer.2.html) | Reports monotonic remaining duration. |

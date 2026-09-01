@@ -52,12 +52,6 @@ impl AlarmDeadline {
         self.remaining().is_zero()
     }
 
-    pub(super) fn saturating_add(self, duration: Duration) -> Self {
-        match self {
-            Self::Monotonic(deadline) => Self::Monotonic(deadline.saturating_add(duration)),
-            Self::Realtime(deadline) => Self::Realtime(deadline.saturating_add(duration)),
-        }
-    }
 }
 
 struct Entry {

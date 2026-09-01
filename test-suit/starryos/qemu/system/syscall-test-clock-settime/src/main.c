@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,12 +19,21 @@
 #define LINUX_TIME_UPTIME_SEC_MAX (30LL * 365 * 24 * 60 * 60)
 #define LINUX_TIME_SETTOD_SEC_MAX                                           \
     (INT64_MAX / 1000000000LL - LINUX_TIME_UPTIME_SEC_MAX)
+#define CLOCK_STEP_SEC 120LL
 
 static const char *timestamp_path = "/tmp/starry-clock-settime-timestamp";
 
 struct timerfd_probes {
     int relative_fd;
     int cancel_fd;
+};
+
+struct posix_timer_probe {
+    timer_t timer_id;
+    sigset_t wait_set;
+    sigset_t old_mask;
+    int created;
+    int mask_saved;
 };
 
 static int fail(const char *operation)
@@ -209,6 +219,92 @@ static void close_timerfd_probes(const struct timerfd_probes *probes)
     }
 }
 
+static int prepare_posix_timer_probe(const struct timespec *original_realtime,
+                                     struct posix_timer_probe *probe)
+{
+    sigemptyset(&probe->wait_set);
+    sigaddset(&probe->wait_set, SIGRTMIN);
+    if (sigprocmask(SIG_BLOCK, &probe->wait_set, &probe->old_mask) < 0) {
+        return fail("block POSIX timer signal");
+    }
+    probe->mask_saved = 1;
+
+    struct sigevent event = {
+        .sigev_notify = SIGEV_SIGNAL,
+        .sigev_signo = SIGRTMIN,
+        .sigev_value.sival_int = 0x2237,
+    };
+    if (timer_create(CLOCK_REALTIME, &event, &probe->timer_id) < 0) {
+        return fail("create periodic realtime POSIX timer");
+    }
+    probe->created = 1;
+
+    struct itimerspec periodic = {
+        .it_interval = {.tv_sec = 1, .tv_nsec = 0},
+        .it_value = {
+            .tv_sec = original_realtime->tv_sec + 1,
+            .tv_nsec = original_realtime->tv_nsec,
+        },
+    };
+    if (timer_settime(probe->timer_id, TIMER_ABSTIME, &periodic, NULL) < 0) {
+        return fail("arm periodic realtime POSIX timer");
+    }
+    return 0;
+}
+
+static int check_posix_timer_clock_step(struct posix_timer_probe *probe)
+{
+    const struct timespec wait_time = {.tv_sec = 2, .tv_nsec = 0};
+    siginfo_t info = {0};
+    int signo = sigtimedwait(&probe->wait_set, &info, &wait_time);
+    if (signo != SIGRTMIN || info.si_code != SI_TIMER ||
+        info.si_value.sival_int != 0x2237 || info.si_overrun < 100) {
+        fprintf(stderr,
+                "POSIX timer probe: signo=%d code=%d value=%d overrun=%d\n",
+                signo, info.si_code, info.si_value.sival_int,
+                info.si_overrun);
+        errno = EPROTO;
+        return fail("merge missed periodic expirations into one signal");
+    }
+
+    struct itimerspec current = {0};
+    if (timer_gettime(probe->timer_id, &current) < 0) {
+        return fail("read periodic realtime POSIX timer after clock step");
+    }
+    int64_t remaining_nanos = timespec_to_nanos(&current.it_value);
+    if (remaining_nanos <= 0 || remaining_nanos > 1000000000LL) {
+        errno = EPROTO;
+        return fail("advance periodic POSIX timer deadline past stepped clock");
+    }
+
+    struct itimerspec disarmed = {0};
+    if (timer_settime(probe->timer_id, 0, &disarmed, NULL) < 0) {
+        return fail("disarm periodic realtime POSIX timer");
+    }
+
+    const struct timespec no_wait = {0};
+    errno = 0;
+    if (sigtimedwait(&probe->wait_set, NULL, &no_wait) != -1 ||
+        errno != EAGAIN) {
+        errno = EPROTO;
+        return fail("queue only one signal for missed POSIX timer periods");
+    }
+    return 0;
+}
+
+static void close_posix_timer_probe(struct posix_timer_probe *probe)
+{
+    if (probe->created) {
+        timer_delete(probe->timer_id);
+    }
+    if (probe->mask_saved) {
+        const struct timespec no_wait = {0};
+        while (sigtimedwait(&probe->wait_set, NULL, &no_wait) == SIGRTMIN) {
+        }
+        sigprocmask(SIG_SETMASK, &probe->old_mask, NULL);
+    }
+}
+
 static int restore_realtime(const struct timespec *original_realtime,
                             const struct timespec *original_monotonic)
 {
@@ -276,7 +372,7 @@ int main(void)
     }
 
     int64_t requested_nanos = timespec_to_nanos(&original_realtime) +
-                              120LL * 1000000000LL;
+                              CLOCK_STEP_SEC * 1000000000LL;
     struct timespec requested = nanos_to_timespec(requested_nanos);
     if (check_unprivileged_set_is_rejected(&requested)) {
         return EXIT_FAILURE;
@@ -288,19 +384,31 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+    struct posix_timer_probe posix_probe = {0};
+    if (prepare_posix_timer_probe(&original_realtime, &posix_probe)) {
+        close_posix_timer_probe(&posix_probe);
+        close_timerfd_probes(&probes);
+        return EXIT_FAILURE;
+    }
+
     if (syscall(SYS_clock_settime, CLOCK_REALTIME, &requested) < 0) {
+        close_posix_timer_probe(&posix_probe);
         close_timerfd_probes(&probes);
         return fail("set CLOCK_REALTIME as root");
     }
 
-    int result = check_realtime_observers(
-        requested_nanos, timespec_to_nanos(&original_monotonic));
+    int result = check_posix_timer_clock_step(&posix_probe);
+    if (result == 0) {
+        result = check_realtime_observers(
+            requested_nanos, timespec_to_nanos(&original_monotonic));
+    }
     if (result == 0) {
         result = check_timerfd_clock_step(&probes);
     }
     if (result == 0) {
         result = check_new_file_timestamp(requested_nanos);
     }
+    close_posix_timer_probe(&posix_probe);
     close_timerfd_probes(&probes);
     int restore_result = restore_realtime(&original_realtime,
                                           &original_monotonic);
