@@ -183,11 +183,8 @@ fn parse_futex_op(futex_op: u32) -> StarryResult<ParsedFutexOp> {
     };
 
     let clock_realtime = flags & FUTEX_CLOCK_REALTIME != 0;
-    if clock_realtime && command == FutexCommand::WakeOp {
+    if clock_realtime && command != FutexCommand::WaitBitset {
         return Err(StarryError::Unsupported);
-    }
-    if clock_realtime && !matches!(command, FutexCommand::Wait | FutexCommand::WaitBitset) {
-        return Err(StarryError::InvalidInput);
     }
 
     let key_mode = if flags & FUTEX_PRIVATE_FLAG != 0 {

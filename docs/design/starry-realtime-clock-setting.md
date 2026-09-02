@@ -138,7 +138,7 @@ monotonic waits. The implementation therefore makes clock domains explicit:
 | `timerfd` | monotonic | realtime; optional cancel-on-set |
 | POSIX timers | monotonic | realtime |
 | `ITIMER_REAL` and `alarm` | monotonic | not applicable |
-| futex waits | monotonic | realtime for `FUTEX_CLOCK_REALTIME` |
+| futex waits | monotonic | realtime for `FUTEX_WAIT_BITSET` with `FUTEX_CLOCK_REALTIME` |
 | POSIX message queues | not applicable | realtime |
 | AIO, I/O multiplexing, socket, and USB timeouts | monotonic | not applicable |
 
@@ -257,7 +257,7 @@ is not part of this syscall change.
 | `setitimer` | no regression | [`getitimer(2)`](https://man7.org/linux/man-pages/man2/getitimer.2.html) | `ITIMER_REAL` remains an elapsed-time interval across realtime changes. |
 | `getitimer` | no regression | [`getitimer(2)`](https://man7.org/linux/man-pages/man2/getitimer.2.html) | Reports monotonic remaining duration. |
 | `alarm` | no regression | [`alarm(2)`](https://man7.org/linux/man-pages/man2/alarm.2.html) | Uses the same monotonic process-real-timer state. |
-| `futex` | improved realtime absolute-wait behavior | [`futex(2)`](https://man7.org/linux/man-pages/man2/futex.2.html) | Relative waits retain one monotonic deadline; `FUTEX_CLOCK_REALTIME` absolute waits rebuild after a clock step. |
+| `futex` | improved realtime absolute-wait behavior | [`futex(2)`](https://man7.org/linux/man-pages/man2/futex.2.html), [Linux operation validation](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/kernel/futex/syscalls.c#L88-L97) | `FUTEX_WAIT_BITSET` with `FUTEX_CLOCK_REALTIME` rebuilds its absolute realtime wait after a clock step; unsupported clock-flag combinations return `ENOSYS`. |
 | `mq_timedsend` | no regression | [`mq_timedsend(3)`](https://man7.org/linux/man-pages/man3/mq_timedsend.3.html) | Existing wall-deadline wait now receives realtime-change notifications. |
 | `mq_timedreceive` | no regression | [`mq_timedreceive(3)`](https://man7.org/linux/man-pages/man3/mq_timedreceive.3.html) | Existing wall-deadline wait now receives realtime-change notifications. |
 | `io_getevents` | corrected relative-time behavior | [`io_getevents(2)`](https://man7.org/linux/man-pages/man2/io_getevents.2.html) | Its relative timeout now uses monotonic time. |
