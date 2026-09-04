@@ -43,6 +43,7 @@ mod raw {
 
     unsafe extern "C" {
         pub(super) fn eventfd(initval: u32, flags: c_int) -> c_int;
+        pub(super) fn pipe(pipefd: *mut c_int) -> c_int;
         pub(super) fn epoll_create1(flags: c_int) -> c_int;
         pub(super) fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent)
         -> c_int;
@@ -81,6 +82,13 @@ fn io_syscall(result: isize) -> Result<usize, c_int> {
 
 pub fn eventfd(initval: u32, flags: c_int) -> Result<c_int, c_int> {
     fd_syscall(unsafe { raw::eventfd(initval, flags) })
+}
+
+/// Creates a pipe and returns `(read_fd, write_fd)`.
+pub fn pipe() -> Result<(c_int, c_int), c_int> {
+    let mut fds = [0 as c_int; 2];
+    fd_syscall(unsafe { raw::pipe(fds.as_mut_ptr()) })?;
+    Ok((fds[0], fds[1]))
 }
 
 pub fn epoll_create1(flags: c_int) -> Result<c_int, c_int> {

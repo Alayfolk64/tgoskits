@@ -863,6 +863,28 @@ pub unsafe extern "C" fn eventfd(_initval: c_uint, _flags: c_int) -> c_int {
 /// # Safety
 ///
 /// Callers must uphold the Linux/musl ABI contract for this libc symbol.
+#[cfg(feature = "fd")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pipe(pipefd: *mut c_int) -> c_int {
+    if pipefd.is_null() {
+        return fail(Errno::EFAULT);
+    }
+    let fds = unsafe { core::slice::from_raw_parts_mut(pipefd, 2) };
+    ok_or_errno(ax_posix_api::sys_pipe(fds))
+}
+
+/// # Safety
+///
+/// Callers must uphold the Linux/musl ABI contract for this libc symbol.
+#[cfg(not(feature = "fd"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pipe(_pipefd: *mut c_int) -> c_int {
+    fail(Errno::ENOSYS)
+}
+
+/// # Safety
+///
+/// Callers must uphold the Linux/musl ABI contract for this libc symbol.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isatty(_fd: c_int) -> c_int {
     fail(Errno::ENOTTY)
