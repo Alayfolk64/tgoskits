@@ -626,7 +626,7 @@ fn run_debugfs_script_with_program(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{env, fs, path::Path};
 
     use tempfile::tempdir;
 
@@ -733,7 +733,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_root_extraction_starts_debugfs_inside_fakeroot() {
-        let root = tempdir().unwrap();
+        let root = executable_helper_tempdir();
         let fakeroot = root.path().join("fakeroot");
         let debugfs = root.path().join("debugfs");
         let marker = root.path().join("debugfs-ran-inside-fakeroot");
@@ -828,9 +828,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn debugfs_script_discards_normal_stdout_and_receives_all_commands() {
-        let root = tempdir().unwrap();
+        use std::fs::OpenOptions;
+
+        let root = executable_helper_tempdir();
         let debugfs = root.path().join("debugfs");
         let received_commands = root.path().join("received-commands");
+        let _stale_writer = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&debugfs)
+            .unwrap();
         write_executable(
             &debugfs,
             &format!(
@@ -855,10 +863,34 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn executable_helper_tempdir() -> tempfile::TempDir {
+        let test_binary = env::current_exe().expect("test binary path must be available");
+        let test_binary_dir = test_binary
+            .parent()
+            .expect("test binary path must have a parent directory");
+
+        tempfile::Builder::new()
+            .prefix("axbuild-rootfs-test-")
+            .tempdir_in(test_binary_dir)
+            .expect("test binary directory must accept temporary helper scripts")
+    }
+
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::write(path, contents).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut staged_name = path
+            .file_name()
+            .expect("executable helper path must have a file name")
+            .to_os_string();
+        staged_name.push(".publishing");
+        let staged_path = path.with_file_name(staged_name);
+
+        fs::write(&staged_path, contents).unwrap();
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Publish a fully closed and executable inode. A stale writer may still
+        // hold the previous destination inode, but it cannot make the newly
+        // published helper fail exec with ETXTBSY.
+        fs::rename(staged_path, path).unwrap();
     }
 }

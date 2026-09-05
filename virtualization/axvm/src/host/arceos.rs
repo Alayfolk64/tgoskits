@@ -219,6 +219,7 @@ pub(crate) type ArceOsAxTaskRef = modules::ax_task::AxTaskRef;
 pub(crate) type ArceOsCurrentTask = modules::ax_task::CurrentTask;
 pub(crate) type ArceOsTaskInner = modules::ax_task::TaskInner;
 pub(crate) type ArceOsWaitQueue = modules::ax_task::WaitQueue;
+pub(crate) use modules::ax_task::SchedulerAddressSpaceActivation as ArceOsSchedulerAddressSpaceActivation;
 #[cfg(target_arch = "aarch64")]
 pub(crate) type ArceOsIrqError = modules::ax_hal::irq::IrqError;
 pub(crate) type ArceOsWaitQueueHandle = api::task::AxWaitQueueHandle;
@@ -299,7 +300,8 @@ fn send_ipi_to_all_except_current(cpu_num: usize) {
 pub fn shutdown_host_filesystems() -> AxVmResult {
     modules::ax_fs_ng::shutdown_filesystems()
         .map_err(|error| AxVmError::host("shut down host filesystems", error))?;
-    let released = modules::ax_fs_ng::release_block_irqs_for_passthrough();
+    let released = modules::ax_fs_ng::release_block_irqs_for_passthrough()
+        .map_err(|error| AxVmError::host("release host filesystem block IRQs", error))?;
     if released != 0 {
         info!("Released {released} host filesystem block IRQ registration(s) during shutdown");
     }

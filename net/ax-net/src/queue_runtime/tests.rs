@@ -7,7 +7,8 @@ use std::{
 use irq_framework::{HwIrq, IrqDomainId};
 use rd_net::{
     DmaBuffer, NetControlEndpoint, NetDeviceInfo, PreparedNetDevice, RxCompletion,
-    TxNetworkProtocol, TxNotify, TxSubmitOptions, TxTransportProtocol,
+    TxNetworkProtocol, TxNotify, TxSubmitOptions, TxTransportProtocol, WifiOperation,
+    WifiTransaction, Wpa2Pmk,
     dma_api::{
         DeviceDma, DmaAllocHandle, DmaCoherency, DmaConstraints, DmaDeviceInfo, DmaDirection,
         DmaDomainId, DmaError, DmaMapHandle, DmaOp,
@@ -15,7 +16,7 @@ use rd_net::{
 };
 
 use super::*;
-use crate::device::NetDeviceError;
+use crate::device::{EthernetFramePort, NetDeviceError, ProtocolEthernetFrame};
 
 struct DropProbe(Arc<AtomicUsize>);
 
@@ -53,7 +54,7 @@ impl PinnedNetIrqRegistrar for UnexpectedRegistrar {
     }
 }
 
-struct TestDma;
+pub(super) struct TestDma;
 
 impl TestDma {
     unsafe fn allocate(layout: Layout) -> Option<DmaAllocHandle> {
@@ -112,7 +113,7 @@ impl DmaOp for TestDma {
     unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
 }
 
-static TEST_DMA: TestDma = TestDma;
+pub(super) static TEST_DMA: TestDma = TestDma;
 
 fn dma_buffer(capacity: usize, len: usize) -> DmaBuffer {
     let device = DeviceDma::new(
@@ -130,6 +131,170 @@ fn dma_buffer(capacity: usize, len: usize) -> DmaBuffer {
     );
     DmaBuffer::new(pool.alloc().unwrap(), len)
         .unwrap_or_else(|_| panic!("test DMA token length exceeds its allocation"))
+}
+
+fn tx_frame(marker: u8) -> ProtocolEthernetFrame {
+    let mut frame = ProtocolEthernetFrame::new(60).unwrap();
+    frame.packet_mut().fill(marker);
+    frame
+}
+
+fn tx_frame_marker(buffer: &DmaBuffer) -> u8 {
+    buffer.read_with_cpu(buffer.len(), |packet| packet[0])
+}
+
+fn tx_test_port(
+    tx_queue_discipline: TxQueueDiscipline,
+    initial_tx_tokens: usize,
+) -> (
+    QueueFramePort,
+    SpscConsumer<executor::TxRequest>,
+    SpscProducer<DmaBuffer>,
+) {
+    let (_rx_ready_tx, rx_ready) = spsc_ring(1);
+    let (rx_recycle, _rx_recycle_rx) = spsc_ring(1);
+    let (tx_ready, tx_ready_rx) = spsc_ring(4);
+    let (mut tx_free_tx, tx_free) = spsc_ring(4);
+    for _ in 0..initial_tx_tokens {
+        tx_free_tx.push(dma_buffer(2048, 0)).unwrap();
+    }
+    let shared = Arc::new(group_state(STATE_IDLE));
+    let group = ProtocolGroupPort {
+        rx_ready,
+        rx_recycler: Arc::new(executor::RxRecycler::new(
+            rx_recycle,
+            Arc::clone(&shared),
+            1,
+        )),
+        tx_ready,
+        tx_free,
+        tx_spares: Vec::new(),
+        shared,
+    };
+    (
+        QueueFramePort {
+            name: String::from("test0"),
+            mac: Arc::new(SpinLock::new([0; 6])),
+            groups: vec![group],
+            tx_queue_discipline,
+            pending_tx: VecDeque::new(),
+            next_rx: 0,
+            next_tx: 0,
+            checksum_capabilities: rd_net::TxChecksumCapabilities::NONE,
+        },
+        tx_ready_rx,
+        tx_free_tx,
+    )
+}
+
+#[test]
+fn fifo_backlog_is_lazy_bounded_ordered_and_flushes_after_token_return() {
+    let (mut port, mut tx_ready, mut tx_free) = tx_test_port(
+        TxQueueDiscipline::Fifo {
+            max_frames: NonZeroUsize::new(2).unwrap(),
+        },
+        1,
+    );
+
+    assert_eq!(port.pending_tx.capacity(), 0);
+    assert_eq!(port.transmit(&tx_frame(1)), Ok(()));
+    assert_eq!(port.transmit(&tx_frame(2)), Ok(()));
+    assert_eq!(port.transmit(&tx_frame(3)), Ok(()));
+    assert_eq!(port.pending_tx.len(), 2);
+    assert_eq!(port.transmit(&tx_frame(4)), Err(NetDeviceError::Again));
+
+    let first = tx_ready.pop().unwrap();
+    assert_eq!(tx_frame_marker(&first.buffer), 1);
+    tx_free.push(first.buffer).unwrap();
+    assert!(matches!(port.receive(), Err(NetDeviceError::Again)));
+    assert_eq!(port.pending_tx.len(), 1);
+
+    let second = tx_ready.pop().unwrap();
+    assert_eq!(tx_frame_marker(&second.buffer), 2);
+    tx_free.push(second.buffer).unwrap();
+    assert!(matches!(port.receive(), Err(NetDeviceError::Again)));
+    assert!(port.pending_tx.is_empty());
+
+    let third = tx_ready.pop().unwrap();
+    assert_eq!(tx_frame_marker(&third.buffer), 3);
+}
+
+#[test]
+fn fifo_direct_fill_and_backlog_preserve_submit_options() {
+    let (mut port, mut tx_ready, mut tx_free) = tx_test_port(
+        TxQueueDiscipline::Fifo {
+            max_frames: NonZeroUsize::new(1).unwrap(),
+        },
+        1,
+    );
+    let options = TxSubmitOptions {
+        notify: TxNotify::Deferred,
+        ..Default::default()
+    };
+    let mut filled_address = 0;
+    port.transmit_frame_with_options(100, options, &mut |packet| {
+        filled_address = packet.as_ptr() as usize;
+        packet.fill(0x31);
+    })
+    .unwrap();
+    let first = tx_ready.pop().unwrap();
+    assert_eq!(first.options, options);
+    first.buffer.read_with_cpu(100, |packet| {
+        assert_eq!(packet.as_ptr() as usize, filled_address);
+        assert_eq!(packet, &[0x31; 100]);
+    });
+    assert_eq!(port.pending_tx.capacity(), 0);
+
+    let mut fills = 0;
+    port.transmit_frame_with_options(100, options, &mut |packet| {
+        fills += 1;
+        packet.fill(0x32);
+    })
+    .unwrap();
+    assert_eq!(fills, 1);
+    assert_eq!(port.pending_tx.len(), 1);
+    tx_free.push(first.buffer).unwrap();
+    // The production adapter uses receive_owned, which must also flush FIFO.
+    assert!(matches!(port.receive_owned(), Err(NetDeviceError::Again)));
+    let second = tx_ready.pop().unwrap();
+    assert_eq!(second.options, options);
+    second
+        .buffer
+        .read_with_cpu(100, |packet| assert_eq!(packet, &[0x32; 100]));
+    assert!(port.pending_tx.is_empty());
+}
+
+#[test]
+fn noqueue_never_retains_or_allocates_when_device_is_busy() {
+    let (mut port, _tx_ready, _tx_free) = tx_test_port(TxQueueDiscipline::NoQueue, 0);
+
+    assert_eq!(port.pending_tx.capacity(), 0);
+    assert_eq!(port.transmit(&tx_frame(1)), Err(NetDeviceError::Again));
+    assert!(port.pending_tx.is_empty());
+    assert_eq!(port.pending_tx.capacity(), 0);
+}
+
+#[test]
+fn device_qdisc_limits_and_backlogs_are_isolated() {
+    let (mut first, _first_ready, _first_free) = tx_test_port(
+        TxQueueDiscipline::Fifo {
+            max_frames: NonZeroUsize::new(1).unwrap(),
+        },
+        0,
+    );
+    let (mut second, _second_ready, _second_free) = tx_test_port(
+        TxQueueDiscipline::Fifo {
+            max_frames: NonZeroUsize::new(2).unwrap(),
+        },
+        0,
+    );
+
+    assert_eq!(first.transmit(&tx_frame(1)), Ok(()));
+    assert_eq!(first.transmit(&tx_frame(2)), Err(NetDeviceError::Again));
+    assert_eq!(second.transmit(&tx_frame(3)), Ok(()));
+    assert_eq!(second.transmit(&tx_frame(4)), Ok(()));
+    assert_eq!(first.pending_tx.len(), 1);
+    assert_eq!(second.pending_tx.len(), 2);
 }
 
 struct RecordingRegistration {
@@ -296,6 +461,7 @@ fn zero_cpu_topology_quarantines_prepared_device_ownership() {
             poll_groups: Vec::new(),
         },
         irq_sources: Vec::new(),
+        tx_queue_discipline: TxQueueDiscipline::NoQueue,
     };
 
     let result = NetworkRuntimeBuilder::new(vec![input], &UnexpectedRegistrar, 0).build();
@@ -639,4 +805,29 @@ fn hardware_retry_rearms_instead_of_immediately_rescheduling() {
 fn protocol_owner_uses_the_least_loaded_cpu() {
     assert_eq!(select_protocol_owner(&[0, 0, 1], 4), 2);
     assert_eq!(select_protocol_owner(&[0, 1, 2, 3], 4), 0);
+}
+
+#[test]
+fn secure_startup_transaction_receives_runtime_owned_entropy() {
+    let transaction = WifiTransaction::connect_wpa2_pmk("ssid", Wpa2Pmk::new([0x11; 32]));
+    let transaction =
+        prepare_startup_transaction(transaction, || Ok::<_, crate::NetError>([0x22; 32])).unwrap();
+
+    let WifiOperation::Connect { entropy, .. } = transaction.operation() else {
+        panic!("expected station transaction");
+    };
+    assert_eq!(entropy, &Some([0x22; 32]));
+}
+
+#[test]
+fn open_startup_transaction_does_not_consume_secure_entropy() {
+    let transaction = prepare_startup_transaction(
+        WifiTransaction::connect_open("ssid"),
+        || -> Result<[u8; 32], crate::NetError> {
+            panic!("open startup connection must not request secure entropy")
+        },
+    )
+    .unwrap();
+
+    assert!(!transaction.needs_connect_entropy());
 }

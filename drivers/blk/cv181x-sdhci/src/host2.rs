@@ -3,7 +3,7 @@
 use dma_api::DeviceDma;
 use sdhci_host::Sdhci;
 use sdmmc_host::{ClockHz, ProgressCause, RequestProgress, SignalVoltage};
-use sdmmc_protocol::sdio::host::SdMmcIrqHost;
+use sdmmc_protocol::sdio::host::{CompletionIrqRearmHost, SdMmcIrqHost};
 
 use super::*;
 
@@ -31,6 +31,7 @@ impl SdMmcIrqHost for Cv181xSdhci {
             inner,
             mmio,
             config,
+            controller,
         } = self;
         let parts = <Sdhci as SdMmcIrqHost>::into_parts(inner);
         sdmmc_host::HostParts {
@@ -38,6 +39,7 @@ impl SdMmcIrqHost for Cv181xSdhci {
                 inner: parts.bus,
                 mmio,
                 config,
+                controller,
             },
             irq: parts.irq,
             card_irq: parts.card_irq,
@@ -50,6 +52,14 @@ impl SdMmcIrqHost for Cv181xSdhci {
 
     fn progress_wait_kind(&self) -> sdmmc_protocol::sdio::HostProgressWait {
         <Sdhci as SdMmcIrqHost>::progress_wait_kind(&self.inner)
+    }
+}
+
+impl CompletionIrqRearmHost for Cv181xSdhci {
+    fn rearm_completion_irq_and_check(
+        &mut self,
+    ) -> Result<sdmmc_protocol::sdio::CompletionIrqRearm, ProtocolError> {
+        <Sdhci as CompletionIrqRearmHost>::rearm_completion_irq_and_check(&mut self.inner)
     }
 }
 

@@ -15,6 +15,10 @@ use ax_sched::BaseScheduler;
     not(feature = "host-test")
 ))]
 use crate::sync::RawState;
+#[cfg(all(feature = "task-ext", feature = "uspace"))]
+use crate::task::SchedulerAddressSpaceActivation;
+#[cfg(feature = "task-ext")]
+use crate::task::TaskExt;
 use crate::{
     AxCpuMask, AxTaskRef, Scheduler, TaskInner, WaitQueue,
     sync::{GuardState, SpinLock, SpinLockIrqSaveGuard},
@@ -50,6 +54,11 @@ percpu_static! {
     /// `switch_to` and `clear_prev_task_on_cpu`: the scheduler retains an Arc
     /// throughout that non-preemptible handoff.
     PREV_TASK: Option<PreviousTask> = None,
+    /// The unique OS-owned activation whose userspace root may remain in this
+    /// CPU's TLB. Kernel tasks retain this token and borrow its root exactly as
+    /// Linux kernel threads retain `active_mm` in lazy-TLB mode.
+    #[cfg(all(feature = "task-ext", feature = "uspace"))]
+    ACTIVE_ADDRESS_SPACE: Option<SchedulerAddressSpaceActivation> = None,
 }
 
 /// An array of references to run queues, one for each CPU, indexed by cpu_id.
@@ -97,6 +106,50 @@ pub(crate) fn current_run_queue<G: GuardState>() -> CurrentRunQueueRef<G> {
         current_task: crate::current(),
         state: irq_state,
         _phantom: core::marker::PhantomData,
+    }
+}
+
+/// Publishes a newly-installed userspace activation as the sole per-CPU
+/// scheduler owner, then retires the previously installed activation.
+#[cfg(all(feature = "task-ext", feature = "uspace"))]
+pub(crate) fn replace_current_address_space_activation(
+    activation: SchedulerAddressSpaceActivation,
+    proof: crate::AddressSpaceSwitchProof,
+) {
+    assert_eq!(proof.cpu(), this_cpu_id());
+    // SAFETY: the caller holds a preempt/IRQ guard across the hardware root
+    // write and this per-CPU ownership publication.
+    let previous = unsafe {
+        ax_hal::percpu::with_cpu_pin(|pin| {
+            ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
+                ACTIVE_ADDRESS_SPACE.with_current_mut(exclusive, |slot| slot.replace(activation))
+            })
+        })
+    }
+    .expect("address-space publication requires an installed CPU-local area");
+    if let Some(previous) = previous {
+        previous.release_after_root_switch(proof);
+    }
+}
+
+/// Releases the current lazy activation after CPU offline installed the stable
+/// kernel context and completed a local full TLB flush.
+#[cfg(all(feature = "task-ext", feature = "uspace"))]
+pub(crate) fn release_current_address_space_after_kernel_switch(
+    proof: crate::CpuOfflineRootSwitchProof,
+) {
+    assert_eq!(proof.cpu(), this_cpu_id());
+    // SAFETY: CPU offline excludes migration, interrupts and scheduler entry.
+    let activation = unsafe {
+        ax_hal::percpu::with_cpu_pin(|pin| {
+            ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
+                ACTIVE_ADDRESS_SPACE.with_current_mut(exclusive, Option::take)
+            })
+        })
+    }
+    .expect("address-space withdrawal requires an installed CPU-local area");
+    if let Some(activation) = activation {
+        activation.release_after_kernel_switch(proof);
     }
 }
 
@@ -335,78 +388,50 @@ fn is_remote_cpu(cpu_id: usize) -> bool {
 mod tests {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    // Host-test mode collapses the pending/count state into process-global
-    // atomics, so keep their assertions in one test.
+    // This test covers only the atomic publication edge. Scheduler handling
+    // and forced rotation require the real ArceOS IPI path; the task-ipi QEMU
+    // case is the runtime evidence boundary rather than a host fake scheduler.
     #[test]
-    fn remote_reschedule_request_is_coalesced_and_forced() {
-        const REMOTE_CPU: usize = 1;
-
-        super::REMOTE_RESCHEDULE_REQUESTS.store(0, Ordering::Release);
-        super::REMOTE_RESCHEDULE_PENDING.store(false, Ordering::Release);
-
-        super::kick_remote_cpu(REMOTE_CPU);
+    fn remote_reschedule_request_is_coalesced() {
+        let pending = AtomicBool::new(false);
+        let requests = AtomicUsize::new(0);
 
         assert_eq!(
-            super::REMOTE_RESCHEDULE_REQUESTS.load(Ordering::Acquire),
-            1,
-            "remote CPU kicks must enqueue a scheduler-visible reschedule request",
+            super::request_remote_reschedule_if_not_pending(&pending, || {
+                requests.fetch_add(1, Ordering::Release);
+                Ok(ax_ipi::IpiNotification::Sent)
+            })
+            .unwrap(),
+            ax_ipi::IpiNotification::Sent,
         );
-        super::kick_remote_cpu(REMOTE_CPU);
-
         assert_eq!(
-            super::REMOTE_RESCHEDULE_REQUESTS.load(Ordering::Acquire),
+            super::request_remote_reschedule_if_not_pending(&pending, || {
+                requests.fetch_add(1, Ordering::Release);
+                Ok(ax_ipi::IpiNotification::Sent)
+            })
+            .unwrap(),
+            ax_ipi::IpiNotification::Coalesced,
+        );
+        assert_eq!(
+            requests.load(Ordering::Acquire),
             1,
-            "remote CPU kicks should coalesce identical pending reschedule requests",
+            "remote reschedule requests should coalesce while pending",
         );
 
-        assert!(super::take_remote_reschedule_pending_for_current_cpu());
-        super::kick_remote_cpu(REMOTE_CPU);
-
+        pending.store(false, Ordering::Release);
         assert_eq!(
-            super::REMOTE_RESCHEDULE_REQUESTS.load(Ordering::Acquire),
+            super::request_remote_reschedule_if_not_pending(&pending, || {
+                requests.fetch_add(1, Ordering::Release);
+                Ok(ax_ipi::IpiNotification::Sent)
+            })
+            .unwrap(),
+            ax_ipi::IpiNotification::Sent,
+        );
+        assert_eq!(
+            requests.load(Ordering::Acquire),
             2,
-            "remote CPU kicks must be accepted again after the pending bit is cleared",
+            "a cleared pending bit should permit a fresh request",
         );
-
-        #[cfg(feature = "preempt")]
-        crate::tests::run_in_test_scheduler(|| {
-            let curr = crate::current();
-
-            curr.set_preempt_pending(false);
-            curr.set_force_resched_pending(false);
-            super::REMOTE_RESCHEDULE_PENDING.store(true, Ordering::Release);
-
-            super::handle_ipi_reschedule();
-
-            assert!(
-                curr.force_resched_pending_for_test(),
-                "remote IPI reschedule must request forced rotation",
-            );
-            assert!(
-                !curr.preempt_pending_for_test(),
-                "remote IPI reschedule must not rely on ordinary RR preemption",
-            );
-            assert!(
-                !super::REMOTE_RESCHEDULE_PENDING.load(Ordering::Acquire),
-                "the runtime IPI handler must consume the scheduler pending bit",
-            );
-
-            curr.set_force_resched_pending(false);
-            curr.set_preempt_pending(false);
-        });
-
-        #[cfg(feature = "preempt")]
-        {
-            super::kick_remote_cpu(REMOTE_CPU);
-            assert_eq!(
-                super::REMOTE_RESCHEDULE_REQUESTS.load(Ordering::Acquire),
-                3,
-                "a delivered remote IPI must allow a later kick to arm a fresh edge",
-            );
-        }
-
-        super::REMOTE_RESCHEDULE_PENDING.store(false, Ordering::Release);
-        super::REMOTE_RESCHEDULE_REQUESTS.store(0, Ordering::Release);
     }
 
     #[test]
@@ -931,6 +956,16 @@ impl<G: GuardState> CurrentRunQueueRef<G> {
         } else {
             curr.set_state(TaskState::Exited);
 
+            #[cfg(feature = "task-ext")]
+            if let Some(ext) = curr.task_ext() {
+                // The task is no longer eligible for any run queue, while its
+                // architectural context and activation are still installed.
+                // This is the only safe point for an extension to release
+                // task-local lifetime pins without making a retiring context
+                // schedulable again.
+                ext.on_exit();
+            }
+
             // Notify the joiner task.
             curr.notify_exit(exit_code);
 
@@ -1196,14 +1231,24 @@ impl AxRunQueue {
 
         #[cfg(feature = "task-ext")]
         {
-            use crate::TaskExt;
-
             if let Some(ext) = prev_task.task_ext() {
                 ext.on_leave()
             }
             if let Some(ext) = next_task.task_ext() {
                 ext.on_enter()
             }
+        }
+
+        #[cfg(all(feature = "task-ext", feature = "uspace"))]
+        let mut next_activation = next_task
+            .task_ext()
+            .and_then(|ext| ext.acquire_address_space_activation(this_cpu_id()));
+        #[cfg(all(feature = "task-ext", feature = "uspace"))]
+        if let Some(activation) = &next_activation {
+            assert!(
+                activation.installed().is_user(),
+                "scheduler requires a userspace identity"
+            );
         }
 
         // `prev_task.state()` must be sampled before the architectural switch:
@@ -1237,7 +1282,37 @@ impl AxRunQueue {
 
                 // FP, address-space, Arc, and PREV_TASK work all remain before
                 // the prepared token's one-way commit.
+                #[cfg(all(feature = "task-ext", feature = "uspace"))]
+                let next_address_space = next_activation
+                    .as_ref()
+                    .map(|activation| activation.installed())
+                    .or_else(|| {
+                        ACTIVE_ADDRESS_SPACE.with_current(pin, |activation| {
+                            activation.as_ref().map(|activation| activation.installed())
+                        })
+                    });
+                #[cfg(all(feature = "task-ext", feature = "uspace"))]
+                if let Some(installed) = next_address_space {
+                    // A userspace task installs its newly acquired token.
+                    // A kernel task inherits the existing per-CPU token and
+                    // therefore leaves the lazy hardware context active.
+                    (*next_ctx_ptr).set_address_space(installed);
+                }
                 (*prev_ctx_ptr).prepare_switch_to(&*next_ctx_ptr);
+                #[cfg(all(feature = "task-ext", feature = "uspace"))]
+                if let Some(activation) = next_activation.take() {
+                    let proof = crate::AddressSpaceSwitchProof::new(this_cpu_id());
+                    let previous = ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
+                        ACTIVE_ADDRESS_SPACE
+                            .with_current_mut(exclusive, |slot| slot.replace(activation))
+                    });
+                    if let Some(previous) = previous {
+                        // `prepare_switch_to` has installed the incoming root.
+                        // Only now may the old activation stop naming this CPU
+                        // as a possible TLB owner.
+                        previous.release_after_root_switch(proof);
+                    }
+                }
                 ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
                     PREV_TASK.with_current_mut(exclusive, |slot| {
                         *slot = Some(PreviousTask {
@@ -1258,8 +1333,10 @@ impl AxRunQueue {
             })
             .expect("scheduler switch requires an installed CPU-local area");
 
-            // Execution resumes here as the incoming task. Withdraw the exact
-            // previous binding before making that task runnable elsewhere.
+            // Execution resumes here when this task is scheduled again. The
+            // per-CPU MM activation was either replaced by an incoming user MM
+            // or retained across a lazy kernel-task interval; this tail only
+            // withdraws the generic previous-task binding and wake hand-off.
             clear_prev_task_on_cpu();
         }
         SchedulerFrameResult::Resumed
@@ -1315,6 +1392,21 @@ fn gc_entry() {
                     }
                     .expect("GC requires an installed CPU-local area");
                 }
+            }
+        }
+        #[cfg(feature = "vmap-task-stack")]
+        {
+            // TaskStack::drop only publishes `Live -> Retiring`. Run the
+            // fallible PTE/TLB/frame retire protocol here in the sleepable GC
+            // task, after all EXITED_TASKS locks and CPU-local borrows ended.
+            let report = ax_mm::retry_kernel_virtual_quarantines(16);
+            if report.failed() != 0 {
+                warn!(
+                    "task-stack retire pass kept {}/{} range(s) queued: {:?}",
+                    report.failed(),
+                    report.attempted(),
+                    report.first_error(),
+                );
             }
         }
         // Always wait with a timeout to:
@@ -1384,15 +1476,19 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
         // Leaf lock: `resched()` already dropped this CPU's scheduler lock before
         // `switch_to`, so this takes only the target run queue's lock.
         let target_run_queue = get_run_queue(target);
-        // SAFETY: this switch tail runs with preemption and local IRQs disabled;
-        // the scheduler lock supplies cross-CPU exclusion.
-        unsafe { target_run_queue.scheduler.lock_raw() }.put_prev_task(task, false);
-        if target != this_cpu_id() {
+        // The task may have completed its exit after a remote wake changed
+        // `Blocked -> Ready`, but before this CPU finished switching it out.
+        // Reuse the run-queue state transition as the enqueue ownership gate:
+        // `Ready -> Ready` deliberately validates that the deferred wake still
+        // owns a runnable task. Once `on_cpu` is false, only a successful gate
+        // may publish the task to a scheduler; an `Exited` task is dropped here.
+        let enqueued = target_run_queue.put_task_with_state(task, TaskState::Ready, false);
+        if enqueued && target != this_cpu_id() {
             // Remote target: ask that CPU to reschedule so it picks the task up
             // (and wakes if it is idle in `wait_for_irqs`).
             #[cfg(feature = "ipi")]
             kick_remote_cpu(target);
-        } else {
+        } else if enqueued {
             // Local target: `kick_remote_cpu(self)` is a no-op, so the reschedule
             // the remote waker's IPI used to deliver here would be lost — the
             // task could sit un-run until the next tick, or indefinitely if this
@@ -1411,6 +1507,9 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
 }
 pub(crate) fn init() {
     let cpu_id = this_cpu_id();
+
+    #[cfg(feature = "uspace")]
+    crate::task::initialize_kernel_task_address_space();
 
     // Create the `idle` task (not current task).
     // The idle task will run when there is no other runnable task.
@@ -1462,6 +1561,9 @@ pub(crate) fn init() {
 
 pub(crate) fn init_secondary(stack_ptr: VirtAddr, stack_size: usize) {
     let cpu_id = this_cpu_id();
+
+    #[cfg(feature = "uspace")]
+    crate::task::initialize_kernel_task_address_space();
 
     // Put the subsequent execution into the `idle` task.
     let idle_task = TaskInner::new_init(

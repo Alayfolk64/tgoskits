@@ -72,7 +72,14 @@ pub trait SdMmcIrqHandle: Send + 'static {
 
 /// Task-context mask/rearm endpoint for the SDIO card interrupt source.
 pub trait CardIrqControl: Send + 'static {
-    /// Mask only the card-interrupt signal while keeping status observable.
+    /// Mask the level-sensitive card-interrupt source in both controller
+    /// ownership and parent-IRQ delivery masks.
+    ///
+    /// SDHCI exposes these as separate `INT_ENABLE` and `SIGNAL_ENABLE`
+    /// registers, but Linux keeps one `ier` mirror and clears the bit in both
+    /// registers when the top half observes `CARD_INT`.  Keeping the two
+    /// masks in lockstep prevents a level source from re-entering the owner
+    /// while its drain operation is still in progress.
     fn mask(&mut self);
 
     /// Disable the card-interrupt signal for shutdown.
@@ -99,6 +106,16 @@ impl CardIrqControl for () {
 pub enum HostProgressWait {
     Irq,
     Register { retry_after: Duration },
+}
+
+/// Result of closing the completion-IRQ drain/rearm window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionIrqRearm {
+    /// No completion status was latched when delivery was restored.
+    Idle,
+    /// A completion was already latched and was published to the host's
+    /// task-context completion mailbox.
+    Pending,
 }
 
 /// IRQ and DMA capabilities required by the SD/MMC protocol runtime.
@@ -137,6 +154,19 @@ pub trait SdMmcIrqHost: sdmmc_host::SdMmcHost {
     fn progress_wait_kind(&self) -> HostProgressWait {
         HostProgressWait::Irq
     }
+}
+
+/// Task-context completion-IRQ rearm required by SDIO devices whose owner
+/// closes the masked-delivery race before restoring card-interrupt delivery.
+pub trait CompletionIrqRearmHost: SdMmcIrqHost {
+    /// Restore completion-IRQ delivery and synchronously capture status that
+    /// became pending while delivery was masked.
+    ///
+    /// A host returning [`CompletionIrqRearm::Pending`] must publish the
+    /// captured status through the same mailbox consumed by an
+    /// `AcknowledgedIrq` progress step. This closes the edge-triggered parent
+    /// IRQ race without moving protocol progress into the IRQ top half.
+    fn rearm_completion_irq_and_check(&mut self) -> Result<CompletionIrqRearm, Error>;
 }
 
 /// Queue identifier used by single-queue SD/MMC block adapters.

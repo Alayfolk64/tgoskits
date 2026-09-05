@@ -43,6 +43,7 @@ pub type NetDeviceResult<T = ()> = Result<T, NetDeviceError>;
 /// is filled directly in DMA storage and RX is consumed before its token is
 /// returned. This bounded object remains available for adapters that cannot
 /// expose borrowed queue storage.
+#[derive(Clone)]
 pub struct ProtocolEthernetFrame {
     bytes: [u8; ETHERNET_FRAME_CAPACITY],
     len: usize,

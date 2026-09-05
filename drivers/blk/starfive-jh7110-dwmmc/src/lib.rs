@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_irq_methods_delegate_to_inner_dwmmc() {
+    fn completion_irq_enable_disable_delegate_to_inner_dwmmc() {
         let (_regs, mmio) = fake_mmio();
         let mut host = unsafe { Jh7110DwMmc::new(mmio, Jh7110DwMmcConfig::default()) };
 

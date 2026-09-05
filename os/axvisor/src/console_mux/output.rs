@@ -100,7 +100,7 @@ impl GuestOutputMux {
         self.owner = None;
         self.physical_line_open = false;
         output.extend_from_slice(record);
-        if !record.ends_with(b"\n") {
+        if !record_ends_with_line_break(record) {
             output.push(b'\n');
         }
         output
@@ -448,6 +448,33 @@ impl GuestOutputMux {
     }
 }
 
+fn record_ends_with_line_break(mut record: &[u8]) -> bool {
+    loop {
+        if record.ends_with(b"\n") {
+            return true;
+        }
+        let Some(sgr_start) = trailing_sgr_start(record) else {
+            return false;
+        };
+        record = &record[..sgr_start];
+    }
+}
+
+fn trailing_sgr_start(record: &[u8]) -> Option<usize> {
+    if record.last() != Some(&b'm') {
+        return None;
+    }
+    let start = record.iter().rposition(|&byte| byte == b'\x1b')?;
+    if record.get(start + 1) != Some(&b'[')
+        || !record[start + 2..record.len() - 1]
+            .iter()
+            .all(|byte| (0x30..=0x3f).contains(byte))
+    {
+        return None;
+    }
+    Some(start)
+}
+
 fn emit_vm_prefix(vm_id: usize, emit: &mut dyn FnMut(&[u8])) {
     emit(b"[VM ");
 
@@ -487,6 +514,15 @@ mod tests {
 
     #[cfg_attr(axtest, axtest::axtest)]
     #[cfg_attr(not(axtest), test)]
+    fn registering_guest_preallocates_atomic_output_storage() {
+        let mut mux = GuestOutputMux::default();
+        mux.register_guest(7);
+
+        assert!(mux.guests[&7].pending.capacity() >= PER_GUEST_LOG_CAPACITY);
+    }
+
+    #[cfg_attr(axtest, axtest::axtest)]
+    #[cfg_attr(not(axtest), test)]
     fn host_record_terminates_an_open_guest_line() {
         let mut mux = GuestOutputMux::default();
         assert_eq!(mux.format(1, false, b"guest> "), b"guest> ");
@@ -499,6 +535,15 @@ mod tests {
     fn host_record_without_newline_becomes_an_independent_line() {
         let mut mux = GuestOutputMux::default();
         assert_eq!(mux.format_host_record(b":host"), b":host\n");
+    }
+
+    #[cfg_attr(axtest, axtest::axtest)]
+    #[cfg_attr(not(axtest), test)]
+    fn host_record_with_trailing_sgr_does_not_add_a_blank_line() {
+        let mut mux = GuestOutputMux::default();
+        let record = b"\x1b[37mhost record\x1b[m\r\n\x1b[m";
+
+        assert_eq!(mux.format_host_record(record), record);
     }
 
     #[cfg_attr(axtest, axtest::axtest)]

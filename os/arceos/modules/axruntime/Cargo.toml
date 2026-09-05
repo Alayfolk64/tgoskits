@@ -30,6 +30,7 @@ smp = ["ax-hal/smp", "ax-task/smp"]
 uspace = ["ax-hal/uspace", "ax-task/uspace"]
 lockdep = ["ax-task/lockdep", "ax-fs-ng?/lockdep"]
 stack-guard-page = ["ipi", "paging", "ax-task/stack-guard-page"]
+vmap-task-stack = ["ipi", "paging", "ax-task/vmap-task-stack"]
 stack-protector = []
 tls = ["ax-hal/tls", "ax-task/tls"]
 
@@ -50,12 +51,6 @@ net = [
   "dep:ax-net",
   "dep:rd-net",
   "ax-driver/net",
-]
-# SG2002 AIC8800 SoftAP Wi-Fi. The fixed-CPU network runtime supplies explicit
-# IRQ notifications and monotonic timestamps to the portable driver parts.
-aic8800-wifi = [
-  "net",
-  "ax-driver/aic8800-wifi",
 ]
 vsock = ["net", "ax-net/vsock", "ax-driver/vsock"]
 

@@ -28,7 +28,6 @@
 //! Interrupt handling and multi-task scheduling are mandatory runtime
 //! capabilities. The listed features are optional and disabled by default.
 
-#![feature(extern_item_impls)]
 #![cfg_attr(not(test), no_std)]
 #![allow(missing_abi)]
 
@@ -55,6 +54,7 @@ mod kernel_mapping;
 mod klib;
 mod preempt;
 mod raw_console;
+mod structured_log;
 
 pub mod console;
 mod devices;
@@ -112,16 +112,23 @@ const LOGO: &str = r#"
 d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
 "#;
 
-#[eii]
 fn ax_app_entry() {
-    #[cfg(not(test))]
-    unsafe extern "C" {
-        /// Legacy application's entry point.
-        safe fn main();
+    #[cfg(all(feature = "std-compat", not(test)))]
+    {
+        unsafe extern "C" {
+            safe fn __axstd_std_check_entry();
+        }
+        __axstd_std_check_entry();
     }
-    // Default implementation
-    #[cfg(not(test))]
-    main();
+
+    #[cfg(all(not(feature = "std-compat"), not(test)))]
+    {
+        unsafe extern "C" {
+            /// Legacy application's entry point.
+            safe fn main();
+        }
+        main();
+    }
 }
 
 struct LogIfImpl;
@@ -148,11 +155,13 @@ impl ax_log::LogIf for LogIfImpl {
         if let Some(status) = serial::try_publish_record(meta, args) {
             return status;
         }
-        if let Some(status) = console::try_publish_without_runtime(args) {
+        let context = structured_log::with_runtime_log_context(core::convert::identity)
+            .unwrap_or_else(|_| structured_log::fallback_runtime_log_context(meta));
+        if let Some(status) = console::try_publish_without_runtime(meta, context, args) {
             return status;
         }
         let mut writer = PlatformConsoleWriter::default();
-        if core::fmt::write(&mut writer, args).is_ok() {
+        if structured_log::write_record(&mut writer, meta, context, args).is_ok() {
             ax_log::PublishStatus::Published
         } else {
             ax_log::PublishStatus::Dropped
@@ -243,7 +252,20 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     init_allocator();
 
-    let (kernel_space_start, kernel_space_size) = ax_hal::mem::kernel_aspace();
+    let virtual_address_space = ax_hal::mem::virtual_address_space()
+        .unwrap_or_else(|error| panic!("unsupported platform virtual-address layout: {error}"));
+    let user_space = virtual_address_space.user();
+    let kernel_space = virtual_address_space.kernel();
+    let kernel_space_start = kernel_space.start;
+    let kernel_space_size = kernel_space.size();
+
+    info!(
+        "virtual address layout: user [{:#x}, {:#x}), kernel [{:#x}, {:#x})",
+        user_space.start.as_usize(),
+        user_space.end.as_usize(),
+        kernel_space.start.as_usize(),
+        kernel_space.end.as_usize(),
+    );
 
     {
         use core::ops::Range;
@@ -414,14 +436,19 @@ fn init_allocator() {
 fn init_interrupt() {
     init_percpu_irq(ax_hal::percpu::this_cpu_id());
 
+    #[cfg(feature = "paging")]
+    let tlb_preparation = ax_hal::cache::prepare_current_cpu_tlb()
+        .expect("primary CPU failed to prepare TLB capability");
+
     // Enable IRQs before starting app
     ax_hal::asm::enable_irqs();
 
     #[cfg(feature = "ipi")]
-    {
-        ax_hal::asm::flush_tlb(None);
-        ax_ipi::mark_current_cpu_ready();
-    }
+    ax_ipi::mark_current_cpu_ready();
+
+    #[cfg(feature = "paging")]
+    ax_hal::cache::publish_current_cpu_tlb_ready(tlb_preparation)
+        .expect("primary CPU failed to publish TLB readiness");
 }
 
 pub(crate) fn init_percpu_irq(cpu_id: usize) {

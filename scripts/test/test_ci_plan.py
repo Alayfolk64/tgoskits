@@ -57,7 +57,7 @@ class CiPlanTests(unittest.TestCase):
             "run-clippy": ["self-hosted", "linux", "qcs"],
             "test-with-std": ["self-hosted", "linux", "qcs"],
             "test-arceos-x86-64-qemu": ["self-hosted", "linux", "qcs"],
-            "test-axvisor-aarch64-qemu-http-control-plane": [
+            "test-axvisor-aarch64-qemu-panic-http-control-plane-ivc": [
                 "self-hosted",
                 "linux",
                 "qcs",
@@ -512,6 +512,14 @@ command = "true"
             self.assertNotIn("cargo xtask ktest qemu --workspace", command)
             self.assertEqual(rows[check_id]["cache_key"], "")
 
+    def test_only_aka_starry_board_receives_wifi_secrets(self) -> None:
+        rows = {
+            row["id"]: row
+            for row in ci_plan.build_main_plan(self.upstream)["starry_matrix"]["include"]
+        }
+        enabled = [row["id"] for row in rows.values() if row["wifi_secrets"]]
+        self.assertEqual(enabled, ["test-starry-self-hosted-board-aka-00-sg2002"])
+
     def test_asus_nuc_board_reuses_xtask_artifact_and_preserves_timeout(
         self,
     ) -> None:
@@ -547,7 +555,7 @@ command = "true"
                 "run-clippy",
                 "test-with-std",
                 "test-arceos-aarch64-qemu-app-suites",
-                "test-axvisor-aarch64-qemu-http-control-plane",
+                "test-axvisor-aarch64-qemu-panic-http-control-plane-ivc",
                 "test-starry-aarch64-qemu",
             }.issubset(test_rows)
         )

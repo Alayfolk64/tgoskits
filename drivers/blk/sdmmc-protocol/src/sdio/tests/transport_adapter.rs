@@ -306,6 +306,24 @@ fn host2_adapter_submits_bus_ops_for_clock_changes() {
 }
 
 #[test]
+fn newly_submitted_io_card_bus_operation_is_runnable_without_an_irq() {
+    let host = Host2Mock::new(sdmmc_host::RawResponse::empty());
+    let mut card = SdioCard::new(host);
+
+    let _request = card.submit_init().expect("ResetAll bus operation submits");
+
+    assert_eq!(
+        card.progress_wait(),
+        HostProgressWait::Register {
+            retry_after: core::time::Duration::ZERO,
+        },
+        "a bus operation must execute its Submitted step before it can decide whether an IRQ is \
+         required"
+    );
+    assert_eq!(card.host().bus_ops, std::vec![sdmmc_host::BusOp::ResetAll]);
+}
+
+#[test]
 fn host2_adapter_poll_error_releases_active_command() {
     let mut host = Host2Mock::new(ok_r1().to_raw_response(ResponseType::R1));
     host.transaction_error = Some(sdmmc_host::Error::Timeout);

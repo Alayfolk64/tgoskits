@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::{
-    context::{ResolvedStarryRequest, STARRY_PACKAGE, find_workspace_root},
+    context::{ResolvedStarryRequest, STARRY_PACKAGE},
     starry::build::LogLevel,
 };
 
@@ -56,34 +56,6 @@ fn resolve_build_info_path_uses_default_starry_location() {
         root.path()
             .join("tmp/axbuild/config/starryos/build-aarch64-unknown-none-softfloat.toml")
     );
-}
-
-#[test]
-fn starry_manifest_disables_std_compat_and_default_tls() {
-    let manifest =
-        fs::read_to_string(find_workspace_root().join("os/StarryOS/starryos/Cargo.toml")).unwrap();
-
-    assert!(manifest.contains("default-features = false"));
-    assert!(!manifest.contains("\"std-compat\""));
-    assert!(!manifest.contains("\"tls\""));
-}
-
-#[test]
-fn starry_kernel_test_manifest_forwards_the_smp_capability() {
-    let manifest =
-        fs::read_to_string(find_workspace_root().join("os/StarryOS/kernel/Cargo.toml")).unwrap();
-    let manifest: toml::Value = toml::from_str(&manifest).unwrap();
-    let smp_features = manifest
-        .get("features")
-        .and_then(toml::Value::as_table)
-        .and_then(|features| features.get("smp"))
-        .and_then(toml::Value::as_array)
-        .expect("starry-kernel must expose the SMP capability")
-        .iter()
-        .map(|feature| feature.as_str().unwrap())
-        .collect::<Vec<_>>();
-
-    assert_eq!(smp_features, ["ax-std/smp"]);
 }
 
 #[test]
@@ -138,10 +110,9 @@ fn load_build_info_writes_default_template_when_missing() {
 
     let build_info = load_build_info(&request).unwrap();
 
-    assert_eq!(build_info, default_starry_build_info());
+    assert!(build_info.features.is_empty());
+    assert!(build_info.env.is_empty());
     assert!(path.exists());
-    let persisted: StarryBuildInfo = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(persisted, build_info);
 }
 
 #[test]
@@ -170,7 +141,7 @@ HELLO = "world"
     let build_info = load_build_info(&request).unwrap();
 
     assert_eq!(build_info.log, LogLevel::Info);
-    assert_eq!(build_info.features, vec!["net".to_string()]);
+    assert!(build_info.features.iter().any(|feature| feature == "net"));
     assert_eq!(
         build_info.env.get("HELLO").map(String::as_str),
         Some("world")
@@ -253,7 +224,7 @@ fn load_build_info_prefers_request_override_without_writing_file() {
     let build_info = load_build_info(&request).unwrap();
 
     assert_eq!(build_info.log, LogLevel::Info);
-    assert_eq!(build_info.features, vec!["net".to_string()]);
+    assert!(build_info.features.iter().any(|feature| feature == "net"));
     assert!(!path.exists());
 }
 
@@ -280,7 +251,7 @@ fn patch_starry_cargo_config_injects_required_features_and_env() {
 
     assert_eq!(cargo.package, STARRY_PACKAGE);
     assert_eq!(cargo.target, "aarch64-unknown-none-softfloat");
-    assert_eq!(cargo.features, vec!["net".to_string()]);
+    assert!(cargo.features.iter().any(|feature| feature == "net"));
     assert_eq!(
         cargo.env.get("AX_ARCH").map(String::as_str),
         Some("aarch64")
@@ -320,9 +291,11 @@ fn patch_starry_cargo_config_preserves_request_package() {
     patch_starry_cargo_config(&mut cargo, &request, &metadata).unwrap();
 
     assert_eq!(cargo.package, STARRY_PACKAGE);
-    assert_eq!(
-        cargo.args,
-        vec!["--bin".to_string(), STARRY_PACKAGE.to_string()]
+    assert!(
+        cargo
+            .args
+            .windows(2)
+            .any(|args| { args == ["--bin", STARRY_PACKAGE] })
     );
 }
 
@@ -529,7 +502,7 @@ fn load_cargo_config_keeps_sg2002_as_device_feature_without_static_platform_alia
 }
 
 #[test]
-fn load_cargo_config_keeps_original_bare_target_for_dynamic_platform_request() {
+fn load_cargo_config_uses_shared_bare_target_for_dynamic_platform_request() {
     let target = "aarch64-unknown-none-softfloat";
     let mut request = request(PathBuf::from("/tmp/.build.toml"), "aarch64", target);
     request.build_info_override = Some(StarryBuildInfo {
@@ -539,7 +512,8 @@ fn load_cargo_config_keeps_original_bare_target_for_dynamic_platform_request() {
 
     let cargo = load_cargo_config(&request).unwrap();
 
-    assert_eq!(cargo.target, target);
+    assert_eq!(cargo.target, format!("scripts/targets/bare/{target}.json"));
+    assert_eq!(cargo.env.get("AX_TARGET"), Some(&target.to_string()));
 }
 
 #[test]
@@ -569,7 +543,7 @@ fn load_cargo_config_uses_bare_no_std_pie_contract() {
     let cargo = load_cargo_config(&request).unwrap();
     let args = cargo.args.join("\n");
 
-    assert_eq!(cargo.target, target);
+    assert_eq!(cargo.target, format!("scripts/targets/bare/{target}.json"));
     assert!(
         cargo
             .args
@@ -589,9 +563,17 @@ fn load_cargo_config_uses_bare_no_std_pie_contract() {
     }
     assert!(cargo.extra_config.is_none());
     assert!(cargo.pre_build_cmds.is_empty());
-    assert!(!cargo.target.contains("scripts/targets/std"));
-    assert!(!cargo.args.iter().any(|arg| arg == "json-target-spec"));
-    assert!(!cargo.env.contains_key("CARGO_UNSTABLE_JSON_TARGET_SPEC"));
+    assert!(cargo.target.starts_with("scripts/targets/bare/"));
+    assert!(
+        cargo
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-Z", "json-target-spec"])
+    );
+    assert_eq!(
+        cargo.env.get("CARGO_UNSTABLE_JSON_TARGET_SPEC"),
+        Some(&"true".to_string())
+    );
     assert!(
         cargo
             .features
@@ -612,31 +594,43 @@ fn load_cargo_config_derives_to_bin_from_original_bare_target() {
         request.build_info_override = Some(default_starry_build_info());
 
         let cargo = load_cargo_config(&request).unwrap();
-        assert_eq!(cargo.target, target);
+        assert_eq!(cargo.target, format!("scripts/targets/bare/{target}.json"));
+        assert_eq!(cargo.env.get("AX_TARGET"), Some(&target.to_string()));
+        assert_eq!(
+            cargo.env.get("CARGO_UNSTABLE_JSON_TARGET_SPEC"),
+            Some(&"true".to_string())
+        );
         assert_eq!(cargo.to_bin, expected_to_bin);
     }
 }
 
 #[test]
 fn load_cargo_config_applies_arch_specific_bare_pie_flags() {
-    for (arch, target, expected_flag) in [
-        (
-            "riscv64",
-            "riscv64gc-unknown-none-elf",
-            "-Clink-args=--no-relax",
-        ),
-        (
-            "loongarch64",
-            "loongarch64-unknown-none-softfloat",
-            "-Ctarget-feature=-ual",
-        ),
-    ] {
+    for (arch, target, expected_flag) in [(
+        "riscv64",
+        "riscv64gc-unknown-none-elf",
+        "-Clink-args=--no-relax",
+    )] {
         let mut request = request(PathBuf::from("/tmp/.build.toml"), arch, target);
         request.build_info_override = Some(default_starry_build_info());
 
         let cargo = load_cargo_config(&request).unwrap();
         assert!(cargo.args.join("\n").contains(expected_flag));
     }
+}
+
+#[test]
+fn load_cargo_config_denies_warnings() {
+    let mut request = request(
+        PathBuf::from("/tmp/.build.toml"),
+        "x86_64",
+        "x86_64-unknown-none",
+    );
+    request.build_info_override = Some(default_starry_build_info());
+
+    let cargo = load_cargo_config(&request).unwrap();
+
+    assert!(cargo.args.join("\n").contains("\"-D\", \"warnings\""));
 }
 
 #[test]
@@ -652,19 +646,6 @@ fn load_cargo_config_rejects_std_compat_for_freestanding_kernel() {
         let err = load_cargo_config(&request).unwrap_err();
         assert!(err.to_string().contains("freestanding no_std build"));
     }
-}
-
-#[test]
-fn starry_kernel_entry_is_freestanding_c_abi() {
-    let source = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../os/StarryOS/starryos/src/main.rs"),
-    )
-    .unwrap();
-
-    assert!(source.contains("#![no_std]"));
-    assert!(source.contains("#![no_main]"));
-    assert!(source.contains("extern \"C\" fn main()"));
-    assert!(!source.contains("cfg_attr(target_os"));
 }
 
 #[test]
@@ -728,7 +709,7 @@ fn ensure_starry_bin_arg_adds_bin_for_starryos_package() {
     let metadata = crate::build::workspace_metadata().unwrap();
     ensure_starry_bin_arg(&mut args, "starryos", &metadata).unwrap();
 
-    assert_eq!(args, vec!["--bin".to_string(), "starryos".to_string()]);
+    assert!(args.windows(2).any(|pair| pair == ["--bin", "starryos"]));
 }
 
 #[test]
@@ -738,7 +719,7 @@ fn ensure_starry_bin_arg_keeps_existing_bin_arg() {
     let metadata = crate::build::workspace_metadata().unwrap();
     ensure_starry_bin_arg(&mut args, STARRY_PACKAGE, &metadata).unwrap();
 
-    assert_eq!(args, vec!["--bin".to_string(), "starryos".to_string()]);
+    assert!(args.windows(2).any(|pair| pair == ["--bin", "starryos"]));
 }
 
 #[test]

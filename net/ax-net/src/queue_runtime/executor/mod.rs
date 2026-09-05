@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use ax_sync::SpinLock;
@@ -10,7 +10,7 @@ use rd_net::{
 use super::{
     COMMAND_QUARANTINE, COMMAND_STOP, COMMAND_WAIT, CPU_ROUND_BUDGET, PollGroupState, QUEUE_BUDGET,
     STATE_MASK, STATE_MISSED, STATE_POLLING, STATE_SCHEDULED, STATUS_FAILED, STATUS_READY,
-    SpscConsumer, SpscProducer,
+    SpscConsumer, SpscProducer, TxQueueDiscipline,
 };
 use crate::device::{
     ETH_ZLEN, EthernetFramePort, NetDeviceError, NetDeviceResult, ProtocolEthernetFrame,
@@ -18,6 +18,9 @@ use crate::device::{
 };
 
 mod wifi;
+
+#[cfg(test)]
+mod queue_tests;
 
 pub(super) use wifi::WifiExecutorSlot;
 use wifi::process_wifi_requests;
@@ -135,14 +138,6 @@ impl ProtocolGroupPort {
         Ok(frame.read_with(consume))
     }
 
-    fn transmit(&mut self, frame: &ProtocolEthernetFrame) -> NetDeviceResult {
-        self.transmit_frame_with_options(
-            frame.packet_len(),
-            TxSubmitOptions::default(),
-            &mut |target| target.copy_from_slice(frame.packet()),
-        )
-    }
-
     pub(super) fn transmit_frame_with_options(
         &mut self,
         frame_len: usize,
@@ -170,10 +165,19 @@ impl ProtocolGroupPort {
     }
 }
 
+pub(super) struct PendingProtocolTx {
+    frame: ProtocolEthernetFrame,
+    options: TxSubmitOptions,
+}
+
 pub(super) struct QueueFramePort {
     pub(super) name: String,
     pub(super) mac: Arc<SpinLock<[u8; 6]>>,
     pub(super) groups: Vec<ProtocolGroupPort>,
+    /// Device-level policy for handling a busy transmit queue.
+    pub(super) tx_queue_discipline: TxQueueDiscipline,
+    /// Lazily allocated FIFO storage used only by `TxQueueDiscipline::Fifo`.
+    pub(super) pending_tx: VecDeque<PendingProtocolTx>,
     pub(super) next_rx: usize,
     pub(super) next_tx: usize,
     pub(super) checksum_capabilities: TxChecksumCapabilities,
@@ -193,21 +197,11 @@ impl EthernetFramePort for QueueFramePort {
     }
 
     fn transmit(&mut self, frame: &ProtocolEthernetFrame) -> NetDeviceResult {
-        if self.groups.is_empty() {
-            return Err(NetDeviceError::Stopped);
-        }
-        for offset in 0..self.groups.len() {
-            let index = (self.next_tx + offset) % self.groups.len();
-            match self.groups[index].transmit(frame) {
-                Ok(()) => {
-                    self.next_tx = (index + 1) % self.groups.len();
-                    return Ok(());
-                }
-                Err(NetDeviceError::Again) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(NetDeviceError::Again)
+        self.transmit_frame_with_options(
+            frame.packet_len(),
+            TxSubmitOptions::default(),
+            &mut |target| target.copy_from_slice(frame.packet()),
+        )
     }
 
     fn transmit_frame_with_options(
@@ -219,31 +213,45 @@ impl EthernetFramePort for QueueFramePort {
         if self.groups.is_empty() {
             return Err(NetDeviceError::Stopped);
         }
-        for offset in 0..self.groups.len() {
-            let index = (self.next_tx + offset) % self.groups.len();
+        let TxQueueDiscipline::Fifo { max_frames } = self.tx_queue_discipline else {
+            debug_assert!(self.pending_tx.is_empty());
+            return self.try_transmit_with_options(frame_len, options, fill);
+        };
+
+        self.flush_pending_tx()?;
+        if self.pending_tx.len() >= max_frames.get() {
+            return Err(NetDeviceError::Again);
+        }
+        if self.pending_tx.is_empty() {
             let mut filled = false;
-            let mut fill_once = |target: &mut [u8]| {
+            match self.try_transmit_with_options(frame_len, options, &mut |target| {
                 filled = true;
                 fill(target);
-            };
-            match self.groups[index].transmit_frame_with_options(frame_len, options, &mut fill_once)
-            {
-                Ok(()) => {
-                    self.next_tx = (index + 1) % self.groups.len();
-                    return Ok(());
-                }
+            }) {
+                Ok(()) => return Ok(()),
                 Err(NetDeviceError::Again) if !filled => {}
-                Err(NetDeviceError::Again) => return Err(NetDeviceError::Again),
+                // A callback may own a one-shot packet builder. If publication
+                // failed after filling, leave retry ownership with the caller.
                 Err(error) => return Err(error),
             }
         }
-        Err(NetDeviceError::Again)
+        // Only a busy FIFO needs an inline frame. Available DMA tokens use
+        // the same direct-fill path as NoQueue devices above.
+        let mut frame = ProtocolEthernetFrame::new(frame_len)?;
+        fill(frame.packet_mut());
+        self.pending_tx
+            .push_back(PendingProtocolTx { frame, options });
+        Ok(())
     }
 
     fn receive(&mut self) -> NetDeviceResult<ProtocolEthernetFrame> {
         if self.groups.is_empty() {
             return Err(NetDeviceError::Stopped);
         }
+        // Completion of a DMA TX token requests another protocol poll. Flush
+        // the retained qdisc-like backlog before consuming RX work so a busy
+        // TX queue cannot remain stranded while the link is otherwise live.
+        self.flush_pending_tx()?;
         for offset in 0..self.groups.len() {
             let index = (self.next_rx + offset) % self.groups.len();
             match self.groups[index].receive() {
@@ -257,11 +265,11 @@ impl EthernetFramePort for QueueFramePort {
         }
         Err(NetDeviceError::Again)
     }
-
     fn receive_owned(&mut self) -> NetDeviceResult<Option<ProtocolRxFrame>> {
         if self.groups.is_empty() {
             return Err(NetDeviceError::Stopped);
         }
+        self.flush_pending_tx()?;
         for offset in 0..self.groups.len() {
             let index = (self.next_rx + offset) % self.groups.len();
             match self.groups[index].receive_owned() {
@@ -280,6 +288,7 @@ impl EthernetFramePort for QueueFramePort {
         if self.groups.is_empty() {
             return Err(NetDeviceError::Stopped);
         }
+        self.flush_pending_tx()?;
         for offset in 0..self.groups.len() {
             let index = (self.next_rx + offset) % self.groups.len();
             match self.groups[index].receive_with(consume) {
@@ -292,6 +301,52 @@ impl EthernetFramePort for QueueFramePort {
             }
         }
         Err(NetDeviceError::Again)
+    }
+}
+
+impl QueueFramePort {
+    fn try_transmit_with_options(
+        &mut self,
+        frame_len: usize,
+        options: TxSubmitOptions,
+        fill: &mut dyn FnMut(&mut [u8]),
+    ) -> NetDeviceResult {
+        for offset in 0..self.groups.len() {
+            let index = (self.next_tx + offset) % self.groups.len();
+            let mut filled = false;
+            let mut fill_once = |target: &mut [u8]| {
+                filled = true;
+                fill(target);
+            };
+            match self.groups[index].transmit_frame_with_options(frame_len, options, &mut fill_once)
+            {
+                Ok(()) => {
+                    self.next_tx = (index + 1) % self.groups.len();
+                    return Ok(());
+                }
+                Err(NetDeviceError::Again) if !filled => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(NetDeviceError::Again)
+    }
+
+    fn flush_pending_tx(&mut self) -> NetDeviceResult {
+        while let Some(request) = self.pending_tx.pop_front() {
+            match self.try_transmit_with_options(
+                request.frame.packet_len(),
+                request.options,
+                &mut |target| target.copy_from_slice(request.frame.packet()),
+            ) {
+                Ok(()) => {}
+                Err(NetDeviceError::Again) => {
+                    self.pending_tx.push_front(request);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -354,7 +409,7 @@ pub(super) struct QueueGroupExecutor {
     pub(super) tx_ready: SpscConsumer<TxRequest>,
     pub(super) tx_free: SpscProducer<DmaBuffer>,
     pub(super) pending_rx: Option<RxCompletion>,
-    pub(super) pending_rx_refill: Option<PendingRxRefill>,
+    pub(super) pending_rx_refill: VecDeque<PendingRxRefill>,
     pub(super) pending_tx: Option<TxRequest>,
     pub(super) pending_tx_free: Option<DmaBuffer>,
     pub(super) retry_at: Option<u64>,
@@ -424,87 +479,9 @@ impl QueueGroupExecutor {
         }
 
         let mut work = 0;
-        if let Some(completion) = self.pending_rx.take() {
-            match self.rx_ready.push(completion) {
-                Ok(()) => crate::request_poll(),
-                Err(completion) => {
-                    self.pending_rx = Some(completion);
-                    return GroupPollOutcome::Blocked(work);
-                }
-            }
-        }
         if let Some(buffer) = self.pending_tx_free.take() {
             if let Err(buffer) = self.tx_free.push(buffer) {
                 self.pending_tx_free = Some(buffer);
-                return GroupPollOutcome::Blocked(work);
-            }
-            crate::request_poll();
-        }
-        let per_class = QUEUE_BUDGET.min(cpu_budget.saturating_sub(work));
-        let recycled =
-            self.rx_recycler
-                .drain_into(&mut self.rx_recycle, &mut self.rx_spares, per_class);
-        work += recycled;
-
-        if let Some(pending) = self.pending_rx_refill.take() {
-            match self.group.rx.recycle(pending.replacement) {
-                Ok(()) => {
-                    work += 1;
-                    if let Err(completion) = self.rx_ready.push(pending.completion) {
-                        self.pending_rx = Some(completion);
-                        return GroupPollOutcome::Blocked(work);
-                    }
-                    crate::request_poll();
-                }
-                Err(error) => {
-                    let (replacement, reason) = error.into_parts();
-                    self.pending_rx_refill = Some(PendingRxRefill {
-                        completion: pending.completion,
-                        replacement,
-                    });
-                    if matches!(reason, NetError::Retry) {
-                        return hardware_retry_outcome(work);
-                    }
-                    self.shared.disable();
-                    return GroupPollOutcome::Failed;
-                }
-            }
-        }
-
-        let rx_budget = QUEUE_BUDGET.min(cpu_budget.saturating_sub(work));
-        let mut received = 0;
-        while received < rx_budget {
-            let Some(completion) = self.group.rx.reclaim() else {
-                break;
-            };
-            received += 1;
-            work += 1;
-            let replacement = match self.rx_spares.pop() {
-                Some(buffer) => buffer,
-                None => match self.group.rx.allocate_replacement() {
-                    Ok(buffer) => buffer,
-                    Err(_) => {
-                        self.shared.disable();
-                        return GroupPollOutcome::Failed;
-                    }
-                },
-            };
-            // Keep the hardware ring full before the completed token crosses
-            // into protocol ownership and may be retained by smoltcp.
-            if let Err(error) = self.group.rx.recycle(replacement) {
-                let (replacement, reason) = error.into_parts();
-                self.pending_rx_refill = Some(PendingRxRefill {
-                    completion,
-                    replacement,
-                });
-                if matches!(reason, NetError::Retry) {
-                    return rx_refill_retry_outcome(work, received);
-                }
-                self.shared.disable();
-                return GroupPollOutcome::Failed;
-            }
-            if let Err(completion) = self.rx_ready.push(completion) {
-                self.pending_rx = Some(completion);
                 return GroupPollOutcome::Blocked(work);
             }
             crate::request_poll();
@@ -567,6 +544,88 @@ impl QueueGroupExecutor {
             self.group.tx.flush();
         }
 
+        if let Some(completion) = self.pending_rx.take() {
+            match self.rx_ready.push(completion) {
+                Ok(()) => crate::request_poll(),
+                Err(completion) => {
+                    self.pending_rx = Some(completion);
+                    return GroupPollOutcome::Blocked(work);
+                }
+            }
+        }
+
+        let per_class = QUEUE_BUDGET.min(cpu_budget.saturating_sub(work));
+        let recycled =
+            self.rx_recycler
+                .drain_into(&mut self.rx_recycle, &mut self.rx_spares, per_class);
+        work += recycled;
+
+        let rx_budget = QUEUE_BUDGET.min(cpu_budget.saturating_sub(work));
+        let mut received = 0;
+        let mut rx_refill_blocked = false;
+        loop {
+            while !rx_refill_blocked && work < cpu_budget {
+                let Some(pending) = self.pending_rx_refill.pop_front() else {
+                    break;
+                };
+                match self.group.rx.recycle(pending.replacement) {
+                    Ok(()) => {
+                        work += 1;
+                        if let Err(completion) = self.rx_ready.push(pending.completion) {
+                            self.pending_rx = Some(completion);
+                            return GroupPollOutcome::Blocked(work);
+                        }
+                        crate::request_poll();
+                    }
+                    Err(error) => {
+                        let (replacement, reason) = error.into_parts();
+                        self.pending_rx_refill.push_front(PendingRxRefill {
+                            completion: pending.completion,
+                            replacement,
+                        });
+                        if !matches!(reason, NetError::Retry) {
+                            self.shared.disable();
+                            return GroupPollOutcome::Failed;
+                        }
+                        rx_refill_blocked = true;
+                    }
+                }
+            }
+            if work >= cpu_budget
+                || received >= rx_budget
+                || self.pending_rx_refill.len() >= self.group.rx.capacity()
+            {
+                break;
+            }
+            let Some(completion) = self.group.rx.reclaim() else {
+                break;
+            };
+            received += 1;
+            work += 1;
+            let replacement = match self.rx_spares.pop() {
+                Some(buffer) => buffer,
+                None => match self.group.rx.allocate_replacement() {
+                    Ok(buffer) => buffer,
+                    Err(_) => {
+                        self.shared.disable();
+                        return GroupPollOutcome::Failed;
+                    }
+                },
+            };
+            // Retain completion ownership until its replacement is submitted.
+            // Reclaim remains allowed while refill is blocked: software-backed
+            // queues may need completion-ring space before they accept buffers.
+            // The retained queue is bounded by the hardware RX capacity.
+            self.pending_rx_refill.push_back(PendingRxRefill {
+                completion,
+                replacement,
+            });
+        }
+
+        if rx_refill_blocked {
+            return rx_refill_retry_outcome(work, received);
+        }
+
         let exhausted = budget_was_exhausted(received, rx_budget)
             || budget_was_exhausted(tx_completed, tx_completion_budget)
             || budget_was_exhausted(submitted, tx_submit_budget)
@@ -620,6 +679,7 @@ pub(super) struct ExecutorControl {
     pub(super) command: AtomicU8,
     pub(super) affinity_status: AtomicU8,
     pub(super) startup_status: AtomicU8,
+    pub(super) startup_error: SpinLock<Option<NetError>>,
     pub(super) notify: Arc<ax_task::IrqNotify>,
 }
 
@@ -680,9 +740,14 @@ pub(super) fn queue_executor_main(
         return;
     }
 
-    let initialized = groups.iter_mut().all(|group| group.initialize().is_ok());
+    let initialization = groups
+        .iter_mut()
+        .try_for_each(QueueGroupExecutor::initialize);
+    if let Err(error) = initialization {
+        *control.startup_error.lock_irqsave() = Some(error);
+    }
     control.startup_status.store(
-        if initialized {
+        if control.startup_error.lock_irqsave().is_none() {
             STATUS_READY
         } else {
             STATUS_FAILED
@@ -690,7 +755,7 @@ pub(super) fn queue_executor_main(
         Ordering::Release,
     );
     control.notify.notify();
-    if !initialized {
+    if control.startup_error.lock_irqsave().is_some() {
         let irq_synchronized = wait_for_cleanup_command(&control);
         release_executor_resources(groups, wifi, irq_synchronized);
         return;

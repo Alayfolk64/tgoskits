@@ -11,7 +11,10 @@ mod state;
 mod tests;
 
 use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::{
+    num::NonZeroUsize,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use ax_sync::SpinLock;
 use ax_task::WaitQueue;
@@ -163,12 +166,14 @@ pub enum NetworkRuntimeError {
     InvalidTopology,
     #[error("network queue executor could not be pinned to CPU {0}")]
     WorkerAffinity(usize),
-    #[error("network queue initialization failed")]
-    QueueInit,
+    #[error("network queue initialization failed: {0}")]
+    QueueInit(NetError),
     #[error("network IRQ registration failed: {0}")]
     IrqRegistration(#[from] PinnedNetIrqError),
     #[error("network DMA setup failed: {0}")]
     Device(#[from] NetError),
+    #[error("secure Wi-Fi startup entropy failed: {0}")]
+    StartupEntropy(#[from] crate::NetError),
 }
 
 /// Resolved driver source-id to physical IRQ mapping.
@@ -183,6 +188,16 @@ pub struct NetworkDeviceInput {
     pub name: String,
     pub device: PreparedNetDevice,
     pub irq_sources: Vec<ResolvedNetIrqSource>,
+    pub tx_queue_discipline: TxQueueDiscipline,
+}
+
+/// Protocol-side transmit queue policy for one network device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxQueueDiscipline {
+    /// Submit directly to the device and return `Again` when it is busy.
+    NoQueue,
+    /// Retain frames in submission order while the device is busy.
+    Fifo { max_frames: NonZeroUsize },
 }
 
 /// Result of a bounded hard-IRQ callback.
@@ -432,7 +447,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     tx_ready: tx_ready_rx,
                     tx_free: tx_free_tx,
                     pending_rx: None,
-                    pending_rx_refill: None,
+                    pending_rx_refill: VecDeque::with_capacity(rx_capacity),
                     pending_tx: None,
                     pending_tx_free: None,
                     retry_at: None,
@@ -470,6 +485,8 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 name: port_name,
                 mac: port_mac,
                 groups: protocol_groups,
+                tx_queue_discipline: input.tx_queue_discipline,
+                pending_tx: VecDeque::new(),
                 next_rx: 0,
                 next_tx: 0,
                 checksum_capabilities: checksum_capabilities
@@ -487,6 +504,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 command: AtomicU8::new(COMMAND_WAIT),
                 affinity_status: AtomicU8::new(STATUS_PENDING),
                 startup_status: AtomicU8::new(STATUS_PENDING),
+                startup_error: SpinLock::new(None),
                 notify: Arc::clone(&cpu_notifies[owner_cpu]),
             });
             let task_control = Arc::clone(&control);
@@ -604,6 +622,12 @@ impl<'a> NetworkRuntimeBuilder<'a> {
         for executor in &executors {
             wait_status(&executor.control.startup_status);
             if executor.control.startup_status.load(Ordering::Acquire) != STATUS_READY {
+                let error = executor
+                    .control
+                    .startup_error
+                    .lock_irqsave()
+                    .take()
+                    .unwrap_or(NetError::InvalidParts);
                 let irq_synchronized = release_registrations(registrations);
                 stop_executors(&executors, irq_synchronized);
                 release_runtime_side_resources(
@@ -618,7 +642,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     ),
                     irq_synchronized,
                 );
-                return Err(NetworkRuntimeError::QueueInit);
+                return Err(NetworkRuntimeError::QueueInit(error));
             }
         }
         let protocol_owner_cpu = select_protocol_owner(&group_owners, self.online_cpus);
@@ -632,6 +656,8 @@ impl<'a> NetworkRuntimeBuilder<'a> {
             protocol_owner_cpu,
         };
         for (handle, transaction) in startup_transactions {
+            let transaction =
+                prepare_startup_transaction(transaction, super::next_wifi_connection_entropy)?;
             let policy = transaction.link_policy();
             handle.submit(transaction)?;
             if let Some(policy) = policy {
@@ -646,6 +672,17 @@ impl<'a> NetworkRuntimeBuilder<'a> {
         }
         Ok((runtime, ports))
     }
+}
+
+fn prepare_startup_transaction(
+    mut transaction: WifiTransaction,
+    next_entropy: impl FnOnce() -> Result<[u8; 32], crate::NetError>,
+) -> Result<WifiTransaction, crate::NetError> {
+    if transaction.needs_connect_entropy() {
+        transaction.provide_connect_entropy(next_entropy()?);
+        log::info!("[wifi] secure startup connection entropy prepared");
+    }
+    Ok(transaction)
 }
 
 fn validate_and_collect_irq_sets(

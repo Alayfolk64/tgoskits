@@ -16,6 +16,19 @@ StarryOS 测试由数据驱动。用例位于 `test-suit/starryos`，发现与�
 
 QEMU 用例构建 `starryos` 软件包，并运行对应体系结构的 `qemu-<arch>.toml`。板卡用例针对板卡目标构建 StarryOS，再通过板卡运行器执行 `board-<board>.toml`。
 
+## 与其他测试层的边界
+
+- 宿主 `std` 只验证算法、数据结构、状态机、协议解析和错误转换；不能用 fake runtime、fake IRQ、fake timer 或 shell prompt 代替 StarryOS 运行证据。
+- ArceOS 的真实调度、IPI、IRQ、timer、SMP、affinity 和上下文切换优先放在 `test-suit/arceos/rust`，使用 `cargo xtask arceos test qemu ...`。
+- Starry kernel 私有 Linux ABI、namespace、procfs、pipe、epoll 和内核生命周期语义保留在本 suite 或 Starry kernel axtest；Axvisor 和板卡专有行为分别使用 `cargo xtask ktest qemu`/`cargo xtask ktest board`。
+- 同一 crate 可以同时有 std 模型测试和 QEMU/axtest 集成测试，但同一断言只能由一个最接近真实语义的层负责；上层运行证据不能被低层 host 编译替代。
+
+用例的目标风险、必要性、缺陷敏感度与跨层去重先按
+[`test-quality`](../test-quality/SKILL.md) 判断；本技能只补充 Starry 测试套件的目录、发现、文件流水线和运行器契约。
+
+宿主 `std` 允许列表和 profile 规则见 [`update-std-tests`](../update-std-tests/SKILL.md)，
+ArceOS Rust QEMU 的发现与 runner 契约见 [`arceos-test-adapter`](../arceos-test-adapter/SKILL.md)。
+
 ## 工作流程
 
 1. 检查 `test-suit/starryos` 下的目标目录，以及 `scripts/axbuild/src/starry/test.rs` 中当前测试流程。
@@ -31,6 +44,7 @@ QEMU 用例构建 `starryos` 软件包，并运行对应体系结构的 `qemu-<a
 - Starry 测试套件不再使用 `normal`、`stress` 等一级测试分组。QEMU 和板卡用例直接从 `test-suit/starryos` 发现。
 - QEMU 配置位于 `test-suit/starryos/<case>/qemu-<arch>.toml`，或 `test-suit/starryos/<build-wrapper>/<case>/qemu-<arch>.toml`。
 - 板卡配置位于 `test-suit/starryos/<case>/board-<board>.toml`，或 `test-suit/starryos/<build-wrapper>/<case>/board-<board>.toml`。
+- 板卡用例依赖非空宿主环境变量时，在同一 case 目录的 `requirements.toml` 中以 `required_env = ["NAME", ...]` 声明。缺失或空值必须明确记为 skipped，不能从发现或 `--list` 中静默删除，也不能构建或占用板卡。
 - 构建配置位于用例目录或最近的构建包装目录，命名为 `build-<target>.toml`；存在时也识别 `build-<arch>.toml`。
 - 构建包装目录保存共享构建配置和多个用例。目录同时含 `build-*` 与 `qemu-*` 或 `board-*` 时，该目录本身也是用例。
 - QEMU 发现先选择具有匹配体系结构或目标构建配置的目录，再在该目录及其下级目录中发现 `qemu-<arch>.toml`。

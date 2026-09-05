@@ -31,14 +31,18 @@ pub(crate) fn start() {
           no reachable web console address yet\r\n\
           VM startup will continue while network configuration completes\r\n",
     );
-    thread::Builder::new()
+    if let Err(error) = thread::Builder::new()
         .name("axvisor-network-status".into())
         .spawn(wait_for_ready_interface)
-        .expect("failed to start Axvisor network status reporter");
+    {
+        let message = format!(
+            "\r\nAxvisor web console address monitor unavailable:\r\n  error = {error}\r\n"
+        );
+        guest_console::submit_host_bytes(message.as_bytes());
+    }
 }
 
 fn wait_for_ready_interface() {
-    crate::network_console::pin_current_task();
     loop {
         thread::sleep(ADDRESS_POLL_INTERVAL);
         if let Some(interface) = ready_interface() {
@@ -66,11 +70,11 @@ fn ready_interface() -> Option<InterfaceAddress> {
 fn submit_access_banner(interface: &InterfaceAddress) {
     let address = interface.ipv4.address.address();
     let mut banner = String::new();
-    let _ = writeln!(banner, "\r\nAxvisor network ready:");
-    let _ = writeln!(banner, "  interface = {}", interface.name);
-    let _ = writeln!(
+    let _ = write!(banner, "\r\nAxvisor network ready:\r\n");
+    let _ = write!(banner, "  interface = {}\r\n", interface.name);
+    let _ = write!(
         banner,
-        "  ipv4 = {address}/{}",
+        "  ipv4 = {address}/{}\r\n",
         interface.ipv4.address.prefix_len()
     );
     append_web_console_endpoint(&mut banner, address, crate::http::bind_addr());
@@ -89,5 +93,5 @@ fn append_web_console_endpoint(
         IpAddr::V4(ip) if ip.is_unspecified() => assigned_address.to_string(),
         ip => ip.to_string(),
     };
-    let _ = writeln!(banner, "  web_console = http://{host}:{}/", bind.port());
+    let _ = write!(banner, "  web_console = http://{host}:{}/\r\n", bind.port());
 }

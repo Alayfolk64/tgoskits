@@ -4,8 +4,10 @@ use ax_hal::paging::{MappingFlags, PageTable};
 use ax_memory_addr::VirtAddr;
 use ax_memory_set::MappingBackend;
 
-mod alloc;
+pub(crate) mod alloc;
 mod linear;
+
+pub use alloc::{KernelVirtualAllocationBackend, KernelVirtualAllocationId};
 
 /// A unified enum type for different memory mapping backends.
 ///
@@ -17,21 +19,25 @@ mod linear;
 ///   which may use huge pages and must not be partially unmapped.
 /// - **Allocation**: used in general, or for lazy mappings. The target physical
 ///   frames are obtained from the global allocator.
+/// - **Kernel virtual allocation**: reserves one virtual interval, optionally
+///   leaves leading guard pages unmapped, and backs the usable part with
+///   individually allocated frames. Its explicit
+///   Live -> Retiring -> Quarantined state keeps frame ownership attached to
+///   the mapping until a TLB acknowledgement.
 #[derive(Clone)]
 pub enum Backend {
     /// Linear mapping backend.
     ///
-    /// The offset between the virtual address and the physical address is
-    /// constant, which is specified by `pa_va_offset`. For example, the virtual
-    /// address `vaddr` is mapped to the physical address `vaddr - pa_va_offset`.
+    /// The signed delta from physical to virtual addresses is constant. The
+    /// physical address for `vaddr` is `vaddr - pa_to_va_delta`.
     Linear {
-        /// `vaddr - paddr`.
-        pa_va_offset: usize,
+        /// `vaddr as i128 - paddr as i128`.
+        pa_to_va_delta: i128,
     },
     /// Immutable linear mapping backend for the boot-time kernel direct map.
     BootLinear {
-        /// `vaddr - paddr`.
-        pa_va_offset: usize,
+        /// `vaddr as i128 - paddr as i128`.
+        pa_to_va_delta: i128,
     },
     /// Allocation mapping backend.
     ///
@@ -43,6 +49,16 @@ pub enum Backend {
         /// Whether to populate the physical frames when creating the mapping.
         populate: bool,
     },
+    /// Virtually contiguous kernel allocation with non-contiguous frames.
+    KernelVirtualAllocation(KernelVirtualAllocationBackend),
+}
+
+/// Whether a kernel virtual allocation may still be used by its owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelVirtualAllocationState {
+    Live,
+    Retiring,
+    Quarantined,
 }
 
 impl MappingBackend for Backend {
@@ -51,22 +67,37 @@ impl MappingBackend for Backend {
     type PageTable = PageTable;
     fn map(&self, start: VirtAddr, size: usize, flags: MappingFlags, pt: &mut PageTable) -> bool {
         match *self {
-            Self::Linear { pa_va_offset } => {
-                self.map_linear(start, size, flags, pt, pa_va_offset, false)
+            Self::Linear { pa_to_va_delta } => {
+                self.map_linear(start, size, flags, pt, pa_to_va_delta, false)
             }
-            Self::BootLinear { pa_va_offset } => {
-                self.map_linear(start, size, flags, pt, pa_va_offset, true)
+            Self::BootLinear { pa_to_va_delta } => {
+                self.map_linear(start, size, flags, pt, pa_to_va_delta, true)
             }
             Self::Alloc { populate } => self.map_alloc(start, size, flags, pt, populate),
+            Self::KernelVirtualAllocation(_) => {
+                self.map_kernel_virtual_allocation(start, size, flags, pt)
+            }
         }
     }
 
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut PageTable) -> bool {
         match *self {
-            Self::Linear { pa_va_offset } | Self::BootLinear { pa_va_offset } => {
-                self.unmap_linear(start, size, pt, pa_va_offset)
+            Self::Linear { pa_to_va_delta } | Self::BootLinear { pa_to_va_delta } => {
+                self.unmap_linear(start, size, pt, pa_to_va_delta)
             }
             Self::Alloc { populate } => self.unmap_alloc(start, size, pt, populate),
+            Self::KernelVirtualAllocation(_) => {
+                self.unmap_kernel_virtual_allocation(start, size, pt)
+            }
+        }
+    }
+
+    fn validate_unmap(&self, start: VirtAddr, size: usize, pt: &PageTable) -> bool {
+        match self {
+            Self::KernelVirtualAllocation(_) => {
+                self.validate_kernel_virtual_allocation(start, size, pt)
+            }
+            _ => true,
         }
     }
 
@@ -81,16 +112,19 @@ impl MappingBackend for Backend {
     }
 
     fn split(&mut self, _align_diff: usize) -> Option<Self> {
-        // backend can be trivially split since it does not have any state.
-        Some(self.clone())
+        match self {
+            Self::KernelVirtualAllocation(_) => None,
+            // These backends do not carry range-relative ownership.
+            _ => Some(self.clone()),
+        }
     }
 
-    fn shrink_left(&mut self, _shrink_size: usize) {
-        // backend can be trivially shrunk since it does not have any state.
+    fn shrink_left(&mut self, _shrink_size: usize) -> bool {
+        !matches!(self, Self::KernelVirtualAllocation(_))
     }
 
-    fn shrink_right(&mut self, _shrink_size: usize) {
-        // backend can be trivially shrunk since it does not have any state.
+    fn shrink_right(&mut self, _shrink_size: usize) -> bool {
+        !matches!(self, Self::KernelVirtualAllocation(_))
     }
 }
 
@@ -106,6 +140,25 @@ impl Backend {
             Self::Alloc { populate } => {
                 self.handle_page_fault_alloc(vaddr, orig_flags, page_table, populate)
             }
+            Self::KernelVirtualAllocation(_) => false,
+        }
+    }
+
+    pub(crate) fn new_kernel_virtual_allocation(
+        usage: ax_alloc::UsageKind,
+        leading_guard_pages: usize,
+        page_count: usize,
+    ) -> Option<Self> {
+        KernelVirtualAllocationBackend::allocate(usage, leading_guard_pages, page_count)
+            .map(Self::KernelVirtualAllocation)
+    }
+
+    pub(crate) const fn kernel_virtual_allocation(
+        &self,
+    ) -> Option<&KernelVirtualAllocationBackend> {
+        match self {
+            Self::KernelVirtualAllocation(allocation) => Some(allocation),
+            _ => None,
         }
     }
 }
