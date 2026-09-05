@@ -620,7 +620,10 @@ impl TransportOps for DgramTransport {
                 match rx.try_recv() {
                     Ok(packet) => packet,
                     Err(TryRecvError::Empty) => return Err(NetError::WouldBlock),
-                    Err(TryRecvError::Closed) => return Ok(0),
+                    Err(TryRecvError::Closed) if self.is_seqpacket => return Ok(0),
+                    // Datagram peer close does not shut down this receiver.
+                    // Linux leaves an empty SOCK_DGRAM receive queue waiting.
+                    Err(TryRecvError::Closed) => return Err(NetError::WouldBlock),
                 }
             };
 
@@ -676,7 +679,10 @@ impl Pollable for DgramTransport {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::OUT;
         if let Some((rx, _)) = self.data_rx.lock().as_ref() {
-            events.set(IoEvents::IN, !rx.is_empty() || rx.is_closed());
+            events.set(IoEvents::IN, !rx.is_empty());
+            if self.is_seqpacket && rx.is_closed() {
+                events.insert(IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP);
+            }
         }
         // A packet parked by MSG_PEEK is immediately readable.
         if self.peeked.lock().is_some() {
@@ -692,15 +698,23 @@ impl Pollable for DgramTransport {
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if !events.contains(IoEvents::IN) {
+        let receive_events = if self.is_seqpacket {
+            IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP
+        } else {
+            IoEvents::IN
+        };
+        let interests = events & receive_events;
+        if interests.is_empty() {
             return;
         }
         // Registration happens from socket poll task context.
         if let Some((_, poll)) = self.data_rx.lock().as_ref() {
-            unsafe { poll.register(context.waker(), IoEvents::IN) };
+            unsafe { poll.register(context.waker(), interests) };
         }
         // Seqpacket listener waits for incoming connections.
-        if let Some((_, poll)) = self.conn_rx.lock().as_ref() {
+        if events.contains(IoEvents::IN)
+            && let Some((_, poll)) = self.conn_rx.lock().as_ref()
+        {
             unsafe { poll.register(context.waker(), IoEvents::IN) };
         }
     }
@@ -715,7 +729,12 @@ impl Drop for DgramTransport {
             // waking first lets the reader observe `Empty`, park again, and
             // miss the sender's subsequent terminal drop forever.
             drop(chan);
-            unsafe { peer_poll.wake(IoEvents::IN | IoEvents::OUT) };
+            if self.is_seqpacket {
+                // Only connection-oriented sockets publish peer shutdown.
+                unsafe {
+                    peer_poll.wake(IoEvents::IN | IoEvents::OUT | IoEvents::RDHUP | IoEvents::HUP)
+                };
+            }
         }
     }
 }
@@ -770,5 +789,43 @@ mod tests {
 
         assert!(probe.saw_closed_channel.load(Ordering::Acquire));
         assert!(receiver.poll().contains(IoEvents::IN));
+    }
+
+    #[test]
+    fn datagram_peer_close_is_not_readable_eof() {
+        let (closing, receiver) = DgramTransport::new_pair(1);
+        drop(closing);
+
+        assert!(
+            !receiver
+                .poll()
+                .intersects(IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP)
+        );
+    }
+
+    #[test]
+    fn seqpacket_close_wakes_terminal_only_waiters() {
+        for interest in [IoEvents::RDHUP, IoEvents::HUP] {
+            let (closing, receiver) = DgramTransport::new_pair_seqpacket(1);
+            let probe = Arc::new(PeerCloseProbe {
+                receiver: receiver.data_rx.lock().as_ref().unwrap().0.clone(),
+                saw_closed_channel: AtomicBool::new(false),
+            });
+            let waker = Waker::from(probe.clone());
+            receiver.register(&mut Context::from_waker(&waker), interest);
+            drop(closing);
+
+            assert!(
+                probe.saw_closed_channel.load(Ordering::Acquire),
+                "{interest:?}"
+            );
+            for _ in 0..2 {
+                assert!(
+                    receiver
+                        .poll()
+                        .contains(IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP)
+                );
+            }
+        }
     }
 }
