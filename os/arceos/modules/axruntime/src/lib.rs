@@ -252,7 +252,20 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     init_allocator();
 
-    let (kernel_space_start, kernel_space_size) = ax_hal::mem::kernel_aspace();
+    let virtual_address_space = ax_hal::mem::virtual_address_space()
+        .unwrap_or_else(|error| panic!("unsupported platform virtual-address layout: {error}"));
+    let user_space = virtual_address_space.user();
+    let kernel_space = virtual_address_space.kernel();
+    let kernel_space_start = kernel_space.start;
+    let kernel_space_size = kernel_space.size();
+
+    info!(
+        "virtual address layout: user [{:#x}, {:#x}), kernel [{:#x}, {:#x})",
+        user_space.start.as_usize(),
+        user_space.end.as_usize(),
+        kernel_space.start.as_usize(),
+        kernel_space.end.as_usize(),
+    );
 
     {
         use core::ops::Range;
@@ -423,14 +436,19 @@ fn init_allocator() {
 fn init_interrupt() {
     init_percpu_irq(ax_hal::percpu::this_cpu_id());
 
+    #[cfg(feature = "paging")]
+    let tlb_preparation = ax_hal::cache::prepare_current_cpu_tlb()
+        .expect("primary CPU failed to prepare TLB capability");
+
     // Enable IRQs before starting app
     ax_hal::asm::enable_irqs();
 
     #[cfg(feature = "ipi")]
-    {
-        ax_hal::asm::flush_tlb(None);
-        ax_ipi::mark_current_cpu_ready();
-    }
+    ax_ipi::mark_current_cpu_ready();
+
+    #[cfg(feature = "paging")]
+    ax_hal::cache::publish_current_cpu_tlb_ready(tlb_preparation)
+        .expect("primary CPU failed to publish TLB readiness");
 }
 
 pub(crate) fn init_percpu_irq(cpu_id: usize) {

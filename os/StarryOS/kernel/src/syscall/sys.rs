@@ -13,8 +13,6 @@ use ringbuf::{
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_read_slice, vm_write_slice};
 
-#[cfg(target_arch = "riscv64")]
-use crate::mm::UserPtr;
 use crate::{
     Errno, StarryError, StarryResult,
     sync::Mutex,
@@ -755,6 +753,7 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> StarryResult<isize> {
         + usages.get(ax_alloc::UsageKind::VirtMem)
         + usages.get(ax_alloc::UsageKind::PageCache)
         + usages.get(ax_alloc::UsageKind::PageTable)
+        + usages.get(ax_alloc::UsageKind::TaskStack)
         + usages.get(ax_alloc::UsageKind::Dma)
         + usages.get(ax_alloc::UsageKind::Global);
     let free = total.saturating_sub(used);
@@ -1061,14 +1060,24 @@ pub fn sys_riscv_hwprobe(
         return Err(StarryError::InvalidInput);
     }
 
-    let pairs = UserPtr::<RiscvHwprobe>::from(pairs.cast()).get_as_mut_slice(pair_count)?;
-    for pair in pairs {
-        if let Some(value) = ax_runtime::hal::cpu::cap::riscv_hwprobe(pair.key) {
-            pair.value = value;
+    let user_pairs = pairs.cast::<RiscvHwprobe>();
+    for index in 0..pair_count {
+        let pair = user_pairs.wrapping_add(index);
+        // Linux imports only the key, then publishes this pair before reading
+        // the next one. The value field is output-only and no array is staged.
+        let key_ptr = pair.cast::<i64>();
+        let mut key = key_ptr.vm_read()?;
+        let value = if let Some(value) = ax_runtime::hal::cpu::cap::riscv_hwprobe(key) {
+            value
         } else {
-            pair.key = -1;
-            pair.value = 0;
-        }
+            key = -1;
+            0
+        };
+        key_ptr.vm_write(key)?;
+        pair.cast::<u8>()
+            .wrapping_add(core::mem::offset_of!(RiscvHwprobe, value))
+            .cast::<u64>()
+            .vm_write(value)?;
     }
 
     Ok(0)

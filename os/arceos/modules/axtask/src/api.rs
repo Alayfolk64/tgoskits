@@ -15,10 +15,15 @@ pub(crate) use crate::run_queue::{current_run_queue, select_run_queue, select_wa
 use crate::sync::PreemptIrqSaveState;
 #[cfg_attr(doc, doc(cfg(feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
-pub use crate::task::{AxTaskExt, TaskExt};
+pub use crate::task::{
+    AddressSpaceSwitchProof, AxTaskExt, CpuOfflineRootSwitchProof, TaskAddressSpace,
+    TaskAddressSpaceMode, TaskExt,
+};
+#[cfg(feature = "task-ext")]
+pub use crate::task::{SchedulerAddressSpaceActivation, SchedulerAddressSpaceOwner};
 pub use crate::{
     interrupt::InterruptSnapshot,
-    task::{CurrentTask, TaskId, TaskInner, TaskState},
+    task::{CurrentTask, TaskCreateError, TaskId, TaskInner, TaskState},
     timers::{
         ClockEventControl, HardKernelTimerAction, HardKernelTimerCallback, KernelTimerAction,
         KernelTimerCallback, KernelTimerCancelOutcome, KernelTimerError, KernelTimerHandle,
@@ -280,7 +285,15 @@ pub fn spawn_raw<F>(f: F, name: String, stack_size: usize) -> AxTaskRef
 where
     F: FnOnce() + Send + 'static,
 {
-    spawn_task(TaskInner::new(f, name, stack_size))
+    try_spawn_raw(f, name, stack_size).expect("task stack allocation failed")
+}
+
+/// Tries to spawn a new task without publishing it until its stack exists.
+pub fn try_spawn_raw<F>(f: F, name: String, stack_size: usize) -> Result<AxTaskRef, TaskCreateError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    Ok(spawn_task(TaskInner::try_new(f, name, stack_size)?))
 }
 
 /// Spawns a new task with the given name and the default stack size.

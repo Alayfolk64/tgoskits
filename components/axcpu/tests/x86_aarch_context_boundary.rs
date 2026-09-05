@@ -9,8 +9,8 @@ fn x86_task_context_switches_tls_only_in_the_naked_window() {
     let naked_switch = function_body(&source, r#"unsafe extern "C" fn context_switch_raw"#);
 
     assert!(!rust_switch.contains("write_thread_pointer"));
-    assert!(rust_switch.contains("write_user_page_table"));
-    assert!(!naked_switch.contains("write_user_page_table"));
+    assert!(rust_switch.contains("install_user_address_space"));
+    assert!(!naked_switch.contains("install_user_address_space"));
     assert!(naked_switch.contains("rdmsr"));
     assert!(naked_switch.contains("wrmsr"));
     assert!(naked_switch.contains("kernel_tls_offset"));
@@ -25,8 +25,8 @@ fn aarch64_task_context_restores_current_and_tls_in_the_naked_window() {
     let naked_switch = function_body(&source, r#"unsafe extern "C" fn context_switch_raw"#);
 
     assert!(!rust_switch.contains("write_thread_pointer"));
-    assert!(rust_switch.contains("write_user_page_table"));
-    assert!(!naked_switch.contains("write_user_page_table"));
+    assert!(rust_switch.contains("install_user_address_space"));
+    assert!(!naked_switch.contains("install_user_address_space"));
     assert!(naked_switch.contains("tpidr_el0"));
     assert!(naked_switch.contains("sp_el0"));
     assert!(naked_switch.contains("context_header_offset"));
@@ -78,6 +78,34 @@ fn x86_cpu_initialization_does_not_rebind_the_platform_cpu_area() {
     assert!(!source.contains("pub fn init_percpu"));
     assert!(!source.contains("ax_percpu::init("));
     assert!(!source.contains("ax_percpu::init_percpu_reg"));
+}
+
+#[test]
+fn aarch64_tlb_sequences_complete_page_table_stores_before_invalidation() {
+    // This checks the literal ISA protocol, rather than modeling hardware
+    // ordering with a fake runtime. QEMU execution supplements it but cannot
+    // deterministically expose a missing architectural store-completion barrier.
+    let source = read_arch_source("aarch64/asm.rs");
+    let body = function_body(&source, "pub fn flush_tlb(");
+    let sequences: Vec<_> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("asm!(\""))
+        .map(|literal| literal.split('"').next().unwrap())
+        .collect();
+    assert_eq!(sequences.len(), 4, "EL1/EL2, address/full invalidation");
+    for sequence in sequences {
+        let instructions: Vec<_> = sequence.split(';').map(str::trim).collect();
+        assert!(
+            matches!(instructions[0], "dsb ishst" | "dsb sy"),
+            "page-table stores must complete before TLBI: {sequence}",
+        );
+        assert!(instructions.iter().any(|op| op.starts_with("tlbi ")));
+        assert_eq!(instructions.last(), Some(&"isb"));
+        assert!(matches!(
+            instructions[instructions.len() - 2],
+            "dsb ish" | "dsb sy"
+        ));
+    }
 }
 
 fn read_arch_source(relative: &str) -> String {
