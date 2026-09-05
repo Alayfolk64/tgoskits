@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::mem::{self, MaybeUninit};
 
 use ax_io::{IoError, IoResult, prelude::*};
@@ -16,16 +17,26 @@ pub struct IoVec {
 
 #[derive(Default)]
 pub struct IoVectorBuf {
-    iovs: *const IoVec,
-    iovcnt: usize,
+    iovs: Vec<IoVec>,
     len: usize,
 }
 
 impl IoVectorBuf {
     pub fn new(iovs: *const IoVec, iovcnt: usize) -> StarryResult<Self> {
+        Self::new_with_len_validator(iovs, iovcnt, |_| Ok(()))
+    }
+
+    /// Imports one stable descriptor snapshot. Descriptor-specific length
+    /// checks run before payload address checks, as required by eventfd writes.
+    pub(crate) fn new_with_len_validator(
+        iovs: *const IoVec,
+        iovcnt: usize,
+        validate_len: impl FnOnce(usize) -> StarryResult,
+    ) -> StarryResult<Self> {
         if iovcnt > 1024 {
             return Err(StarryError::InvalidInput);
         }
+        let mut owned_iovs = Vec::with_capacity(iovcnt);
         let mut len = 0usize;
         for i in 0..iovcnt {
             let iov = iovs.wrapping_add(i).vm_read()?;
@@ -33,16 +44,38 @@ impl IoVectorBuf {
                 return Err(StarryError::InvalidInput);
             }
             let iov_len = iov.iov_len as usize;
-            if iov_len > 0 {
-                check_access(iov.iov_base as usize, iov_len)
-                    .map_err(|_| StarryError::BadAddress)?;
-            }
             len = len
                 .checked_add(iov_len)
                 .filter(|len| *len <= isize::MAX as usize)
                 .ok_or(StarryError::InvalidInput)?;
+            owned_iovs.push(iov);
         }
-        Ok(Self { iovs, iovcnt, len })
+        validate_len(len)?;
+        for iov in &owned_iovs {
+            if iov.iov_len > 0 {
+                check_access(iov.iov_base as usize, iov.iov_len as usize)
+                    .map_err(|_| StarryError::BadAddress)?;
+            }
+        }
+        Ok(Self {
+            iovs: owned_iovs,
+            len,
+        })
+    }
+
+    pub(crate) const fn byte_len(&self) -> usize {
+        self.len
+    }
+
+    /// Faults the captured source ranges before allocating their owned copy.
+    /// Subsequent copy-in still revalidates accesses; no user reference escapes.
+    pub(crate) fn prepare_read(&self) -> StarryResult {
+        for iov in &self.iovs {
+            if iov.iov_len != 0 {
+                super::prepare_user_read(iov.iov_base as usize, iov.iov_len as usize)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn into_io(self) -> IoVectorBufIo {
@@ -62,13 +95,8 @@ pub struct IoVectorBufIo {
 
 impl IoVectorBufIo {
     fn skip_empty(&mut self) -> IoResult<()> {
-        while self.start < self.inner.iovcnt {
-            let iov = self
-                .inner
-                .iovs
-                .wrapping_add(self.start)
-                .vm_read()
-                .map_err(vm_error_to_io_error)?;
+        while self.start < self.inner.iovs.len() {
+            let iov = self.inner.iovs[self.start];
             if iov.iov_len as usize > self.offset {
                 break;
             }
@@ -84,15 +112,10 @@ impl Read for IoVectorBufIo {
         let mut count = 0;
         loop {
             self.skip_empty()?;
-            if self.start >= self.inner.iovcnt {
+            if self.start >= self.inner.iovs.len() {
                 break;
             }
-            let iov = self
-                .inner
-                .iovs
-                .wrapping_add(self.start)
-                .vm_read()
-                .map_err(vm_error_to_io_error)?;
+            let iov = self.inner.iovs[self.start];
             let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
             if len == 0 {
                 break;
@@ -114,15 +137,10 @@ impl Write for IoVectorBufIo {
         let mut count = 0;
         loop {
             self.skip_empty()?;
-            if self.start >= self.inner.iovcnt {
+            if self.start >= self.inner.iovs.len() {
                 break;
             }
-            let iov = self
-                .inner
-                .iovs
-                .wrapping_add(self.start)
-                .vm_read()
-                .map_err(vm_error_to_io_error)?;
+            let iov = self.inner.iovs[self.start];
             let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
             if len == 0 {
                 break;
