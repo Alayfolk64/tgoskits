@@ -166,10 +166,19 @@ Timerfds are tracked through a weak-reference registry. Closing a timerfd
 immediately unregisters its weak reference, so creating and closing timerfds
 cannot retain dead `Arc` allocations until the next clock step. A realtime
 step snapshots live timerfds while holding the registry lock, then releases
-that lock before inspecting per-timer state. Armed absolute realtime timers
+that lock before inspecting per-timer state. Absolute realtime timers registered
 with `TFD_TIMER_CANCEL_ON_SET` are marked as canceled, poll/read waiters are
 woken, and one read consumes `ECANCELED`. Relative and monotonic timerfds are
 never marked for cancellation.
+
+A timerfd expiration publishes one tick and parks the timer task. A normal
+`read` or `timerfd_gettime` advances an expired periodic deadline past all
+missed intervals and rearms it. This matches Linux's lazy periodic restart.
+An `ECANCELED` read instead consumes the cancellation and pending ticks without
+restarting an expired timer. Its next expiration then requires an explicit
+`timerfd_settime`. Cancellation does not stop a future, unexpired deadline:
+Linux's clock-change callback leaves that underlying timer armed, so reading
+`ECANCELED` must preserve it.
 
 ### Concurrency and publication order
 
@@ -220,6 +229,10 @@ The deterministic regression is
 - `gettimeofday` and a written-and-closed file observe the adjusted clock;
 - a relative timerfd remains pending;
 - an absolute realtime cancel-on-set timerfd returns `ECANCELED`;
+- after consuming cancellation on an expired periodic timerfd, a second
+  nonblocking read returns `EAGAIN` and `timerfd_gettime` reports no pending
+  deadline; an explicit rearm produces a new expiration;
+- consuming cancellation on a future timerfd preserves its original deadline;
 - a periodic absolute realtime POSIX timer survives a 120-second forward step
   by queuing one signal, reporting the merged count through `si_overrun`, and
   publishing a next deadline in the future;
@@ -251,7 +264,7 @@ is not part of this syscall change.
 | `time` | no regression | [`time(2)`](https://man7.org/linux/man-pages/man2/time.2.html) | The x86_64 entry reads the same adjusted realtime seconds. |
 | `timerfd_settime` | compatible for clock-step behavior | [`timerfd_create(2)`](https://man7.org/linux/man-pages/man2/timerfd_create.2.html), [Linux timerfd clock-change path](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L90-L173) | Relative timers stay monotonic; absolute realtime timers are re-evaluated; cancel-on-set is armed only for that domain. |
 | `timerfd_gettime` | compatible for adjusted deadlines | [`timerfd_create(2)`](https://man7.org/linux/man-pages/man2/timerfd_create.2.html) | Remaining time is computed in the deadline's explicit clock domain. |
-| `read` (timerfd) | compatible for cancel-on-set | [Linux timerfd read path](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L263-L307) | One read consumes the cancellation and returns `ECANCELED`. |
+| `read` (timerfd) | compatible for cancel-on-set | [Linux timerfd read path](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/fs/timerfd.c#L263-L307) | One read consumes cancellation and ticks, returns `ECANCELED`, and does not restart an expired timer. A future, unexpired deadline remains armed. |
 | `timer_settime` | improved clock-step compatibility | [`timer_settime(2)`](https://man7.org/linux/man-pages/man2/timer_settime.2.html), [Linux periodic rearm](https://github.com/torvalds/linux/blob/038d61fd642278bab63ee8ef722c50d10ab01e8f/kernel/time/posix-timers.c#L287-L327) | Relative timers use monotonic deadlines; absolute `CLOCK_REALTIME` timers retain realtime deadlines and are re-evaluated. Missed periodic expirations are merged into one notification, the next deadline skips all elapsed intervals, and `si_overrun` is clamped to `INT_MAX`. |
 | `timer_gettime` | no regression | [`timer_gettime(2)`](https://man7.org/linux/man-pages/man2/timer_gettime.2.html) | Remaining time is derived from the timer's tagged domain. |
 | `setitimer` | no regression | [`getitimer(2)`](https://man7.org/linux/man-pages/man2/getitimer.2.html) | `ITIMER_REAL` remains an elapsed-time interval across realtime changes. |

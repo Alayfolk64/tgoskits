@@ -9,11 +9,12 @@
 //! background task (via `ax_task::spawn_raw`) that owns a weak reference to
 //! the Timerfd. The task loops, reading the current deadline under the state
 //! lock, then parks on whichever fires first: the clock-domain deadline or an
-//! "arm event" poked by `settime` / `Drop`. One task
+//! "arm event" poked by rearming operations / `Drop`. One task
 //! per timerfd over its whole lifetime — no per-settime stack leak.
 //!
-//! Missed-tick coalescing: if the scheduler delays the task by N intervals,
-//! `read` returns the full count (Linux semantics).
+//! A firing publishes one expiration and parks the task. Periodic timers are
+//! advanced and rearmed on read/gettime, coalescing missed ticks without
+//! repeatedly waking the task while userspace has not consumed an expiration.
 
 use alloc::{
     borrow::{Cow, ToOwned},
@@ -118,16 +119,51 @@ impl TimerDeadline {
 /// Internal, mutex-protected state of a timerfd.
 #[derive(Default)]
 struct State {
-    /// Time of the next expiration and its clock domain. `None` when disarmed.
+    /// Armed deadline, or the last fired deadline while `expired` is set.
+    /// `None` means disarmed with no expiration to rearm.
     next_deadline: Option<TimerDeadline>,
+    /// The task fired once and is waiting for read/gettime before rearming.
+    expired: bool,
     /// Interval for periodic firing. `Duration::ZERO` means one-shot.
     interval: Duration,
-    /// Whether an armed realtime absolute timer is canceled by a clock step.
+    /// Whether this absolute realtime setting is registered for clock cancellation.
     cancel_on_set: bool,
     /// Whether the next read must consume a realtime clock cancellation.
     canceled: bool,
     /// When `true`, the background task should exit on its next wake.
     shutdown: bool,
+}
+
+impl State {
+    /// Rearms an expired periodic timer and returns additional missed ticks.
+    /// The firing itself has already contributed one tick.
+    fn rearm_periodic(&mut self) -> u64 {
+        if !self.expired || self.interval.is_zero() {
+            return 0;
+        }
+        let deadline = self
+            .next_deadline
+            .expect("expired timer retains its deadline");
+        self.expired = false;
+        let Some(lag) = deadline.lag() else {
+            // A backward clock step can put the old expiration in the future.
+            return 0;
+        };
+        let interval_ns = self.interval.as_nanos();
+        let remainder_ns = lag.as_nanos() % interval_ns;
+        let remainder = Duration::new(
+            (remainder_ns / 1_000_000_000) as u64,
+            (remainder_ns % 1_000_000_000) as u32,
+        );
+        // Forward from now to the next boundary without multiplying a tick
+        // count into a Duration; large clock steps are handled in one pass.
+        self.next_deadline = Some(
+            deadline
+                .saturating_add(lag)
+                .saturating_add(self.interval - remainder),
+        );
+        (lag.as_nanos() / interval_ns).min(u64::MAX as u128 - 1) as u64
+    }
 }
 
 static TIMERFD_INSTANCES: LazyLock<Mutex<Vec<Weak<Timerfd>>>> =
@@ -142,7 +178,7 @@ pub struct Timerfd {
     expire_count: AtomicU64,
     poll_rx: PollSet,
     non_blocking: AtomicBool,
-    /// Pulsed by `settime` / `Drop` to wake the background task so it
+    /// Pulsed when a timer is rearmed or dropped to wake the background task so it
     /// re-reads `state` and either re-arms or exits. `Arc` so the task
     /// can hold it independently of the Timerfd (allowing the Timerfd
     /// Arc to drop while the task is parked).
@@ -186,6 +222,7 @@ impl Timerfd {
         new_interval: Duration,
     ) -> StarryResult<(Duration, Duration)> {
         let mut state = self.state.lock();
+        state.rearm_periodic();
         let old_interval = state.interval;
         let old_remaining = state
             .next_deadline
@@ -210,6 +247,7 @@ impl Timerfd {
             state.cancel_on_set = mode.cancel_on_set() && deadline.is_realtime();
         }
         state.canceled = false;
+        state.expired = false;
         // Clear any expirations that accumulated under the previous
         // setting. man timerfd_read(2) is explicit: read returns the
         // number of expirations since "the last successful read or the
@@ -229,15 +267,61 @@ impl Timerfd {
         Ok((old_interval, old_remaining))
     }
 
-    /// Current `(interval, remaining)`. `remaining == 0` iff disarmed.
+    /// Current `(interval, remaining)`, advancing an expired periodic timer.
     pub fn gettime(&self) -> (Duration, Duration) {
-        let state = self.state.lock();
-        let interval = state.interval;
-        let remaining = match state.next_deadline {
-            None => Duration::ZERO,
-            Some(deadline) => deadline.remaining(),
-        };
-        (interval, remaining)
+        let mut state = self.state.lock();
+        let rearmed = state.expired && !state.interval.is_zero();
+        let extra = state.rearm_periodic();
+        self.expire_count.fetch_add(extra, Ordering::AcqRel);
+        let result = (
+            state.interval,
+            state
+                .next_deadline
+                .map(TimerDeadline::remaining)
+                .unwrap_or(Duration::ZERO),
+        );
+        drop(state);
+        if rearmed {
+            self.arm_event.notify(usize::MAX);
+        }
+        result
+    }
+
+    fn take_expirations(&self) -> StarryResult<u64> {
+        let mut state = self.state.lock();
+        if state.canceled {
+            state.canceled = false;
+            if state.expired {
+                state.next_deadline = None;
+                state.expired = false;
+            }
+            // Linux consumes ticks/expired without restarting an expired
+            // timer. A still-armed future deadline remains armed.
+            self.expire_count.store(0, Ordering::Release);
+            return Err(Errno::ECANCELED.into());
+        }
+        let rearmed = state.expired && !state.interval.is_zero();
+        let extra = state.rearm_periodic();
+        if state.expired {
+            // A consumed one-shot has no future deadline.
+            state.next_deadline = None;
+            state.expired = false;
+        }
+        // Claim counts under the same lock as firing, settime and clock
+        // cancellation, so concurrent readers cannot consume the same ticks.
+        let count = self
+            .expire_count
+            .swap(0, Ordering::AcqRel)
+            .saturating_add(extra);
+        drop(state);
+        if rearmed {
+            self.arm_event.notify(usize::MAX);
+        }
+        if count == 0 {
+            Err(StarryError::WouldBlock)
+        } else {
+            Ok(count)
+        }
     }
 }
 
@@ -258,7 +342,7 @@ pub fn notify_realtime_clock_changed() {
 
     for timerfd in timerfds {
         let mut state = timerfd.state.lock();
-        if state.cancel_on_set && state.next_deadline.is_some() {
+        if state.cancel_on_set {
             state.canceled = true;
             timerfd.expire_count.store(1, Ordering::Release);
             drop(state);
@@ -306,12 +390,19 @@ async fn run_timer(weak: alloc::sync::Weak<Timerfd>) {
         };
         listener!(arm_event => listener);
 
-        let (deadline, interval, shutdown) = {
+        let (deadline, shutdown) = {
             let Some(tfd) = weak.upgrade() else {
                 return;
             };
             let state = tfd.state.lock();
-            (state.next_deadline, state.interval, state.shutdown)
+            (
+                if state.expired {
+                    None
+                } else {
+                    state.next_deadline
+                },
+                state.shutdown,
+            )
         };
         if shutdown {
             return;
@@ -340,52 +431,18 @@ async fn run_timer(weak: alloc::sync::Weak<Timerfd>) {
                     continue;
                 }
 
-                // Timer fired. Re-upgrade, compute missed-tick count,
-                // advance deadline by N intervals, publish to state.
                 let Some(tfd) = weak.upgrade() else {
                     return;
                 };
-                let mut expirations: u64 = 1;
-                let mut next_deadline = dl;
-                if !interval.is_zero() {
-                    // Missed-tick coalescing: count every interval that
-                    // fully elapsed past `dl`. Clamp at u32::MAX ticks so
-                    // `Duration::*` multiplication cannot silently
-                    // truncate; u32::MAX ticks at a 1 ns interval is still
-                    // ~4 seconds of lag, which is more than any real
-                    // scheduler delay we need to represent faithfully.
-                    if let Some(lag) = dl.lag() {
-                        let extra_ticks = lag.as_nanos() / interval.as_nanos().max(1);
-                        let extra = core::cmp::min(extra_ticks, u32::MAX as u128 - 1) as u32;
-                        expirations += extra as u64;
-                        // saturating_mul avoids panic on pathological
-                        // (interval, extra) pairs.
-                        let advance = interval.saturating_mul(extra + 1);
-                        next_deadline = dl.saturating_add(advance);
-                    }
-                }
-
-                // Publish next deadline (or clear for one-shot) AND add
-                // the expirations under the same state lock. If the
-                // current next_deadline no longer matches the one we
-                // just fired, someone re-armed (or disarmed) the timer
-                // while we were firing — those expirations belong to
-                // the now-gone timer setting, so drop them on the
-                // floor. settime clears expire_count under the same
-                // lock, so once we observe a stale deadline here the
-                // count has already been cleared and we must not
-                // re-add to it.
+                // Fire once. Userspace read/gettime decides whether a periodic
+                // timer is rearmed; an ECANCELED read must skip that restart.
                 let mut state = tfd.state.lock();
                 if state.shutdown {
                     return;
                 }
-                if state.next_deadline == Some(dl) {
-                    tfd.expire_count.fetch_add(expirations, Ordering::AcqRel);
-                    if interval.is_zero() {
-                        state.next_deadline = None;
-                    } else {
-                        state.next_deadline = Some(next_deadline);
-                    }
+                if !state.expired && state.next_deadline == Some(dl) {
+                    state.expired = true;
+                    tfd.expire_count.fetch_add(1, Ordering::AcqRel);
                     drop(state);
                     // expire_count is published before waking readers.
                     unsafe { tfd.poll_rx.wake(IoEvents::IN) };
@@ -401,40 +458,11 @@ impl FileLike for Timerfd {
             return Err(StarryError::InvalidInput);
         }
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            {
-                let mut state = self.state.lock();
-                if state.canceled {
-                    state.canceled = false;
-                    self.expire_count.store(0, Ordering::Release);
-                    return Err(Errno::ECANCELED.into());
-                }
-            }
-
-            // Race-free read: atomically claim the entire `expire_count`
-            // snapshot via CAS so concurrent readers can't both observe
-            // and copy the same ticks. Linux's `timerfd_read(2)` holds
-            // the timerfd spinlock across the load + clear; we get the
-            // same single-consumer guarantee from the CAS loop. A
-            // simultaneous `fetch_add` from the timer task raises the
-            // count past `n`, the CAS fails, and we re-snapshot before
-            // copying — so newly-arrived ticks aren't dropped either.
-            let n = loop {
-                let observed = self.expire_count.load(Ordering::Acquire);
-                if observed == 0 {
-                    return Err(StarryError::WouldBlock);
-                }
-                if self
-                    .expire_count
-                    .compare_exchange(observed, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    break observed;
-                }
-            };
+            let n = self.take_expirations()?;
             // Linux's timerfd_read(2): a failed read does not discard
             // expirations. Restore the claimed count on copyout failure,
             // and re-wake `poll_rx` so any reader or poller that
-            // entered its wait between our CAS-to-zero and this restore
+            // entered its wait between claiming the count and this restore
             // notices the fd is readable again.
             if let Err(e) = dst.write(&n.to_ne_bytes()) {
                 self.expire_count.fetch_add(n, Ordering::AcqRel);
@@ -492,6 +520,51 @@ mod tests {
             non_blocking: AtomicBool::new(false),
             arm_event: Arc::new(Event::new()),
         })
+    }
+
+    #[test]
+    fn canceled_expiration_is_consumed_without_rearming() {
+        let timerfd = unspawned_timerfd();
+        {
+            let mut state = timerfd.state.lock();
+            state.next_deadline = Some(TimerDeadline::Realtime(Duration::from_secs(10)));
+            state.interval = Duration::from_millis(10);
+            state.expired = true;
+            state.canceled = true;
+        }
+        timerfd.expire_count.store(2, Ordering::Release);
+
+        assert!(matches!(
+            timerfd.take_expirations(),
+            Err(StarryError::Errno(Errno::ECANCELED))
+        ));
+        assert!(matches!(
+            timerfd.take_expirations(),
+            Err(StarryError::WouldBlock)
+        ));
+        let state = timerfd.state.lock();
+        assert_eq!(state.next_deadline, None);
+        assert!(!state.expired);
+        assert!(!state.canceled);
+        assert_eq!(state.interval, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn cancellation_read_preserves_an_unexpired_timer() {
+        let timerfd = unspawned_timerfd();
+        let deadline = TimerDeadline::Realtime(Duration::from_secs(600));
+        {
+            let mut state = timerfd.state.lock();
+            state.next_deadline = Some(deadline);
+            state.canceled = true;
+        }
+        timerfd.expire_count.store(1, Ordering::Release);
+
+        assert!(matches!(
+            timerfd.take_expirations(),
+            Err(StarryError::Errno(Errno::ECANCELED))
+        ));
+        assert_eq!(timerfd.state.lock().next_deadline, Some(deadline));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -26,6 +27,7 @@ static const char *timestamp_path = "/tmp/starry-clock-settime-timestamp";
 struct timerfd_probes {
     int relative_fd;
     int cancel_fd;
+    int cancel_periodic_fd;
 };
 
 struct posix_timer_probe {
@@ -166,7 +168,9 @@ static int prepare_timerfd_probes(const struct timespec *original_realtime,
 {
     probes->relative_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     probes->cancel_fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
-    if (probes->relative_fd < 0 || probes->cancel_fd < 0) {
+    probes->cancel_periodic_fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+    if (probes->relative_fd < 0 || probes->cancel_fd < 0 ||
+        probes->cancel_periodic_fd < 0) {
         return fail("create timerfd clock-step probes");
     }
 
@@ -179,7 +183,17 @@ static int prepare_timerfd_probes(const struct timespec *original_realtime,
             .tv_nsec = original_realtime->tv_nsec,
         },
     };
-    if (timerfd_settime(probes->relative_fd, 0, &relative, NULL) < 0 ||
+    struct itimerspec cancel_periodic = {
+        .it_interval = {.tv_sec = 0, .tv_nsec = 10000000},
+        .it_value = {
+            .tv_sec = original_realtime->tv_sec + 1,
+            .tv_nsec = original_realtime->tv_nsec,
+        },
+    };
+    if (timerfd_settime(probes->cancel_periodic_fd,
+                        TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET,
+                        &cancel_periodic, NULL) < 0 ||
+        timerfd_settime(probes->relative_fd, 0, &relative, NULL) < 0 ||
         timerfd_settime(probes->cancel_fd,
                         TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &cancel,
                         NULL) < 0) {
@@ -206,6 +220,43 @@ static int check_timerfd_clock_step(const struct timerfd_probes *probes)
         errno = EPROTO;
         return fail("cancel an absolute realtime timerfd after clock step");
     }
+
+    errno = 0;
+    if (read(probes->cancel_periodic_fd, &expirations, sizeof(expirations)) != -1 ||
+        errno != ECANCELED) {
+        errno = EPROTO;
+        return fail("cancel an expired periodic realtime timerfd");
+    }
+    usleep(100000);
+    errno = 0;
+    if (read(probes->cancel_periodic_fd, &expirations, sizeof(expirations)) != -1 ||
+        errno != EAGAIN) {
+        errno = EPROTO;
+        return fail("keep canceled periodic timerfd disarmed until explicit rearm");
+    }
+    struct itimerspec current = {0};
+    if (timerfd_gettime(probes->cancel_periodic_fd, &current) < 0 ||
+        timespec_to_nanos(&current.it_value) != 0) {
+        errno = EPROTO;
+        return fail("report no pending deadline after canceled expiration");
+    }
+    if (timerfd_gettime(probes->cancel_fd, &current) < 0 ||
+        current.it_value.tv_sec < 400) {
+        errno = EPROTO;
+        return fail("preserve the original unexpired timer after cancellation read");
+    }
+    struct itimerspec rearm = {.it_value = {.tv_nsec = 20000000}};
+    if (timerfd_settime(probes->cancel_periodic_fd, 0, &rearm, NULL) < 0) {
+        return fail("explicitly rearm canceled periodic timerfd");
+    }
+    struct pollfd ready = {.fd = probes->cancel_periodic_fd, .events = POLLIN};
+    if (poll(&ready, 1, 2000) != 1 ||
+        read(probes->cancel_periodic_fd, &expirations, sizeof(expirations)) !=
+            (ssize_t)sizeof(expirations) || expirations != 1) {
+        errno = EPROTO;
+        return fail("deliver a new expiration after explicit rearm");
+    }
+    puts("timerfd cancel-on-set: no expiration after ECANCELED");
     return 0;
 }
 
@@ -216,6 +267,9 @@ static void close_timerfd_probes(const struct timerfd_probes *probes)
     }
     if (probes->cancel_fd >= 0) {
         close(probes->cancel_fd);
+    }
+    if (probes->cancel_periodic_fd >= 0) {
+        close(probes->cancel_periodic_fd);
     }
 }
 
@@ -378,7 +432,9 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    struct timerfd_probes probes = {.relative_fd = -1, .cancel_fd = -1};
+    struct timerfd_probes probes = {
+        .relative_fd = -1, .cancel_fd = -1, .cancel_periodic_fd = -1,
+    };
     if (prepare_timerfd_probes(&original_realtime, &probes)) {
         close_timerfd_probes(&probes);
         return EXIT_FAILURE;

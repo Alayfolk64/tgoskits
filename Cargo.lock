@@ -722,6 +722,7 @@ dependencies = [
 name = "ax-alloc"
 version = "0.8.16"
 dependencies = [
+ "ax-crate-interface",
  "ax-memory-addr",
  "ax-percpu",
  "ax-plat",
@@ -927,6 +928,7 @@ dependencies = [
  "chrono",
  "dma-api",
  "hashbrown 0.16.1",
+ "heapless",
  "intrusive-collections",
  "irq-framework",
  "log",
@@ -1572,6 +1574,7 @@ dependencies = [
  "axaddrspace",
  "axvm-types",
  "log",
+ "mbarrier",
 ]
 
 [[package]]
@@ -1936,6 +1939,7 @@ dependencies = [
 name = "buddy-slab-allocator"
 version = "0.5.0"
 dependencies = [
+ "ax-crate-interface",
  "ax-sync",
  "divan",
  "log",
@@ -7967,11 +7971,11 @@ dependencies = [
  "ddebug",
  "dma-api",
  "downcast-rs",
- "enum_dispatch",
  "event-listener",
  "extern-trait",
  "flatten_objects",
  "hashbrown 0.16.1",
+ "heapless",
  "indoc",
  "inherit-methods-macro",
  "k230-kpu",
