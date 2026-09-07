@@ -1,8 +1,10 @@
 target = "aarch64-unknown-none-softfloat"
 log = "Warn"
+env = { BACKTRACE = "y" }
 features = [
   "ax-driver/nvme",
   "ax-driver/virtio-net",
+  "guest-profile",
   "smp",
 ]
 max_cpu_num = 8

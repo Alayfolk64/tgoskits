@@ -26,6 +26,34 @@ use super::{
     runtime_status_error, with_current_cpu_pin,
 };
 
+/// Returns the allocated bounds of the current thread's kernel stack.
+///
+/// The range is only valid while the caller remains on this execution context.
+/// Bootstrap contexts without an owned runtime stack return `None`.
+#[cfg(feature = "profile")]
+pub fn current_kernel_stack_range() -> Option<core::ops::Range<usize>> {
+    let _irq = crate::task::sync::IrqSaveGuard::new();
+    // SAFETY: the IRQ guard prevents migration and scheduler replacement.
+    unsafe {
+        with_current_cpu_pin(|pin| {
+            let context = current_runtime_context(pin).ok()?;
+            if context.stack.is_none() {
+                return None;
+            }
+            // SAFETY: the current context retains this stack until switch-out.
+            let stack = &*ptr::with_exposed_provenance::<RuntimeStack>(context.stack.into_raw());
+            let bottom = match &stack.backing {
+                super::resources::StackBacking::Heap { pointer, .. } => pointer.as_ptr() as usize,
+                #[cfg(feature = "paging")]
+                super::resources::StackBacking::VirtualPages { allocation, .. } => {
+                    allocation.usable_range().start.as_usize()
+                }
+            };
+            Some(bottom..stack.usable_top)
+        })
+    }
+}
+
 /// Reports whether a kernel page fault hit the current runtime stack guard.
 pub fn diagnose_current_stack_guard_page_fault(fault: ax_memory_addr::VirtAddr) -> bool {
     #[cfg(feature = "stack-guard-page")]

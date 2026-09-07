@@ -30,6 +30,9 @@ pub fn init(args: &[String], envs: &[String]) {
     static_keys::global_init();
     crate::cgroup::init();
 
+    #[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+    crate::profiler::init();
+
     tracepoint_init().expect("Failed to initialize tracepoints");
 
     crate::ebpf::init_ebpf();
@@ -276,11 +279,14 @@ fn spawn_selfbuild_watchdog() {
     }
 
     #[cfg(not(feature = "selfbuild-watchdog-reset-test"))]
-    ax_task::spawn_raw(
-        selfbuild_watchdog_loop,
-        String::from("selfbuild-wdt"),
-        ax_task::default_task_stack_size(),
-    );
+    {
+        let mut affinity = ax_runtime::task::sched::CpuSet::empty(ax_runtime::hal::cpu_num());
+        assert!(affinity.insert(ax_runtime::task::sched::CpuId::new(0)));
+        let _ = kernel_thread_builder(String::from("selfbuild-wdt"))
+            .affinity(affinity)
+            .spawn(selfbuild_watchdog_loop)
+            .expect("failed to spawn self-build watchdog feeder");
+    }
 }
 
 #[cfg(all(
@@ -288,14 +294,9 @@ fn spawn_selfbuild_watchdog() {
     not(feature = "selfbuild-watchdog-reset-test")
 ))]
 fn selfbuild_watchdog_loop() {
-    if !ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0)) {
-        error!("self-build watchdog failed to pin feeder to CPU 0; waiting for reset");
-        return;
-    }
-
     let lease_started = ax_runtime::hal::time::monotonic_time();
     loop {
-        ax_task::sleep(SELFBUILD_WATCHDOG_FEED_PERIOD);
+        ax_runtime::task::thread::current::sleep(SELFBUILD_WATCHDOG_FEED_PERIOD);
         if ax_runtime::hal::time::monotonic_time().saturating_sub(lease_started)
             >= SELFBUILD_WATCHDOG_LEASE
         {

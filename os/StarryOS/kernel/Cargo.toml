@@ -24,6 +24,9 @@ targets = [
 [features]
 default = ["dynamic_debug"]
 dev-log = []
+# Optional in-guest CPU and wait profiling.
+guest-profile = ["ax-cpu/profile", "ax-runtime/profile"]
+user-access-fastpath = []
 ext4 = ["ax-fs-ng/ext4"]
 fat = ["ax-fs-ng/fat"]
 memtrack = ["axbacktrace/alloc", "ax-alloc/tracking"]

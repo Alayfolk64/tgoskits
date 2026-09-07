@@ -22,6 +22,7 @@ host-test = [
 ]
 fault-injection = ["ax-task/fault-injection"]
 irq-time-accounting = []
+profile = ["ax-sync/profile", "ax-task/profile", "ax-fs-ng?/profile"]
 ipi = ["dep:ax-ipi", "ax-hal/ipi"]
 # Scheduler-only users still share ax-ipi's typed, coalescible physical edge;
 # logical pending state remains in ax-task.

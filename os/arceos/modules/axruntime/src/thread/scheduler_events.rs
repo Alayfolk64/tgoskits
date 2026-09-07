@@ -5,6 +5,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 const TASK_CLOCK_EVENT_IRQ_BUDGET: usize = 64;
 
 static TASK_TIMER_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "profile")]
+static TIMER_PROFILE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Installs a non-blocking, allocation-free scheduler timer observer.
+#[cfg(feature = "profile")]
+pub fn register_timer_profile_hook(hook: fn()) {
+    TIMER_PROFILE_HOOK.store(hook as usize, Ordering::Release);
+}
 #[cfg(feature = "qperf-metrics")]
 static SCHEDULER_IPI_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "qperf-metrics")]
@@ -88,6 +97,15 @@ pub(crate) fn on_clock_event(
     scheduler_event: ax_task::runtime::service::ClaimedSchedulerDeadlines,
 ) -> ax_task::runtime::service::TaskClockEventOutcome {
     TASK_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "profile")]
+    {
+        let hook = TIMER_PROFILE_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: registration only publishes callbacks of type fn().
+            let hook: fn() = unsafe { core::mem::transmute(hook) };
+            hook();
+        }
+    }
     account_clock_event(now, scheduler_event)
 }
 fn account_clock_event(

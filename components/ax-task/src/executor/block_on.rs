@@ -31,6 +31,8 @@ pub fn block_on<F: IntoFuture>(future: F) -> F::Output {
     let executor = LocalExecutor::new(thread.wake_handle())
         .unwrap_or_else(|error| panic!("future executor requires its owner thread: {error}"));
     let output = executor.run(future.into_future(), |condition| {
+        #[cfg(feature = "profile")]
+        let _profile = crate::profile::BlockProfile::new();
         wait.wait_until(|| condition.should_abort());
     });
     drop(executor);
@@ -52,6 +54,8 @@ pub fn block_on_timeout<F: IntoFuture>(
     let mut future = pin!(future.into_future());
     let timed = poll_fn(|context| poll_until_deadline(future.as_mut(), context, deadline));
     let output = executor.run(timed, |condition| {
+        #[cfg(feature = "profile")]
+        let _profile = crate::profile::BlockProfile::new();
         let _timed_out = wait.wait_until_deadline(deadline, || condition.should_abort());
     });
     drop(executor);

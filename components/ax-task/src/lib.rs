@@ -23,3 +23,7 @@ pub mod thread;
 pub mod diagnostics;
 pub mod sched;
 pub mod time;
+
+/// Optional observations of scheduler-backed future waits.
+#[cfg(feature = "profile")]
+pub mod profile;

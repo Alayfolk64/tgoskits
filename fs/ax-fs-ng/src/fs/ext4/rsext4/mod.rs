@@ -80,6 +80,8 @@ impl Ext4Disk {
 
 impl BlockIo for Ext4Disk {
     fn write(&mut self, buffer: &[u8], sector: SectorId, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockWrite, self as *mut Self as usize);
         if self.device.is_read_only() {
             return Err(Ext4Error::read_only());
         }
@@ -96,6 +98,8 @@ impl BlockIo for Ext4Disk {
     }
 
     fn read(&mut self, buffer: &mut [u8], sector: SectorId, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockRead, self as *mut Self as usize);
         let dev_block = self.device.block_size();
         let required_size = dev_block
             .checked_mul(count as usize)

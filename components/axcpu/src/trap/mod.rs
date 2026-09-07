@@ -57,6 +57,15 @@ fn default_debug_handler(_tf: &mut KernelTrapFrame<'_>) -> bool {
     false
 }
 
+#[cfg(feature = "profile")]
+static PROFILE_SAMPLE_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+/// Installs an IRQ-context observer. The callback must not block or allocate.
+#[cfg(feature = "profile")]
+pub fn set_profile_sample_handler(handler: fn(InterruptedContext)) {
+    PROFILE_SAMPLE_HANDLER.store(handler as usize, Ordering::Release);
+}
+
 static IRQ_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static PAGE_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static BREAKPOINT_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -108,6 +117,15 @@ pub fn set_debug_handler(handler: DebugHandler) -> DebugHandler {
 
 /// Dispatches an IRQ through the runtime-registered handler, or the default handler.
 pub fn dispatch_irq(irq: usize, origin: TrapOrigin, context: Option<InterruptedContext>) -> bool {
+    #[cfg(feature = "profile")]
+    if let Some(context) = context {
+        let sample = PROFILE_SAMPLE_HANDLER.load(Ordering::Acquire);
+        if sample != 0 {
+            // SAFETY: the setter publishes only this exact function signature.
+            let sample: fn(InterruptedContext) = unsafe { core::mem::transmute(sample) };
+            sample(context);
+        }
+    }
     let handler = IRQ_HANDLER.load(Ordering::Acquire);
     let handler = if handler == 0 {
         default_irq_handler
