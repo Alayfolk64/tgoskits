@@ -24,6 +24,8 @@ license = "Apache-2.0"
 default = []
 exception-table = []
 fp-simd = []
+# Expose an optional trap-context callback for low-overhead in-guest profiling.
+profile = []
 # Use unprivileged host-safe register fallbacks in scheduler tests.
 host-test = []
 tls = ["cpu-local/tls"]

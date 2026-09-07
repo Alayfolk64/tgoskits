@@ -7,6 +7,8 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize},
 };
 
+#[cfg(feature = "profile")]
+pub use ax_sync::{ProfileEvent, ProfileScope, register_profile_hooks};
 pub use ax_task::sync::api::*;
 
 struct RuntimeContextOps;

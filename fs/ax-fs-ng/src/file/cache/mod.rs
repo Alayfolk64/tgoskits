@@ -162,6 +162,14 @@ fn filesystem_uses_unbounded_page_cache(name: &str) -> bool {
 }
 
 impl CachedFile {
+    #[cfg(feature = "profile")]
+    fn profile_scope(&self) -> ax_sync::ProfileScope {
+        ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::PageCache,
+            Arc::as_ptr(&self.shared) as usize,
+        )
+    }
+
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> VfsResult<Self> {
         let in_memory = filesystem_uses_unbounded_page_cache(location.filesystem().name());
@@ -454,6 +462,8 @@ impl CachedFile {
         pn: u32,
         f: impl FnOnce(&mut PageCache, Option<(u32, PageCache)>) -> VfsResult<R>,
     ) -> VfsResult<R> {
+        #[cfg(feature = "profile")]
+        let _profile = self.profile_scope();
         let _io = self.shared.io_lock.lock();
         let mut guard = self.shared.page_cache.lock();
         let (page, evicted) =
@@ -485,6 +495,8 @@ impl CachedFile {
             let chunk_len = (end - page_start).min(PAGE_SIZE as u64) as usize - page_offset;
 
             {
+                #[cfg(feature = "profile")]
+                let _profile = self.profile_scope();
                 let _io = self.shared.io_lock.lock();
                 self.populate_page_window(file, pn, window_pages)?;
                 let mut guard = self.shared.page_cache.lock();
@@ -560,12 +572,16 @@ impl CachedFile {
 
     /// Writes `buf` to the file at `offset`.
     pub fn write_at(&self, buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "profile")]
+        let _profile = self.profile_scope();
         let _io = self.shared.io_lock.lock();
         self.write_at_locked(buf, offset)
     }
 
     /// Appends `buf` to the end of the file. Returns `(bytes_written, new_end)`.
     pub fn append(&self, buf: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+        #[cfg(feature = "profile")]
+        let _profile = self.profile_scope();
         let _io = self.shared.io_lock.lock();
         let len = self.shared.len();
         self.write_at_locked(buf, len)

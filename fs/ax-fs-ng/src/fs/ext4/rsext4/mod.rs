@@ -26,6 +26,11 @@ impl Ext4Disk {
 
 impl BlockDevice for Ext4Disk {
     fn write(&mut self, buffer: &[u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::BlockWrite,
+            self as *mut Self as usize,
+        );
         let dev_block = self.0.block_size();
         if !BLOCK_SIZE.is_multiple_of(dev_block) {
             return Err(Ext4Error::invalid_input());
@@ -42,6 +47,11 @@ impl BlockDevice for Ext4Disk {
     }
 
     fn read(&mut self, buffer: &mut [u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::BlockRead,
+            self as *mut Self as usize,
+        );
         let dev_block = self.0.block_size();
         if !BLOCK_SIZE.is_multiple_of(dev_block) {
             return Err(Ext4Error::invalid_input());

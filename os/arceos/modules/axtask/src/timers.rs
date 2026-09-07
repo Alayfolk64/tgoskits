@@ -1,4 +1,6 @@
 use alloc::{boxed::Box, vec::Vec};
+#[cfg(feature = "profile")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use ax_hal::time::{TimeValue, monotonic_time};
@@ -12,6 +14,24 @@ use crate::{
 };
 
 static TIMER_TICKET_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "profile")]
+static TIMER_PROFILE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the global profiler hook called from every hardware timer IRQ.
+#[cfg(feature = "profile")]
+pub fn register_timer_profile_hook(hook: fn()) {
+    TIMER_PROFILE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[cfg(feature = "profile")]
+pub(crate) fn run_profile_hook() {
+    let hook = TIMER_PROFILE_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: `register_timer_profile_hook` stores this exact function type.
+        let hook: fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
+}
 
 percpu_static! {
     TIMER_LIST: TimerList<TaskWakeupEvent> = TimerList::new(),

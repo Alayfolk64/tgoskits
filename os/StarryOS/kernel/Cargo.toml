@@ -74,6 +74,8 @@ SMP = "4"
 [features]
 default = ["dynamic_debug"]
 dev-log = []
+# Local in-guest kernel CPU/off-CPU profiler used for self-build analysis.
+guest-profile = ["ax-cpu/profile", "ax-runtime/profile", "ax-task/profile"]
 # Lock-free user-copy fast path: probe the HW page table (aarch64 `AT S1E0R/W`)
 # so a syscall copy of already-present, EL0-permitted pages skips the aspace lock
 # and `populate_area`. Off by default; misses fall to the unchanged locked slow

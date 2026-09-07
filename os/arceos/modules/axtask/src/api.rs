@@ -16,6 +16,8 @@ use crate::sync::PreemptIrqSaveState;
 #[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "task-ext"))))]
 #[cfg(feature = "task-ext")]
 pub use crate::task::{AxTaskExt, TaskExt};
+#[cfg(feature = "profile")]
+pub use crate::timers::register_timer_profile_hook;
 #[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
 #[cfg(feature = "irq")]
 pub use crate::timers::{
@@ -234,6 +236,8 @@ pub fn on_timer_tick() {
 #[cfg_attr(doc, doc(cfg(feature = "irq")))]
 pub fn on_timer_irq(scheduler_tick: bool) {
     crate::timers::begin_hardware_timer_irq();
+    #[cfg(feature = "profile")]
+    crate::timers::run_profile_hook();
     crate::timers::check_events(scheduler_tick);
     if scheduler_tick {
         // Since irq and preemption are both disabled here,

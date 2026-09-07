@@ -51,6 +51,8 @@ pub mod kprobe;
 mod mm;
 mod namespace;
 mod perf;
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+mod profiler;
 mod pseudofs;
 mod stop_machine;
 mod sync;

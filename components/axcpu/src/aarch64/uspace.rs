@@ -183,6 +183,8 @@ impl UserContext {
 
         let ret = match kind {
             TrapKind::Irq => {
+                #[cfg(feature = "profile")]
+                crate::trap::profile_sample(self);
                 crate::trap::dispatch_irq(0);
                 ReturnReason::Interrupt
             }

@@ -3,7 +3,10 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use core::cell::OnceCell;
+use core::{
+    cell::OnceCell,
+    ops::{Deref, DerefMut},
+};
 
 use axfs_ng_vfs::{
     DirEntry, DirNode, Filesystem, FilesystemOps, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
@@ -93,6 +96,26 @@ impl Ext4State {
 
     pub(crate) fn clear_zero_link(&mut self, ino: InodeNumber) {
         self.zero_link.remove(&ino);
+    }
+}
+
+pub(crate) struct Ext4Guard<'a> {
+    inner: MutexGuard<'a, Ext4State>,
+    #[cfg(feature = "profile")]
+    _profile: ax_sync::ProfileScope,
+}
+
+impl Deref for Ext4Guard<'_> {
+    type Target = Ext4State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for Ext4Guard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -201,8 +224,27 @@ impl Ext4Filesystem {
     /// this guard is held. IRQ-driven block submission sleeps until the
     /// maintenance thread publishes completion, so the outer filesystem state
     /// guard must not disable interrupts or preemption.
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Ext4State> {
-        self.inner.lock()
+    pub(crate) fn lock(&self) -> Ext4Guard<'_> {
+        #[cfg(feature = "profile")]
+        let profile =
+            ax_sync::ProfileScope::new(ax_sync::ProfileEvent::Ext4, self as *const Self as usize);
+        #[cfg(feature = "profile")]
+        let inner = if let Some(inner) = self.inner.try_lock() {
+            inner
+        } else {
+            let _wait = ax_sync::ProfileScope::new(
+                ax_sync::ProfileEvent::Ext4LockWait,
+                &self.inner as *const Mutex<Ext4State> as usize,
+            );
+            self.inner.lock()
+        };
+        #[cfg(not(feature = "profile"))]
+        let inner = self.inner.lock();
+        Ext4Guard {
+            inner,
+            #[cfg(feature = "profile")]
+            _profile: profile,
+        }
     }
 
     pub(crate) fn sync_to_disk(&self) -> VfsResult<()> {

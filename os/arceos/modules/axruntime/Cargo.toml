@@ -35,6 +35,7 @@ irq = [
   "ax-driver/irq",
 ]
 multitask = ["ax-task/multitask", "ax-sync/sleep"]
+profile = ["ax-sync/profile", "ax-fs-ng?/profile"]
 paging = ["ax-hal/paging", "dep:ax-mm"]
 rtc = ["ax-hal/rtc", "ax-driver/rtc"]
 smp = ["ax-hal/smp", "ax-task/smp"]

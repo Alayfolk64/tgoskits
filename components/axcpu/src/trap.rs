@@ -36,6 +36,10 @@ pub type IrqHandler = fn(usize) -> bool;
 /// Page-fault trap hook type.
 pub type PageFaultHandler = fn(VirtAddr, PageFaultFlags) -> bool;
 
+/// Interrupted-context sampling hook used by an optional in-guest profiler.
+#[cfg(feature = "profile")]
+pub type ProfileSampleHandler = fn(&UserRegisters);
+
 fn default_irq_handler(irq: usize) -> bool {
     trace!("IRQ {} triggered", irq);
     false
@@ -48,6 +52,8 @@ fn default_page_fault_handler(addr: VirtAddr, flags: PageFaultFlags) -> bool {
 
 static IRQ_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static PAGE_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "profile")]
+static PROFILE_SAMPLE_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// Installs the global IRQ trap hook and returns the previous one.
 pub fn set_irq_handler(handler: IrqHandler) -> IrqHandler {
@@ -68,6 +74,23 @@ pub fn set_page_fault_handler(handler: PageFaultHandler) -> PageFaultHandler {
     } else {
         // SAFETY: the atomic only stores function pointers of type `PageFaultHandler`.
         unsafe { core::mem::transmute::<usize, PageFaultHandler>(old) }
+    }
+}
+
+/// Installs the interrupted-context sampling hook.
+#[cfg(feature = "profile")]
+pub fn set_profile_sample_handler(handler: ProfileSampleHandler) {
+    PROFILE_SAMPLE_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+/// Saves the register image interrupted by an IRQ when a hook is installed.
+#[cfg(all(feature = "profile", target_arch = "aarch64"))]
+pub(crate) fn profile_sample(registers: &UserRegisters) {
+    let handler = PROFILE_SAMPLE_HANDLER.load(Ordering::Acquire);
+    if handler != 0 {
+        // SAFETY: `set_profile_sample_handler` stores this exact function type.
+        let handler: ProfileSampleHandler = unsafe { core::mem::transmute(handler) };
+        handler(registers);
     }
 }
 

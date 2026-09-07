@@ -31,6 +31,8 @@ multitask = [
   "dep:ax-percpu",
 ]
 preempt = ["irq"]
+# Optional hooks around genuine off-CPU blocking intervals.
+profile = ["multitask", "irq"]
 smp = []
 stack-guard-page = ["multitask", "dep:ax-alloc", "dep:ax-mm", "ax-hal/paging"]
 lockdep = [

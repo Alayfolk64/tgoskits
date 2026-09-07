@@ -22,6 +22,8 @@ pub mod interface;
 mod lockdep;
 #[cfg(feature = "sleep")]
 mod mutex;
+#[cfg(feature = "profile")]
+mod profile;
 mod spin;
 
 #[cfg(all(feature = "host-test", not(target_os = "none")))]
@@ -29,4 +31,6 @@ mod spin;
 pub use self::host::host_preempt_depth;
 #[cfg(feature = "sleep")]
 pub use self::mutex::*;
+#[cfg(feature = "profile")]
+pub use self::profile::*;
 pub use self::{context::*, lockdep::*, spin::*};

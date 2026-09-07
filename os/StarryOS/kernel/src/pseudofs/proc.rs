@@ -1903,8 +1903,56 @@ fn unsupported_limit_sysctl_file(fs: &Arc<SimpleFs>, value: &'static str) -> Arc
     )
 }
 
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+struct StarryProfileFile {
+    snapshot: crate::sync::IrqMutex<Vec<u8>>,
+}
+
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+impl StarryProfileFile {
+    fn new() -> Self {
+        Self {
+            snapshot: crate::sync::IrqMutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+impl DirectRwFsFileOps for StarryProfileFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if offset == 0 {
+            *self.snapshot.lock() = crate::profiler::snapshot().into_bytes();
+        }
+        let snapshot = self.snapshot.lock();
+        if offset >= snapshot.len() as u64 {
+            return Ok(0);
+        }
+        let data = &snapshot[offset as usize..];
+        let read = data.len().min(buf.len());
+        buf[..read].copy_from_slice(&data[..read]);
+        Ok(read)
+    }
+
+    fn write_at(&self, input: &[u8], _offset: u64) -> VfsResult<usize> {
+        if !input.is_empty() {
+            crate::profiler::command(input);
+            self.snapshot.lock().clear();
+        }
+        Ok(input.len())
+    }
+}
+
 fn builder(fs: Arc<SimpleFs>, view: PidView) -> DirMaker {
     let mut root = DirMapping::new();
+    #[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+    root.add(
+        "starry_profile",
+        SpecialFsFile::new_regular_with_perm(
+            fs.clone(),
+            StarryProfileFile::new(),
+            NodePermission::from_bits_truncate(0o600),
+        ),
+    );
     root.add(
         "mounts",
         SimpleFile::new_regular(fs.clone(), || {

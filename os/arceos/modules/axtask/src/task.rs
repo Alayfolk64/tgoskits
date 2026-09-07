@@ -1,6 +1,8 @@
 use alloc::{boxed::Box, string::String, sync::Arc};
 #[cfg(not(feature = "stack-guard-page"))]
 use core::alloc::Layout;
+#[cfg(feature = "profile")]
+use core::ops::Range;
 #[cfg(feature = "smp")]
 use core::sync::atomic::AtomicPtr;
 use core::{
@@ -244,6 +246,23 @@ impl TaskInner {
     /// Gets the name of the task.
     pub fn name(&self) -> String {
         self.name.lock_irqsave().clone()
+    }
+
+    /// Copies the task name without allocating or waiting for a contended lock.
+    #[cfg(feature = "profile")]
+    pub fn copy_name(&self, output: &mut [u8]) -> usize {
+        let Some(name) = self.name.try_lock() else {
+            return 0;
+        };
+        let len = output.len().min(name.len());
+        output[..len].copy_from_slice(&name.as_bytes()[..len]);
+        len
+    }
+
+    /// Returns the usable kernel-stack range owned by this task.
+    #[cfg(feature = "profile")]
+    pub fn kernel_stack_range(&self) -> Range<usize> {
+        self.kstack.bottom().as_usize()..self.kstack.top().as_usize()
     }
 
     /// Set the name of the task.

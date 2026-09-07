@@ -10,6 +10,8 @@ use core::{
 };
 
 use crate::interface::LockMetadata;
+#[cfg(feature = "profile")]
+use crate::{ProfileEvent, ProfileScope};
 
 /// A lockdep subclass identifier.
 pub type LockSubclass = u32;
@@ -41,6 +43,9 @@ impl RawMutex {
     #[inline(always)]
     #[track_caller]
     fn acquire(&self, subclass: u32, is_try: bool) -> bool {
+        #[cfg(feature = "profile")]
+        let _profile = (!is_try && self.owner_id.load(Ordering::Acquire) != 0)
+            .then(|| ProfileScope::new(ProfileEvent::MutexWait, self.addr()));
         crate::interface::mutex_acquire(
             &self.wait_queue,
             &self.owner_id,

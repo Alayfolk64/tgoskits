@@ -233,6 +233,8 @@ unsafe extern "C" fn aarch64_trap_handler(raw: *mut RawTrapFrame, raw_kind: u8, 
             );
         }
         TrapKind::Irq => {
+            #[cfg(feature = "profile")]
+            crate::trap::profile_sample(&tf.raw.0);
             crate::trap::dispatch_irq(0);
         }
         TrapKind::Synchronous => {

@@ -1,6 +1,8 @@
 //! Future support.
 
 use alloc::{sync::Arc, task::Wake};
+#[cfg(feature = "profile")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{
     future::poll_fn,
     pin::pin,
@@ -17,6 +19,49 @@ pub use poll::*;
 
 mod time;
 pub use time::*;
+
+#[cfg(feature = "profile")]
+type ProfileBeginHook = fn() -> u64;
+#[cfg(feature = "profile")]
+type ProfileEndHook = fn(u64);
+
+#[cfg(feature = "profile")]
+static PROFILE_BEGIN_HOOK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "profile")]
+static PROFILE_END_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Installs callbacks around intervals in which `block_on` removes a task from a CPU.
+#[cfg(feature = "profile")]
+pub fn register_block_profile_hooks(begin: ProfileBeginHook, end: ProfileEndHook) {
+    PROFILE_BEGIN_HOOK.store(begin as usize, Ordering::Release);
+    PROFILE_END_HOOK.store(end as usize, Ordering::Release);
+}
+
+#[cfg(feature = "profile")]
+#[inline]
+fn profile_block_begin() -> u64 {
+    let hook = PROFILE_BEGIN_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return 0;
+    }
+    // SAFETY: `register_block_profile_hooks` stores this exact function type.
+    let hook: ProfileBeginHook = unsafe { core::mem::transmute(hook) };
+    hook()
+}
+
+#[cfg(feature = "profile")]
+#[inline]
+fn profile_block_end(token: u64) {
+    if token == 0 {
+        return;
+    }
+    let hook = PROFILE_END_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: `register_block_profile_hooks` stores this exact function type.
+        let hook: ProfileEndHook = unsafe { core::mem::transmute(hook) };
+        hook(token);
+    }
+}
 
 /// Errors owned by task waiting and notification operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -126,7 +171,11 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                 let mut rq = current_run_queue::<PreemptIrqSaveState>();
                 let mut woke = axwaker.woke.lock_irqsave();
                 if !*woke {
+                    #[cfg(feature = "profile")]
+                    let profile_token = profile_block_begin();
                     rq.future_blocked_resched(woke);
+                    #[cfg(feature = "profile")]
+                    profile_block_end(profile_token);
                 } else {
                     *woke = false;
                     drop(woke);
