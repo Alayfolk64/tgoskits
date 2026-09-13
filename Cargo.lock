@@ -7000,6 +7000,7 @@ name = "rsext4"
 version = "0.9.1"
 dependencies = [
  "bitflags 2.13.2",
+ "spinning_top",
  "thiserror 2.0.20",
 ]
 
