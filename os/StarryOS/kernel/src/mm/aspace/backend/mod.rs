@@ -21,6 +21,7 @@ use crate::{StarryError, StarryResult};
 mod cow;
 mod file;
 mod linear;
+mod private_file;
 mod shared;
 
 pub use self::shared::SharedMemoryObject;
@@ -1038,7 +1039,7 @@ impl MappingOperation {
         page: &Arc<super::objects::PageObject>,
     ) -> StarryResult {
         match &self.kind {
-            MappingOperationKind::Cow(cow) => cow.publish_page_object(page),
+            MappingOperationKind::Cow(cow) => cow.publish_page_object(va, page),
             MappingOperationKind::File(file) => file.finish_page_publication(va, page),
             MappingOperationKind::Linear(_) | MappingOperationKind::Shared(_) => Ok(()),
         }
@@ -1057,7 +1058,9 @@ impl MappingOperation {
             return Ok(());
         }
         match &self.kind {
-            MappingOperationKind::Cow(cow) => cow.cancel_page_publication(&owner.page),
+            MappingOperationKind::Cow(cow) => {
+                cow.cancel_page_publication(owner.va, &owner.page)
+            }
             MappingOperationKind::File(file) => file.cancel_page_publication(owner.va, &owner.page),
             MappingOperationKind::Linear(_) | MappingOperationKind::Shared(_) => Ok(()),
         }
@@ -1082,7 +1085,7 @@ impl MappingOperation {
         match &self.kind {
             MappingOperationKind::Cow(cow) => {
                 let page = page.ok_or(StarryError::BadState)?;
-                cow.restore_page_identity(page)?;
+                cow.restore_page_identity(va, page)?;
             }
             MappingOperationKind::File(file) => {
                 let page = page.ok_or(StarryError::BadState)?;

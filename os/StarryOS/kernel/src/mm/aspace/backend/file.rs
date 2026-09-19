@@ -293,7 +293,7 @@ impl FilePageIndex {
     }
 }
 
-struct FilePageDomain {
+pub(super) struct FilePageDomain {
     identity: CachedFileIdentity,
     pages: Mutex<FilePageIndex>,
 }
@@ -304,7 +304,7 @@ static FILE_PAGE_DOMAINS: LazyLock<Mutex<FilePageDomains>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 impl FilePageDomain {
-    fn get_or_create(cache: &CachedFile) -> StarryResult<Arc<Self>> {
+    pub(super) fn get_or_create(cache: &CachedFile) -> StarryResult<Arc<Self>> {
         let identity = cache.identity();
         let domain = {
             let mut domains = FILE_PAGE_DOMAINS.lock();
@@ -325,7 +325,7 @@ impl FilePageDomain {
         Ok(domain)
     }
 
-    fn reserve_page(
+    pub(super) fn reserve_page(
         &self,
         file_epoch: u64,
         page_number: u32,
@@ -345,7 +345,32 @@ impl FilePageDomain {
         self.pages.lock().resolve(file_epoch, page_number, paddr)
     }
 
-    fn finish_page_publication(
+    pub(super) fn page_if_matches(
+        &self,
+        file_epoch: u64,
+        page_number: u32,
+        paddr: PhysAddr,
+    ) -> Option<Arc<PageObject>> {
+        // A private mapping may already have replaced this cache page with an
+        // anonymous COW page. Treat an identity mismatch as "not cache-owned"
+        // so the caller can continue with its anonymous-page index.
+        self.pages
+            .lock()
+            .resolve(file_epoch, page_number, paddr)
+            .ok()
+            .flatten()
+    }
+
+    pub(super) fn owns_page(&self, page_number: u32, page: &Arc<PageObject>) -> bool {
+        self.pages
+            .lock()
+            .pages
+            .get(&page_number)
+            .and_then(FilePageEntry::page)
+            .is_some_and(|current| Arc::ptr_eq(&current, page))
+    }
+
+    pub(super) fn finish_page_publication(
         &self,
         file_epoch: u64,
         page_number: u32,
@@ -359,13 +384,17 @@ impl FilePageDomain {
         Ok(())
     }
 
-    fn cancel_page_publication(&self, page_number: u32, page: &Arc<PageObject>) -> StarryResult {
+    pub(super) fn cancel_page_publication(
+        &self,
+        page_number: u32,
+        page: &Arc<PageObject>,
+    ) -> StarryResult {
         let pin = self.pages.lock().cancel_publication(page_number, page)?;
         drop(pin);
         Ok(())
     }
 
-    fn ensure_page_identity(
+    pub(super) fn ensure_page_identity(
         &self,
         file_epoch: u64,
         page_number: u32,

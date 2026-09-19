@@ -332,7 +332,7 @@ fn map_elf<'a>(
             ph.offset,
             Some(file_end),
             false,
-        );
+        )?;
         uspace.map(
             seg_start.align_down_4k(),
             seg_align_size,

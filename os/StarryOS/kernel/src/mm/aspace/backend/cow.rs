@@ -27,6 +27,7 @@ use super::{
             VmaDescriptor, allocate_mapping_id,
         },
     },
+    private_file::PrivateFileBacking,
     FaultFallback, FaultMaterialization, FaultPteSnapshot, MappingExecution, MappingFileInfo,
     MappingOperation, PopulateRequest, PreparedPteOwner, ProviderPublication, PteMaterialization,
     RssKind, alloc_frame, occupied_leaf_ranges, pages_in, validate_occupied_leaf_range,
@@ -525,7 +526,7 @@ pub struct CowBackend {
     /// Logical-source-local physical lookup. Published entries are weak; each
     /// installed MappingSlot is the only strong mapping owner.
     pages: Arc<IrqMutex<CowPageIndex>>,
-    file: Option<(FileBackend, VirtAddr, u64, Option<u64>)>,
+    file: Option<PrivateFileBacking>,
     name: Option<String>,
     shared: bool,
 }
@@ -553,7 +554,23 @@ impl CowBackend {
         self.pages.lock().get(paddr)
     }
 
-    pub(crate) fn publish_page_object(&self, page: &Arc<PageObject>) -> StarryResult {
+    fn page_object_at(&self, vaddr: VirtAddr, paddr: PhysAddr) -> Option<Arc<PageObject>> {
+        self.file
+            .as_ref()
+            .and_then(|file| file.cached_page_at(vaddr, paddr))
+            .or_else(|| self.page_object_for_frame(paddr))
+    }
+
+    pub(crate) fn publish_page_object(
+        &self,
+        vaddr: VirtAddr,
+        page: &Arc<PageObject>,
+    ) -> StarryResult {
+        if let Some(file) = &self.file
+            && file.finish_page_publication(vaddr, page)?
+        {
+            return Ok(());
+        }
         let displaced = {
             let mut pages = self.pages.lock();
             pages.publish(page)?
@@ -562,7 +579,16 @@ impl CowBackend {
         Ok(())
     }
 
-    pub(crate) fn restore_page_identity(&self, page: &Arc<PageObject>) -> StarryResult {
+    pub(crate) fn restore_page_identity(
+        &self,
+        vaddr: VirtAddr,
+        page: &Arc<PageObject>,
+    ) -> StarryResult {
+        if let Some(file) = &self.file
+            && file.ensure_page_identity(vaddr, page)?
+        {
+            return Ok(());
+        }
         loop {
             let capacity = {
                 let pages = self.pages.lock();
@@ -593,25 +619,13 @@ impl CowBackend {
     }
 
     pub(super) fn mincore_location(&self) -> Option<&axfs_ng_vfs::Location> {
-        self.file.as_ref().map(|(file, ..)| file.location())
+        self.file.as_ref().map(|file| file.backend().location())
     }
 
     pub(crate) fn page_cache_resident(&self, va: VirtAddr) -> bool {
-        let Some((FileBackend::Cached(cache), file_vaddr_base, file_start, file_end)) = &self.file
-        else {
-            return false;
-        };
-        let relative = va.as_usize().saturating_sub(file_vaddr_base.as_usize()) as u64;
-        let Some(offset) = file_start.checked_add(relative) else {
-            return false;
-        };
-        if file_end.is_some_and(|end| offset >= end) {
-            return false;
-        }
-        let Ok(page) = u32::try_from(offset / PAGE_SIZE_4K as u64) else {
-            return false;
-        };
-        cache.is_page_cached(page)
+        self.file
+            .as_ref()
+            .is_some_and(|file| file.page_cache_resident(va))
     }
 
     pub fn with_start(&self, new_start: VirtAddr) -> Self {
@@ -690,7 +704,16 @@ impl CowBackend {
         }
     }
 
-    pub(super) fn cancel_page_publication(&self, page: &Arc<PageObject>) -> StarryResult {
+    pub(super) fn cancel_page_publication(
+        &self,
+        vaddr: VirtAddr,
+        page: &Arc<PageObject>,
+    ) -> StarryResult {
+        if let Some(file) = &self.file
+            && file.cancel_page_publication(vaddr, page)?
+        {
+            return Ok(());
+        }
         self.discard_pending_index_entry(page)
     }
 
@@ -782,29 +805,41 @@ impl CowBackend {
         let pte_flags = self.pte_flags_for_fault_in(flags, access_flags);
         page.prepare_executable_mapping(frame, leaf_size, pte_flags);
         if let Err(err) = pt.map_page(vaddr, frame, leaf_size, pte_flags) {
-            self.discard_pending_page(&page);
+            if let Err(cancel_error) = self.cancel_page_publication(vaddr, &page) {
+                warn!(
+                    "failed to cancel COW page {:?} after page-table map error: {cancel_error}",
+                    page.frame().paddr()
+                );
+            }
             return Err(err.into());
         }
         Ok(page)
     }
 
-    /// Allocates and fills one private fault page without publishing a PTE.
+    /// Prepares one private fault page without publishing a PTE.
     ///
-    /// The returned page remains Pending in the source-local index until the
-    /// address-space mutation publishes its MappingSlot. This is the same
-    /// prepare/apply split Linux uses when it allocates a COW folio before
-    /// taking the page-table lock.
+    /// A page-aligned cached-file read fault reserves the existing cache page;
+    /// other faults allocate and fill a private page. The returned page stays
+    /// pending in its owning domain until the address-space mutation publishes
+    /// its MappingSlot. This keeps allocation and file I/O outside the page-
+    /// table mutation, like Linux's prepare/apply fault split.
     fn prepare_new_at_sized(
         &self,
         vaddr: VirtAddr,
         leaf_size: usize,
         access_flags: MappingFlags,
     ) -> StarryResult<Arc<PageObject>> {
+        if !access_flags.contains(MappingFlags::WRITE)
+            && let Some(file) = &self.file
+            && let Some(page) = file.prepare_cached_read_page(vaddr, leaf_size)?
+        {
+            return Ok(page);
+        }
         let kind = self.rss_kind_for_fault(access_flags);
         let page = self.alloc_new_frame_sized(true, kind, leaf_size)?;
         let frame = page.frame().paddr();
 
-        if let Some((file, file_vaddr_base, file_start, file_end)) = &self.file {
+        if let Some(file) = &self.file {
             let buf =
                 unsafe { slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), leaf_size) };
             // vaddr can be smaller than file_vaddr_base (at most 1 page) due to
@@ -819,22 +854,35 @@ impl CowBackend {
             // subtract the gap here — doing so reads the segment's bytes from
             // the wrong offset and corrupts e.g. the dynamic linker's
             // .dynamic/GOT, making ld-musl jump to a null pointer.
-            let start = file_vaddr_base.as_usize().saturating_sub(vaddr.as_usize());
+            let start = file
+                .vaddr_base()
+                .as_usize()
+                .saturating_sub(vaddr.as_usize());
             if start >= leaf_size {
                 self.discard_pending_page(&page);
                 return Err(StarryError::InvalidInput);
             }
 
-            let relative = vaddr.as_usize().saturating_sub(file_vaddr_base.as_usize());
-            let file_read_offset = (*file_start).checked_add(relative as u64).ok_or_else(|| {
-                self.discard_pending_page(&page);
-                StarryError::InvalidInput
-            })?;
+            let relative = vaddr
+                .as_usize()
+                .saturating_sub(file.vaddr_base().as_usize());
+            let file_read_offset =
+                file.file_start()
+                    .checked_add(relative as u64)
+                    .ok_or_else(|| {
+                        self.discard_pending_page(&page);
+                        StarryError::InvalidInput
+                    })?;
             let available = buf
                 .len()
                 .checked_sub(start)
                 .ok_or(StarryError::InvalidInput)?;
-            let max_read = match cow_file_max_read(file, *file_end, file_read_offset, available) {
+            let max_read = match cow_file_max_read(
+                file.backend(),
+                file.file_end(),
+                file_read_offset,
+                available,
+            ) {
                 Ok(max_read) => max_read,
                 Err(err) => {
                     self.discard_pending_page(&page);
@@ -842,7 +890,9 @@ impl CowBackend {
                 }
             };
 
-            if let Err(err) = file.read_at(&mut &mut buf[start..start + max_read], file_read_offset)
+            if let Err(err) = file
+                .backend()
+                .read_at(&mut &mut buf[start..start + max_read], file_read_offset)
             {
                 self.discard_pending_page(&page);
                 return Err(err.into());
@@ -865,12 +915,25 @@ impl CowBackend {
                         // freeing a frame that a remote TLB may still reach.
                         continue;
                     }
-                    self.discard_pending_page(&page)
+                    if let Err(error) = self.cancel_page_publication(vaddr, &page) {
+                        warn!(
+                            "COW rollback could not cancel page {:?} at {vaddr:?}: {error}",
+                            page.frame().paddr()
+                        );
+                    }
                 }
                 Ok((mapped, ..)) => {
                     warn!("COW rollback found frame {mapped:?} instead of {frame:?} at {vaddr:?}")
                 }
-                Err(PagingError::NotMapped) => self.discard_pending_page(&page),
+                Err(PagingError::NotMapped) => {
+                    if let Err(error) = self.cancel_page_publication(vaddr, &page) {
+                        warn!(
+                            "COW rollback could not cancel unmapped page {:?} at {vaddr:?}: \
+                             {error}",
+                            page.frame().paddr()
+                        );
+                    }
+                }
                 Err(error) => warn!("COW rollback could not unmap {vaddr:?}: {error}"),
             }
         }
@@ -886,7 +949,7 @@ impl CowBackend {
         pt: &mut PageTable,
     ) -> StarryResult<PteMaterialization> {
         let mut materialization = PteMaterialization::with_capacity(run.len())?;
-        let Some((file, file_vaddr_base, file_start, file_end)) = &self.file else {
+        let Some(file) = &self.file else {
             let mut mapped = Vec::new();
             mapped
                 .try_reserve(run.len())
@@ -914,7 +977,7 @@ impl CowBackend {
         };
         let ps = self.page_size;
         let v0 = run[0];
-        if v0.as_usize() < file_vaddr_base.as_usize() {
+        if v0.as_usize() < file.vaddr_base().as_usize() {
             let mut mapped = Vec::new();
             mapped
                 .try_reserve(run.len())
@@ -942,16 +1005,23 @@ impl CowBackend {
         }
         let n = run.len();
         let total = n.checked_mul(ps).ok_or(StarryError::InvalidInput)?;
-        let file_read_offset = file_start
-            .checked_add((v0.as_usize() - file_vaddr_base.as_usize()) as u64)
+        let file_read_offset = file
+            .file_start()
+            .checked_add((v0.as_usize() - file.vaddr_base().as_usize()) as u64)
             .ok_or(StarryError::InvalidInput)?;
-        let max_read = cow_file_max_read(file, *file_end, file_read_offset, total)?;
+        let max_read = cow_file_max_read(
+            file.backend(),
+            file.file_end(),
+            file_read_offset,
+            total,
+        )?;
         let mut buf = Vec::new();
         buf.try_reserve_exact(total)
             .map_err(|_| StarryError::NoMemory)?;
         buf.resize(total, 0);
         if max_read > 0 {
-            file.read_at(&mut &mut buf[..max_read], file_read_offset)?;
+            file.backend()
+                .read_at(&mut &mut buf[..max_read], file_read_offset)?;
         }
         let kind = self.rss_kind_for_fault(access_flags);
         let mut mapped_pages = Vec::new();
@@ -1044,7 +1114,7 @@ impl CowBackend {
         vma_flags: MappingFlags,
     ) -> StarryResult<PreparedPteOwner> {
         let page = self
-            .page_object_for_frame(paddr)
+            .page_object_at(vaddr, paddr)
             .ok_or(StarryError::BadAddress)?;
         if page.mapping_refs() == 0 {
             return Err(StarryError::BadState);
@@ -1052,7 +1122,11 @@ impl CowBackend {
         if leaf_size < PAGE_SIZE_4K || !leaf_size.is_power_of_two() {
             return Err(StarryError::BadState);
         }
-        if page.exclusively_mapped_by(space_id) {
+        let cache_backed = self
+            .file
+            .as_ref()
+            .is_some_and(|file| file.owns_cached_page(vaddr, &page));
+        if page.exclusively_mapped_by(space_id) && !cache_backed {
             let resident_kind = if self.file.is_some() && vma_flags.contains(MappingFlags::WRITE) {
                 Some(RssKind::Anon)
             } else {
@@ -1120,8 +1194,12 @@ impl CowBackend {
         if !super::tlb_retire_is_deferred() {
             crate::mm::flush_tlb_range_sync(addr, page_size)?;
         }
-        if let Some(page) = self.page_object_for_frame(frame)
+        if let Some(page) = self.page_object_at(addr, frame)
             && page.mapping_refs() == 0
+            && !self
+                .file
+                .as_ref()
+                .is_some_and(|file| file.owns_cached_page(addr, &page))
         {
             // This was an unpublished PTE whose Pending index entry was the
             // only strong owner. Published pages remain weakly indexed and are
@@ -1135,7 +1213,7 @@ impl CowBackend {
         let source = self
             .file
             .as_ref()
-            .map(|(file, file_vaddr_base, file_start, ..)| (file, *file_vaddr_base, *file_start));
+            .map(|file| (file.backend(), file.vaddr_base(), file.file_start()));
         if let Some((file, file_vaddr_base, file_start)) = source {
             // Same invariant as `alloc_new_at`: a virtual address maps to
             // `file_start + (vaddr - file_vaddr_base)`, clamped to file_start
@@ -1272,14 +1350,16 @@ impl MappingExecution for CowBackend {
     }
 
     fn vma_descriptor(&self, area_start: VirtAddr) -> VmaDescriptor {
-        let (source, source_offset) = if let Some((file, base, file_start, _)) = &self.file {
-            let relative = area_start.as_usize().saturating_sub(base.as_usize());
-            let offset = file_start.checked_add(relative as u64).unwrap_or(u64::MAX);
+        let (source, source_offset) = if let Some(file) = &self.file {
+            let relative = area_start
+                .as_usize()
+                .saturating_sub(file.vaddr_base().as_usize());
+            let offset = file.file_start().saturating_add(relative as u64);
             // `inode` is a stable VFS identity and, unlike an `Arc` address,
             // remains meaningful after a mapping is cloned or relocated.  A
             // mount-specific epoch can be added by the filesystem adapter
             // without changing this VMA-facing contract.
-            let file_id = file.location().inode();
+            let file_id = file.backend().location().inode();
             (
                 MappingSource::File(FileSource {
                     file_id,
@@ -1607,7 +1687,7 @@ impl MappingExecution for CowBackend {
                 return Err(StarryError::BadState);
             }
             let page = self
-                .page_object_for_frame(paddr)
+                .page_object_at(vaddr, paddr)
                 .ok_or(StarryError::BadState)?;
             if page.mapping_refs() == 0 {
                 return Err(StarryError::BadState);
@@ -1670,16 +1750,17 @@ impl MappingOperation {
         file_start: u64,
         file_end: Option<u64>,
         shared: bool,
-    ) -> Self {
-        Self::from_cow(CowBackend {
+    ) -> StarryResult<Self> {
+        let file = PrivateFileBacking::new(file, start, file_start, file_end)?;
+        Ok(Self::from_cow(CowBackend {
             start: start.align_down_4k(),
             page_size: size,
             mapping_id: allocate_mapping_id(),
             pages: Arc::new(IrqMutex::new(CowPageIndex::new())),
-            file: Some((file, start, file_start, file_end)),
+            file: Some(file),
             name: None,
             shared,
-        })
+        }))
     }
 
     pub fn new_alloc(start: VirtAddr, size: usize, name: &str) -> Self {
@@ -1693,6 +1774,97 @@ impl MappingOperation {
             shared: false,
         })
     }
+}
+
+#[cfg(all(test, axtest))]
+fn private_file_read_fault_maps_cache_and_write_fault_copies_for_test() -> bool {
+    use axfs_ng_vfs::{Location, Mountpoint, NodePermission};
+
+    let (filesystem, memory_fs) = crate::pseudofs::MemoryFs::new_with_handle();
+    let entry = memory_fs.create_anonymous_file(
+        "private-file-cache-cow",
+        NodePermission::from_bits_truncate(0o600),
+        0,
+        0,
+    );
+    let cache = ax_fs_ng::vfs::CachedFile::get_or_create(Location::new(
+        Mountpoint::new_root(&filesystem),
+        entry,
+    ))
+    .unwrap();
+    let source = [0x5a; PAGE_SIZE_4K];
+    if cache.write_at(&source[..], 0).ok() != Some(PAGE_SIZE_4K) {
+        return false;
+    }
+
+    let start = VirtAddr::from_usize(0x7400_0000);
+    let flags = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
+    let operation = MappingOperation::new_cow(
+        start,
+        PAGE_SIZE_4K,
+        FileBackend::Cached(cache.clone()),
+        0,
+        None,
+        false,
+    )
+    .unwrap();
+    let Ok(mut aspace) = AddrSpace::new_empty(start, PAGE_SIZE_4K) else {
+        return false;
+    };
+    if aspace
+        .map(start, PAGE_SIZE_4K, flags, false, operation)
+        .is_err()
+    {
+        return false;
+    }
+    if !matches!(
+        aspace.handle_page_fault_result(
+            start,
+            ax_runtime::hal::trap::PageFaultFlags::READ
+                | ax_runtime::hal::trap::PageFaultFlags::USER,
+        ),
+        super::super::FaultResult::Handled
+    ) {
+        return false;
+    }
+    let Ok((read_frame, read_flags, read_size)) = aspace.pt.query(start) else {
+        return false;
+    };
+    let cache_pin = cache.pin_cached_page(0).unwrap();
+    let cache_frame = PhysAddr::from_usize(cache_pin.paddr());
+    let read_maps_cache = read_frame == cache_frame
+        && read_size == PAGE_SIZE_4K
+        && !read_flags.contains(MappingFlags::WRITE);
+
+    if !matches!(
+        aspace.handle_page_fault_result(
+            start,
+            ax_runtime::hal::trap::PageFaultFlags::WRITE
+                | ax_runtime::hal::trap::PageFaultFlags::USER,
+        ),
+        super::super::FaultResult::Handled
+    ) {
+        return false;
+    }
+    let Ok((write_frame, write_flags, write_size)) = aspace.pt.query(start) else {
+        return false;
+    };
+    // SAFETY: the address space retains `write_frame` and `cache_pin` retains
+    // `cache_frame` for the whole access; both frames contain a full 4 KiB
+    // page and these byte pointers stay within that allocation.
+    let (copied_byte, cache_byte) = unsafe {
+        let copied_byte = *phys_to_virt(write_frame).as_ptr();
+        *phys_to_virt(write_frame).as_mut_ptr() = 0xa5;
+        let cache_byte = *phys_to_virt(cache_frame).as_ptr();
+        (copied_byte, cache_byte)
+    };
+    let write_copied = write_frame != cache_frame
+        && write_size == PAGE_SIZE_4K
+        && write_flags.contains(MappingFlags::WRITE)
+        && copied_byte == 0x5a
+        && cache_byte == 0x5a;
+    drop(cache_pin);
+    read_maps_cache && write_copied && aspace.reset_uninstalled_for_loader().is_ok()
 }
 
 #[cfg(all(test, not(axtest)))]
@@ -3371,6 +3543,12 @@ mod tests {
             8,
             "a full live index must still grow geometrically",
         );
+    }
+
+    #[cfg(all(test, axtest))]
+    #[axtest::axtest]
+    fn private_file_read_fault_maps_cache_and_write_fault_copies() {
+        assert!(super::private_file_read_fault_maps_cache_and_write_fault_copies_for_test());
     }
 
     #[cfg(all(test, not(axtest)))]

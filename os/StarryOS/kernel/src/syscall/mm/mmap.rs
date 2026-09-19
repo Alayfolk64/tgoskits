@@ -726,7 +726,7 @@ pub fn sys_mmap(
                 if !file_flags.contains(FileFlags::READ) {
                     return Err(StarryError::PermissionDenied);
                 }
-                MappingOperation::new_cow(start, page_size, backend, offset as u64, None, false)
+                MappingOperation::new_cow(start, page_size, backend, offset as u64, None, false)?
             } else {
                 MappingOperation::new_alloc(start, page_size, "")
             }
