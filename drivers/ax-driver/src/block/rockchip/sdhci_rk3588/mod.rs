@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{ptr::NonNull, time::Duration};
 
 use log::{info, warn};
@@ -27,6 +27,7 @@ use sdhci_host::{HostClock, HostResetHook, Sdhci, rdif as sdhci_rdif};
 use sdmmc_protocol::{
     Error,
     error::{ErrorContext, Phase},
+    rdif::BlkError,
     sdio::{SdMmcIrqHost, native::SdMmcCard},
 };
 
@@ -38,7 +39,9 @@ use crate::{block::ProbeFdtBlock, mmio::iomap, sdhci_runtime::install_host_timer
 // RK3588 DWCMSHC follows Linux's normal SDHCI completion path: hard IRQ only
 // acknowledges and caches status; the bound hctx advances command/data state.
 const DWCMSHC_P_VENDOR_AREA1: usize = 0xe8;
+const DWCMSHC_P_VENDOR_AREA2: usize = 0xea;
 const DWCMSHC_AREA1_MASK: u16 = 0x0fff;
+const DWCMSHC_CQHCI_REGISTER_BYTES: usize = 0x60;
 const DWCMSHC_HOST_CTRL3: usize = 0x08;
 const DWCMSHC_HOST_CTRL3_CMD_CONFLICT: u32 = 1 << 0;
 const DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE: u32 = 1 << 4;
@@ -58,6 +61,31 @@ const DLL_STRBIN_DELAY_NUM_SEL: u32 = 1 << 26;
 const DLL_STRBIN_DELAY_NUM_DEFAULT: u32 = 16;
 const DLL_STRBIN_DELAY_NUM_OFFSET: u32 = 16;
 const MISC_INTCLK_EN: u32 = 1 << 1;
+
+const SDHCI_BLOCK_SIZE: usize = 0x04;
+const SDHCI_TRANSFER_MODE: usize = 0x0c;
+const SDHCI_BUFFER: usize = 0x20;
+const SDHCI_PRESENT_STATE: usize = 0x24;
+const SDHCI_HOST_CONTROL: usize = 0x28;
+const SDHCI_INT_STATUS: usize = 0x30;
+const SDHCI_INT_ENABLE: usize = 0x34;
+const SDHCI_SIGNAL_ENABLE: usize = 0x38;
+const SDHCI_DATA_AVAILABLE: u32 = 1 << 11;
+const SDHCI_INT_RESPONSE: u32 = 1;
+const SDHCI_DMA_SELECT_MASK: u8 = 0b11 << 3;
+const SDHCI_DMA_SELECT_ADMA32: u8 = 0b10 << 3;
+const SDHCI_BLOCK_SIZE_MASK: u16 = 0x0fff;
+const SDHCI_CQE_BLOCK_SIZE: u16 = 512;
+const SDHCI_INT_ERROR_SUMMARY: u32 = 1 << 15;
+const SDHCI_INT_CQE: u32 = 1 << 14;
+const SDHCI_CQE_ERROR_MASK: u32 = 0x027f_0000;
+const SDHCI_CQE_INTERRUPT_MASK: u32 =
+    SDHCI_CQE_ERROR_MASK | SDHCI_INT_CQE | SDHCI_INT_ERROR_SUMMARY;
+const DWCMSHC_SDHCI_CQE_TRANSFER_MODE: u16 = (1 << 5) | (1 << 1) | 1;
+const CQHCI_SSC1: usize = 0x40;
+const CQHCI_SSC1_CIT_MASK: u32 = 0xffff;
+const CQHCI_SSC1_CIT_RK35XX: u32 = 0x0100;
+const CQHCI_DATA_DRAIN_LIMIT: usize = 4096;
 
 const DWC_MSHC_PTR_PHY_R: usize = 0x300;
 const PHY_CNFG_R: usize = DWC_MSHC_PTR_PHY_R;
@@ -90,6 +118,77 @@ struct RockchipSdhciClock {
 }
 struct RockchipSdhciResetHook {
     resets: Vec<ResetLine>,
+}
+
+struct Rk3588CqhciPlatform {
+    sdhci_base: NonNull<u8>,
+    legacy_interrupt_masks: Option<(u32, u32)>,
+}
+
+// SAFETY: the platform object owns no CPU-local state. Its MMIO capability is
+// moved with the single hardware-queue owner and never accessed concurrently
+// outside the IRQ endpoint's disjoint status registers.
+unsafe impl Send for Rk3588CqhciPlatform {}
+
+impl cqhci_host::CqhciPlatform for Rk3588CqhciPlatform {
+    fn prepare(&mut self, cqhci_base: usize) -> Result<(), BlkError> {
+        let cqhci_base = NonNull::new(cqhci_base as *mut u8).ok_or(BlkError::InvalidRequest)?;
+        let ssc1 = read_u32(cqhci_base, CQHCI_SSC1);
+        write_u32(
+            cqhci_base,
+            CQHCI_SSC1,
+            (ssc1 & !CQHCI_SSC1_CIT_MASK) | CQHCI_SSC1_CIT_RK35XX,
+        );
+        Ok(())
+    }
+
+    fn enable_data_path(&mut self) -> Result<(), BlkError> {
+        for _ in 0..CQHCI_DATA_DRAIN_LIMIT {
+            if read_u32(self.sdhci_base, SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE == 0 {
+                write_u16(
+                    self.sdhci_base,
+                    SDHCI_TRANSFER_MODE,
+                    DWCMSHC_SDHCI_CQE_TRANSFER_MODE,
+                );
+                let host_control = read_u8(self.sdhci_base, SDHCI_HOST_CONTROL);
+                write_u8(
+                    self.sdhci_base,
+                    SDHCI_HOST_CONTROL,
+                    (host_control & !SDHCI_DMA_SELECT_MASK) | SDHCI_DMA_SELECT_ADMA32,
+                );
+                let block_size = read_u16(self.sdhci_base, SDHCI_BLOCK_SIZE);
+                write_u16(
+                    self.sdhci_base,
+                    SDHCI_BLOCK_SIZE,
+                    (block_size & !SDHCI_BLOCK_SIZE_MASK) | SDHCI_CQE_BLOCK_SIZE,
+                );
+                if self.legacy_interrupt_masks.is_none() {
+                    self.legacy_interrupt_masks = Some((
+                        read_u32(self.sdhci_base, SDHCI_INT_ENABLE),
+                        read_u32(self.sdhci_base, SDHCI_SIGNAL_ENABLE),
+                    ));
+                }
+                write_u32(self.sdhci_base, SDHCI_INT_ENABLE, SDHCI_CQE_INTERRUPT_MASK);
+                write_u32(
+                    self.sdhci_base,
+                    SDHCI_SIGNAL_ENABLE,
+                    SDHCI_CQE_INTERRUPT_MASK,
+                );
+                return Ok(());
+            }
+            let _ = read_u32(self.sdhci_base, SDHCI_BUFFER);
+        }
+        Err(BlkError::Io)
+    }
+
+    fn disable_data_path(&mut self) -> Result<(), BlkError> {
+        write_u32(self.sdhci_base, SDHCI_INT_STATUS, SDHCI_INT_RESPONSE);
+        if let Some((status_enable, signal_enable)) = self.legacy_interrupt_masks.take() {
+            write_u32(self.sdhci_base, SDHCI_INT_ENABLE, status_enable);
+            write_u32(self.sdhci_base, SDHCI_SIGNAL_ENABLE, signal_enable);
+        }
+        Ok(())
+    }
 }
 
 impl HostClock for RockchipSdhciClock {
@@ -171,7 +270,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         base_reg.address as usize,
         mmio_size
     );
-    let mmio_base = iomap(base_reg.address as usize, mmio_size as usize)?;
+    let mmio_size = mmio_size as usize;
+    let mmio_base = iomap(base_reg.address as usize, mmio_size)?;
 
     let mut host = unsafe { Sdhci::new(mmio_base) };
     // A previous owner (for example the hypervisor host) may leave completion
@@ -193,7 +293,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         dma_api::DmaConstraints::new(u32::MAX as u64),
     ));
     let config = rockchip_sdhci_rdif_config(0, &dma);
-    host.configure_dma(dma).map_err(|err| {
+    host.configure_dma(dma.clone()).map_err(|err| {
         OnProbeError::other(alloc::format!(
             "rockchip-sdhci ADMA2 configuration failed: {err:?}"
         ))
@@ -207,10 +307,47 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         media_name(preference),
         preference
     );
+    let supports_cqe = info.node.as_node().get_property("supports-cqe").is_some();
+    let cqhci_base = if supports_cqe {
+        match dwcmshc_cqhci_base(mmio_base, mmio_size) {
+            Ok(base) => Some(base),
+            Err(error) => {
+                warn!("rockchip-sdhci: invalid CQHCI vendor area ({error:?}); using legacy SDHCI");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let parts = host.into_parts();
     let mut card = SdMmcCard::new(parts.bus);
     card.set_diagnostic_identity(identity);
-    let dev = sdhci_rdif::BlockDevice::new_initializing(card, parts.irq, config, preference);
+    let dev = if let Some(cqhci_base) = cqhci_base {
+        let platform = Rk3588CqhciPlatform {
+            sdhci_base: mmio_base,
+            legacy_interrupt_masks: None,
+        };
+        let (queue, irq) =
+            unsafe { cqhci_host::queue_and_irq(cqhci_base, dma, Box::new(platform), parts.irq) }
+                .map_err(|error| {
+                    OnProbeError::other(alloc::format!(
+                        "rockchip-sdhci CQHCI allocation failed: {error:?}"
+                    ))
+                })?;
+        info!(
+            "rockchip-sdhci: CQHCI available at offset={:#x}",
+            cqhci_base.as_ptr() as usize - mmio_base.as_ptr() as usize
+        );
+        sdhci_rdif::BlockDevice::new_initializing_accelerated(
+            card,
+            irq,
+            config,
+            preference,
+            Box::new(queue),
+        )
+    } else {
+        sdhci_rdif::BlockDevice::new_initializing(card, parts.irq, config, preference)
+    };
     let irq = probe.register_block(dev)?;
     info!("rockchip-sdhci block device registered irq={:?}", irq);
     Ok(())
@@ -333,11 +470,22 @@ fn dwcmshc_vendor_area1(base: NonNull<u8>) -> usize {
     (read_u16(base, DWCMSHC_P_VENDOR_AREA1) & DWCMSHC_AREA1_MASK) as usize
 }
 
+fn dwcmshc_cqhci_base(base: NonNull<u8>, mmio_size: usize) -> Result<NonNull<u8>, BlkError> {
+    let area2 = usize::from(read_u16(base, DWCMSHC_P_VENDOR_AREA2));
+    if area2 == 0
+        || area2
+            .checked_add(DWCMSHC_CQHCI_REGISTER_BYTES)
+            .is_none_or(|end| end > mmio_size)
+    {
+        return Err(BlkError::InvalidRequest);
+    }
+    NonNull::new(unsafe { base.as_ptr().add(area2) }).ok_or(BlkError::InvalidRequest)
+}
+
 fn read_u32(base: NonNull<u8>, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile(base.as_ptr().add(off) as *const u32) }
 }
 
-#[cfg(test)]
 fn read_u8(base: NonNull<u8>, off: usize) -> u8 {
     unsafe { core::ptr::read_volatile(base.as_ptr().add(off)) }
 }
@@ -417,6 +565,66 @@ mod tests {
         }
 
         assert_eq!(dwcmshc_vendor_area1(base), 0x0abc);
+    }
+
+    #[test]
+    fn dwcmshc_cqhci_pointer_must_cover_the_complete_register_window() {
+        let mut mmio = [0u8; 0x1000];
+        let base = NonNull::new(mmio.as_mut_ptr()).unwrap();
+        write_u16(base, DWCMSHC_P_VENDOR_AREA2, 0x0800);
+
+        let cqhci = dwcmshc_cqhci_base(base, mmio.len()).unwrap();
+        assert_eq!(cqhci.as_ptr() as usize - base.as_ptr() as usize, 0x0800);
+
+        write_u16(base, DWCMSHC_P_VENDOR_AREA2, 0x0fc0);
+        assert_eq!(
+            dwcmshc_cqhci_base(base, mmio.len()),
+            Err(BlkError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn rk3588_cqhci_platform_programs_linux_compatible_data_path() {
+        let mut mmio = [0u8; 0x1000];
+        let base = NonNull::new(mmio.as_mut_ptr()).unwrap();
+        // SAFETY: offset 0x800 remains within the live test MMIO array.
+        let cqhci = unsafe { NonNull::new_unchecked(base.as_ptr().add(0x800)) };
+        write_u32(cqhci, CQHCI_SSC1, u32::MAX);
+        write_u32(base, SDHCI_INT_ENABLE, 0x1234_5678);
+        write_u32(base, SDHCI_SIGNAL_ENABLE, 0x8765_4321);
+        let mut platform = Rk3588CqhciPlatform {
+            sdhci_base: base,
+            legacy_interrupt_masks: None,
+        };
+
+        cqhci_host::CqhciPlatform::prepare(&mut platform, cqhci.as_ptr() as usize).unwrap();
+        cqhci_host::CqhciPlatform::enable_data_path(&mut platform).unwrap();
+
+        assert_eq!(
+            read_u32(cqhci, CQHCI_SSC1) & CQHCI_SSC1_CIT_MASK,
+            CQHCI_SSC1_CIT_RK35XX
+        );
+        assert_eq!(
+            read_u16(base, SDHCI_TRANSFER_MODE),
+            DWCMSHC_SDHCI_CQE_TRANSFER_MODE
+        );
+        assert_eq!(
+            read_u8(base, SDHCI_HOST_CONTROL) & SDHCI_DMA_SELECT_MASK,
+            SDHCI_DMA_SELECT_ADMA32
+        );
+        assert_eq!(
+            read_u16(base, SDHCI_BLOCK_SIZE) & SDHCI_BLOCK_SIZE_MASK,
+            SDHCI_CQE_BLOCK_SIZE
+        );
+        assert_eq!(read_u32(base, SDHCI_INT_ENABLE), SDHCI_CQE_INTERRUPT_MASK);
+        assert_eq!(
+            read_u32(base, SDHCI_SIGNAL_ENABLE),
+            SDHCI_CQE_INTERRUPT_MASK
+        );
+
+        cqhci_host::CqhciPlatform::disable_data_path(&mut platform).unwrap();
+        assert_eq!(read_u32(base, SDHCI_INT_ENABLE), 0x1234_5678);
+        assert_eq!(read_u32(base, SDHCI_SIGNAL_ENABLE), 0x8765_4321);
     }
 
     #[test]
