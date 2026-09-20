@@ -1,16 +1,17 @@
 use alloc::{boxed::Box, vec::Vec};
 
-use axfs_ng_vfs::{VfsError, VfsResult};
+use axfs_ng_vfs::{FileNodeOps, VfsError, VfsResult};
 
 use super::{CacheMappingEvent, CacheMappingResult, CachedFileShared, PAGE_SIZE};
 
 /// Upper bound for one detached writeback snapshot batch.
 ///
 /// Linux writeback submits bounded folio/bio batches and never concatenates an
-/// arbitrarily long dirty extent into a second full-size heap buffer.  The VFS
-/// backing interface is not scatter/gather-aware yet, so this implementation
-/// writes each stable page snapshot separately while bounding the number of
-/// snapshots retained across I/O.
+/// arbitrarily long dirty extent into a second full-size heap buffer. The VFS
+/// backing interface is not scatter/gather-aware yet, so adjacent stable page
+/// snapshots are copied into one bounded run before crossing into the backing
+/// filesystem. This amortizes mapping preparation and lets the block layer see
+/// multi-block writes without retaining unbounded dirty data across I/O.
 const MAX_WRITEBACK_SNAPSHOT_PAGES: usize = 16;
 
 struct DirtyPageSnapshot {
@@ -172,17 +173,17 @@ impl CachedFileShared {
 
     fn writeback_snapshot_batch(&self, snapshots: &[DirtyPageSnapshot]) -> VfsResult<()> {
         let backing = self.backing()?;
-        for page in snapshots {
-            let offset = page.pn as u64 * PAGE_SIZE as u64;
-            let mut written = 0;
-            while written < page.len {
-                let count =
-                    backing.write_at(&page.data[written..page.len], offset + written as u64)?;
-                if count == 0 || count > page.len - written {
-                    return Err(VfsError::Io);
-                }
-                written += count;
+        let mut first = 0;
+        while first < snapshots.len() {
+            let mut end = first + 1;
+            while end < snapshots.len()
+                && snapshots[end - 1].pn.checked_add(1) == Some(snapshots[end].pn)
+                && snapshots[end - 1].len == PAGE_SIZE
+            {
+                end += 1;
             }
+            Self::writeback_snapshot_run(&**backing, &snapshots[first..end])?;
+            first = end;
         }
 
         let mut guard = self.page_cache.lock();
@@ -194,6 +195,43 @@ impl CachedFileShared {
             {
                 current.dirty = false;
             }
+        }
+        Ok(())
+    }
+
+    fn writeback_snapshot_run(
+        backing: &dyn FileNodeOps,
+        pages: &[DirtyPageSnapshot],
+    ) -> VfsResult<()> {
+        let Some(first) = pages.first() else {
+            return Ok(());
+        };
+        let offset = first.pn as u64 * PAGE_SIZE as u64;
+        if pages.len() == 1 {
+            return Self::writeback_bytes(backing, offset, &first.data[..first.len]);
+        }
+
+        let length = pages
+            .iter()
+            .try_fold(0usize, |total, page| total.checked_add(page.len))
+            .ok_or(VfsError::ValueOverflow)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| VfsError::NoMemory)?;
+        for page in pages {
+            data.extend_from_slice(&page.data[..page.len]);
+        }
+        Self::writeback_bytes(backing, offset, &data)
+    }
+
+    fn writeback_bytes(backing: &dyn FileNodeOps, offset: u64, bytes: &[u8]) -> VfsResult<()> {
+        let mut written = 0;
+        while written < bytes.len() {
+            let count = backing.write_at(&bytes[written..], offset + written as u64)?;
+            if count == 0 || count > bytes.len() - written {
+                return Err(VfsError::Io);
+            }
+            written += count;
         }
         Ok(())
     }

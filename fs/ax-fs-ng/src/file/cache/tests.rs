@@ -670,7 +670,7 @@ fn partial_cached_write_reads_backing_without_cache_index_lock() {
 }
 
 #[test]
-fn writeback_does_not_materialize_an_unbounded_contiguous_run() {
+fn writeback_coalesces_contiguous_pages_into_bounded_runs() {
     const PAGE_COUNT: usize = 92;
 
     with_test_page_provider(true, |_| {
@@ -685,8 +685,29 @@ fn writeback_does_not_materialize_an_unbounded_contiguous_run() {
         assert_eq!(state.physical_data, data);
         drop(state);
         let write_lengths = backing.write_lengths();
-        assert_eq!(write_lengths.len(), PAGE_COUNT);
-        assert!(write_lengths.iter().all(|len| *len <= PAGE_SIZE));
+        assert_eq!(write_lengths.len(), PAGE_COUNT.div_ceil(16));
+        assert_eq!(write_lengths[..5], [16 * PAGE_SIZE; 5]);
+        assert_eq!(write_lengths[5], 12 * PAGE_SIZE);
+        assert!(write_lengths.iter().all(|len| *len <= 16 * PAGE_SIZE));
+    });
+}
+
+#[test]
+fn writeback_keeps_noncontiguous_dirty_pages_in_separate_runs() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0; 3 * PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+
+        cached.write_at(&[0x51][..], 0).unwrap();
+        cached
+            .write_at(&[0xa7][..], (2 * PAGE_SIZE) as u64)
+            .unwrap();
+        cached.writeback().unwrap();
+
+        assert_eq!(backing.write_lengths(), vec![PAGE_SIZE, PAGE_SIZE]);
+        let state = backing.state.lock().unwrap();
+        assert_eq!(state.physical_data[0], 0x51);
+        assert_eq!(state.physical_data[2 * PAGE_SIZE], 0xa7);
     });
 }
 
