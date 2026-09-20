@@ -33,7 +33,7 @@ mod inheritance;
 mod inheritance_lifecycle;
 pub mod kprobe;
 #[cfg(target_arch = "aarch64")]
-mod nofault;
+pub(crate) mod nofault;
 #[cfg(target_arch = "aarch64")]
 mod output;
 #[cfg(target_arch = "aarch64")]
@@ -77,7 +77,7 @@ mod task_sideband;
 pub mod tracepoint;
 pub mod uapi;
 #[cfg(target_arch = "aarch64")]
-mod unwind;
+pub(crate) mod unwind;
 pub mod uprobe;
 
 use alloc::{

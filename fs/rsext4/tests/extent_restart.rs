@@ -716,6 +716,67 @@ fn zero_link_legacy_reap_restarts_before_final_inode_transaction() {
     );
 }
 
+#[test]
+fn zero_link_extent_reap_restarts_before_final_inode_transaction() {
+    let mut fixture = build_large_extent_fixture("/extent-reap-restart");
+    let outcome = unlink(
+        &mut fixture.filesystem,
+        &mut fixture.journal,
+        "/extent-reap-restart",
+    )
+    .expect("final unlink must publish the extent-backed orphan");
+    assert_eq!(outcome.inode, fixture.inode_number);
+    assert!(outcome.requires_reap());
+    fixture
+        .filesystem
+        .sync_filesystem(&mut fixture.journal)
+        .expect("orphan fixture sync failed");
+    fixture
+        .journal
+        .flush()
+        .expect("orphan fixture checkpoint failed");
+    install_small_journal(&mut fixture);
+    fixture.power_cut.reset_observation();
+
+    reap_unlinked_inode(
+        &mut fixture.filesystem,
+        &mut fixture.journal,
+        fixture.inode_number,
+    )
+    .expect("zero-link extent reap must restart before its final inode transaction");
+    assert!(
+        fixture.power_cut.commit_writes.get() >= 1,
+        "mapping removal and final inode free must cross a commit boundary"
+    );
+    assert_eq!(fixture.filesystem.superblock.s_last_orphan, 0);
+    assert!(
+        !fixture
+            .filesystem
+            .inode_num_already_allocated(&mut fixture.journal, fixture.inode_number)
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.filesystem.superblock.free_blocks_count(),
+        fixture.free_before
+            + u64::from(fixture.logical_blocks)
+            + fixture.external_blocks.len() as u64
+    );
+    for block in fixture.data_blocks.iter().chain(&fixture.external_blocks) {
+        assert!(!bitmap_block_is_allocated(
+            &mut fixture.filesystem,
+            &mut fixture.journal,
+            *block
+        ));
+    }
+    for block in &fixture.gap_blocks {
+        assert!(bitmap_block_is_allocated(
+            &mut fixture.filesystem,
+            &mut fixture.journal,
+            *block
+        ));
+    }
+}
+
 fn assert_large_extent_removal_restarts(path: &str, operation: ExtentRemovalOperation) {
     let mut fixture = build_large_extent_fixture(path);
     install_small_journal(&mut fixture);

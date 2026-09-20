@@ -152,7 +152,14 @@ impl<T: ?Sized> Mutex<T> {
     /// Locks the mutex, blocking the current task when contended.
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        #[cfg(feature = "profile")]
+        let profile = self
+            .raw
+            .is_locked()
+            .then(|| crate::ProfileScope::new(crate::ProfileEvent::MutexWait, self.raw.addr()));
         self.raw.lock();
+        #[cfg(feature = "profile")]
+        drop(profile);
         MutexGuard::new(self)
     }
 

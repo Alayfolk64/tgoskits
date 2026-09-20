@@ -80,6 +80,9 @@ impl Ext4Disk {
 
 impl BlockIo for Ext4Disk {
     fn write(&mut self, buffer: &[u8], sector: SectorId, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile =
+            ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockWrite, sector.raw() as usize);
         if self.device.is_read_only() {
             return Err(Ext4Error::read_only());
         }
@@ -96,6 +99,9 @@ impl BlockIo for Ext4Disk {
     }
 
     fn read(&mut self, buffer: &mut [u8], sector: SectorId, count: u32) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile =
+            ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockRead, sector.raw() as usize);
         let dev_block = self.device.block_size();
         let required_size = dev_block
             .checked_mul(count as usize)
@@ -118,6 +124,9 @@ impl BlockIo for Ext4Disk {
         if !flags.contains(WriteFlags::FUA) {
             return self.write(buffer, sector, count);
         }
+        #[cfg(feature = "profile")]
+        let _profile =
+            ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockWrite, sector.raw() as usize);
         if self.device.is_read_only() {
             return Err(Ext4Error::read_only());
         }
@@ -152,6 +161,8 @@ impl BlockIo for Ext4Disk {
     }
 
     fn flush(&mut self) -> Ext4Result<()> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(ax_sync::ProfileEvent::BlockFlush, 0);
         if !self.device.supports_flush() {
             return Err(Ext4Error::unsupported_capability("block_io:flush"));
         }

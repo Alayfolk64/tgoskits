@@ -30,6 +30,7 @@ input = ["dep:ax-input", "ax-runtime/input"]
 ipi = ["ax-runtime/ipi"]
 memtrack = ["axbacktrace/alloc", "ax-alloc/tracking"]
 qperf-metrics = ["ax-runtime/qperf-metrics"]
+guest-profile = ["ax-runtime/profile", "ax-fs-ng/profile"]
 # Exposes a debugfs-only synchronization hook used by the real userspace QEMU
 # regression for faultable user copies. Production builds must not enable it.
 uaccess-lock-regression = []

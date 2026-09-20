@@ -8,14 +8,28 @@ use crate::os::sync::{SleepMutex, SleepMutexGuard};
 pub(crate) struct Ext4Guard<'a> {
     cached_writes: &'a Admission,
     inner: SleepMutexGuard<'a, Ext4State>,
+    #[cfg(feature = "profile")]
+    _hold_profile: ax_sync::ProfileScope,
 }
 
 impl<'a> Ext4Guard<'a> {
     pub(super) fn acquire(mutex: &'a SleepMutex<Ext4State>, cached_writes: &'a Admission) -> Self {
+        #[cfg(feature = "profile")]
+        let wait_profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::Ext4LockWait,
+            mutex as *const _ as usize,
+        );
         let inner = mutex.lock();
+        #[cfg(feature = "profile")]
+        drop(wait_profile);
         Self {
             cached_writes,
             inner,
+            #[cfg(feature = "profile")]
+            _hold_profile: ax_sync::ProfileScope::new(
+                ax_sync::ProfileEvent::Ext4LockHold,
+                mutex as *const _ as usize,
+            ),
         }
     }
 }

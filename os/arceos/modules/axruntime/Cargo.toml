@@ -27,6 +27,7 @@ ipi = ["dep:ax-ipi", "ax-hal/ipi"]
 # logical pending state remains in ax-task.
 wake-ipi = ["dep:ax-ipi", "ax-hal/ipi"]
 qperf-metrics = ["ax-task/qperf-metrics"]
+profile = ["ax-sync/profile", "ax-fs-ng?/profile"]
 fp-simd = ["ax-hal/fp-simd"]
 paging = ["ax-hal/paging", "dep:ax-mm"]
 rtc = ["ax-hal/rtc", "ax-driver/rtc"]

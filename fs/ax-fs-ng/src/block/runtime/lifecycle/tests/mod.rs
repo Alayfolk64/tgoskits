@@ -35,7 +35,9 @@ mod publication;
 mod resource_rollback;
 mod teardown;
 
-struct TestDmaOp;
+struct TestDmaOp {
+    allocations: AtomicUsize,
+}
 
 impl DmaOp for TestDmaOp {
     fn page_size(&self) -> usize {
@@ -48,6 +50,7 @@ impl DmaOp for TestDmaOp {
         layout: Layout,
     ) -> Option<DmaAllocHandle> {
         let cpu_addr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        self.allocations.fetch_add(1, Ordering::AcqRel);
         Some(unsafe {
             DmaAllocHandle::new(
                 cpu_addr,
@@ -89,7 +92,9 @@ impl DmaOp for TestDmaOp {
     unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
 }
 
-static TEST_DMA_OP: TestDmaOp = TestDmaOp;
+static TEST_DMA_OP: TestDmaOp = TestDmaOp {
+    allocations: AtomicUsize::new(0),
+};
 
 struct LifecycleQueue {
     log: Arc<StdMutex<Vec<&'static str>>>,

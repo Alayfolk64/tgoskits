@@ -92,7 +92,7 @@ impl PrivateFileBacking {
         if file_offset >= cache.file_len()? {
             return Ok(None);
         }
-        let pin = cache.pin_page_or_insert(page_number)?;
+        let pin = cache.pin_page_for_mapping(page_number)?;
         page_domain
             .reserve_page(cache.mapping_epoch(), page_number, pin)
             .map(Some)

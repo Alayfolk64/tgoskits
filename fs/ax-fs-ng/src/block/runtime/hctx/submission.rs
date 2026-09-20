@@ -88,6 +88,11 @@ pub(super) fn submit_available(
             &mut context.scratch.metadata,
         );
         context.scratch.accepted.ids.clear();
+        #[cfg(feature = "profile")]
+        let dispatch_profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::BlockDispatch,
+            context.state as *const _ as usize,
+        );
         let result =
             queue.submit_batch_owned(&mut context.scratch.requests, &mut context.scratch.accepted);
         let remaining_count_valid = context.scratch.requests.len() <= offered;
@@ -107,6 +112,8 @@ pub(super) fn submit_available(
                 set_hctx_fatal(context.state, context.fatal_error, BlkError::Io);
             }
         }
+        #[cfg(feature = "profile")]
+        drop(dispatch_profile);
 
         let deadline = wall_time().saturating_add(REQUEST_TIMEOUT);
         let ownership_valid = reconcile_submission_batch(

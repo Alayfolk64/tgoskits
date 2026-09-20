@@ -64,6 +64,8 @@ pub mod kernel_mapping;
 mod klib;
 #[cfg(any(feature = "std-compat", target_os = "none"))]
 mod panic_output;
+#[cfg(feature = "profile")]
+pub mod profile;
 mod structured_log;
 
 /// Host-only adapters for testing runtime-owned capability providers.

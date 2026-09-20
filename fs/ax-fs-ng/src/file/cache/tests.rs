@@ -4,7 +4,10 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
-use std::sync::Mutex as StdMutex;
+use std::{
+    sync::{Condvar, Mutex as StdMutex, mpsc},
+    thread,
+};
 
 use axfs_ng_vfs::{
     DeviceId, DirEntry, FileNodeOps, FileRangeOperation, Filesystem, FilesystemOps, Metadata,
@@ -75,6 +78,7 @@ impl FilesystemOps for CacheTestFilesystem {
 struct CacheTestFileState {
     logical_len: usize,
     physical_data: Vec<u8>,
+    read_requests: Vec<(u64, usize)>,
     write_lengths: Vec<usize>,
 }
 
@@ -98,6 +102,7 @@ impl CacheTestFile {
             state: StdMutex::new(CacheTestFileState {
                 logical_len,
                 physical_data,
+                read_requests: Vec::new(),
                 write_lengths: Vec::new(),
             }),
             read_observer: StdMutex::new(None),
@@ -127,6 +132,10 @@ impl CacheTestFile {
 
     fn write_lengths(&self) -> Vec<usize> {
         self.state.lock().unwrap().write_lengths.clone()
+    }
+
+    fn read_requests(&self) -> Vec<(u64, usize)> {
+        self.state.lock().unwrap().read_requests.clone()
     }
 }
 
@@ -196,8 +205,9 @@ impl FileNodeOps for CacheTestFile {
             observer();
         }
         let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let read_len = buf.len().min(state.logical_len.saturating_sub(offset));
+        state.read_requests.push((offset as u64, buf.len()));
         buf[..read_len].fill(0);
         if offset < state.physical_data.len() {
             let physical_len = read_len.min(state.physical_data.len() - offset);
@@ -306,6 +316,18 @@ fn tmpfs_and_ramfs_use_unbounded_page_cache() {
     assert!(!filesystem_uses_unbounded_page_cache("ext4"));
 }
 
+#[test]
+fn disk_cache_does_not_expose_a_per_file_capacity_as_ebusy() {
+    with_test_page_provider(true, |_| {
+        const LEGACY_PER_FILE_PAGE_LIMIT: usize = 512;
+
+        let cached = reopen_cached_file(Arc::new(CacheTestFile::new(Vec::new())));
+        let input = vec![0x5a; (LEGACY_PER_FILE_PAGE_LIMIT + 1) * PAGE_SIZE];
+
+        assert_eq!(cached.write_at(input.as_slice(), 0), Ok(input.len()));
+    });
+}
+
 #[cfg(feature = "vfs")]
 #[test]
 fn filesystem_sync_does_not_visit_another_filesystems_busy_mapping() {
@@ -382,6 +404,79 @@ fn invalidate_clean_pages_detaches_disk_cache_copy() {
         let mut data = vec![0; PAGE_SIZE];
         assert_eq!(cached.read_at(data.as_mut_slice(), 0).unwrap(), PAGE_SIZE);
         assert!(data.iter().all(|byte| *byte == 0x5a));
+    });
+}
+
+#[test]
+fn mmap_faults_grow_bounded_readahead_without_pinning_neighbors() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; 64 * PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+
+        for page in 0..=4 {
+            drop(cached.pin_page_for_mapping(page).unwrap());
+        }
+
+        assert_eq!(
+            backing.read_requests(),
+            vec![(0, 4 * PAGE_SIZE), (4 * PAGE_SIZE as u64, 32 * PAGE_SIZE)]
+        );
+        assert!((0..36).all(|page| cached.is_page_cached(page)));
+        assert!(!cached.is_page_cached(36));
+    });
+}
+
+#[test]
+fn independent_page_loads_run_concurrently_and_same_page_faults_coalesce() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; 2 * PAGE_SIZE]));
+        let cached = Arc::new(reopen_cached_file(backing.clone()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let released = Arc::new((StdMutex::new(false), Condvar::new()));
+        let observer_released = released.clone();
+        backing.set_read_observer(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, ready) = &*observer_released;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+        })));
+
+        let first_file = cached.clone();
+        let first = thread::spawn(move || drop(first_file.pin_page_or_insert(0).unwrap()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first page load did not enter backing I/O");
+        assert!(cached.shared.page_loads.lock().contains_key(&0));
+
+        let duplicate_file = cached.clone();
+        let duplicate = thread::spawn(move || drop(duplicate_file.pin_page_or_insert(0).unwrap()));
+        let independent_file = cached.clone();
+        let independent =
+            thread::spawn(move || drop(independent_file.pin_page_or_insert(1).unwrap()));
+
+        let independent_entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        {
+            let (lock, ready) = &*released;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        first.join().unwrap();
+        duplicate.join().unwrap();
+        independent.join().unwrap();
+
+        assert!(
+            independent_entered,
+            "an unrelated page load remained serialized behind the first backing read"
+        );
+        let mut requests = backing.read_requests();
+        requests.sort_unstable();
+        assert_eq!(
+            requests,
+            vec![(0, PAGE_SIZE), (PAGE_SIZE as u64, PAGE_SIZE)]
+        );
+        assert!(cached.shared.page_loads.lock().is_empty());
     });
 }
 

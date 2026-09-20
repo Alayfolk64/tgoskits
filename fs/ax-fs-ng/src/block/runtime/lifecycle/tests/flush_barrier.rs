@@ -39,6 +39,7 @@ pub(super) fn barrier_test_inner() -> Arc<DeviceInner> {
             teardown_in_progress: false,
             terminal_teardown_error: None,
         }),
+        dma_pool: DmaBufferPool::try_new().unwrap(),
         shutdown_waiters: TaskWaiters::new(),
         member_id: None,
         group_owner: None,

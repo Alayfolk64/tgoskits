@@ -889,6 +889,11 @@ fn drain_latched_irqs(
     for event in events.drain(..) {
         if event.queue_ready {
             let mut unexpected_completion = false;
+            #[cfg(feature = "profile")]
+            let completion_profile = ax_sync::ProfileScope::new(
+                ax_sync::ProfileEvent::BlockCompletionDrain,
+                state as *const _ as usize,
+            );
             let drain_result = {
                 let mut sink = HctxCompletionSink {
                     pending,
@@ -898,6 +903,8 @@ fn drain_latched_irqs(
                 };
                 queue.drain_completions(&mut sink)
             };
+            #[cfg(feature = "profile")]
+            drop(completion_profile);
             if drain_result.is_err() || unexpected_completion {
                 set_hctx_fatal(state, fatal_error, BlkError::Io);
             } else if let Err(error) = refresh_queue_info(queue, state) {

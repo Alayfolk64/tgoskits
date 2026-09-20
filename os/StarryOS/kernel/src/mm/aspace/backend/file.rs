@@ -1044,7 +1044,7 @@ impl MappingExecution for FileBackend {
                 } else {
                     flags - MappingFlags::WRITE
                 };
-                let page_pin = self.0.cache.pin_page_or_insert(page_number)?;
+                let page_pin = self.0.cache.pin_page_for_mapping(page_number)?;
                 let paddr = PhysAddr::from(page_pin.paddr());
                 let page = self.0.get_or_create_page_object(page_number, page_pin)?;
                 let owner = PreparedPteOwner::installed(
@@ -1139,7 +1139,7 @@ impl MappingExecution for FileBackend {
                     } else {
                         flags - MappingFlags::WRITE
                     };
-                    let page_pin = self.0.cache.pin_page_or_insert(pn)?;
+                    let page_pin = self.0.cache.pin_page_for_mapping(pn)?;
                     let paddr = PhysAddr::from(page_pin.paddr());
                     let page_object = self.0.get_or_create_page_object(pn, page_pin)?;
                     page_object.prepare_executable_mapping(paddr, PAGE_SIZE_4K, map_flags);

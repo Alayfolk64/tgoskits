@@ -1933,6 +1933,40 @@ fn unsupported_limit_sysctl_file(fs: &Arc<SimpleFs>, value: &'static str) -> Arc
     )
 }
 
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+struct StarryProfileFile;
+
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+impl DirectRwFsFileOps for StarryProfileFile {
+    fn read_at(&self, output: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let snapshot = crate::profiler::snapshot();
+        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
+        let Some(remaining) = snapshot.as_bytes().get(offset..) else {
+            return Ok(0);
+        };
+        let length = output.len().min(remaining.len());
+        output[..length].copy_from_slice(&remaining[..length]);
+        Ok(length)
+    }
+
+    fn write_at(&self, command: &[u8], offset: u64) -> VfsResult<usize> {
+        if offset != 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        crate::profiler::command(command);
+        Ok(command.len())
+    }
+}
+
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+fn starry_profile_file(fs: &Arc<SimpleFs>) -> Arc<SpecialFsFile<StarryProfileFile>> {
+    SpecialFsFile::new_regular_with_perm(
+        fs.clone(),
+        StarryProfileFile,
+        NodePermission::from_bits_truncate(0o600),
+    )
+}
+
 fn builder(fs: Arc<SimpleFs>, view: PidView) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
@@ -2031,6 +2065,8 @@ fn builder(fs: Arc<SimpleFs>, view: PidView) -> DirMaker {
             Ok(format!("0: {}", ax_runtime::diagnostics::timer_irq_count()))
         }),
     );
+    #[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+    root.add("starry_profile", starry_profile_file(&fs));
 
     root.add("sys", {
         let mut sys = DirMapping::new();

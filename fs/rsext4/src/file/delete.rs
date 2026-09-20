@@ -64,16 +64,28 @@ pub(crate) fn preflight_inode_free<B: BlockIo>(
     Ok(())
 }
 
-fn truncate_legacy_indirect_mapping_before_free<B: BlockIo>(
+fn truncate_inode_mapping_before_free<B: BlockIo>(
     fs: &mut Ext4FileSystem,
     block_dev: &mut Jbd2Dev<B>,
     inode_num: InodeNumber,
     inode: &mut Ext4Inode,
 ) -> Ext4Result<()> {
-    if crate::indirect::has_legacy_indirect_mapping(fs, inode) {
-        crate::file::truncate_inode_for_reap(block_dev, fs, inode_num)?;
-        *inode = fs.get_inode_by_num(block_dev, inode_num)?;
+    let block_size = u32::try_from(fs.superblock.block_size())
+        .map_err(|_| Ext4Error::corrupted().with_operation("orphan:reap_block_size"))?;
+    let huge_file = fs
+        .superblock
+        .has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_HUGE_FILE);
+    if inode.blocks_count(block_size, huge_file) == 0 {
+        return Ok(());
     }
+
+    // Linux evicts page-cache state and truncates every mapped data block
+    // before its small final orphan/xattr/inode transaction. Reuse the same
+    // bounded restart state machine for extent and indirect mappings so a
+    // large unlinked file never has to fit all allocation-group updates in one
+    // journal handle.
+    crate::file::truncate_inode_for_reap(block_dev, fs, inode_num)?;
+    *inode = fs.get_inode_by_num(block_dev, inode_num)?;
     Ok(())
 }
 
@@ -205,7 +217,7 @@ fn free_inode<B: BlockIo>(
     inode_num: InodeNumber,
     inode: &mut Ext4Inode,
 ) -> Ext4Result<()> {
-    truncate_legacy_indirect_mapping_before_free(fs, block_dev, inode_num, inode)?;
+    truncate_inode_mapping_before_free(fs, block_dev, inode_num, inode)?;
     let owned_blocks = inode_owned_blocks(fs, block_dev, inode_num, inode)?;
 
     let updated_inode = fs.apply_inode_dtime(block_dev, inode_num, Ext4DtimeUpdate::SetNow)?;
@@ -247,10 +259,10 @@ pub fn reap_unlinked_inode<B: BlockIo>(
         return Err(Ext4Error::not_found().with_operation("orphan:reap_not_listed"));
     }
     preflight_inode_free(fs, block_dev, inode_num, &inode)?;
-    // Legacy indirect trees may require their own bounded transaction. The
-    // zero-link inode remains durably orphaned across this boundary, so a
-    // crash after mapping removal simply resumes the final reap on mount.
-    truncate_legacy_indirect_mapping_before_free(fs, block_dev, inode_num, &mut inode)?;
+    // Mapping retirement may require several bounded transactions. The
+    // zero-link inode remains durably orphaned across those boundaries, so a
+    // crash after any removal prefix resumes the final reap on mount.
+    truncate_inode_mapping_before_free(fs, block_dev, inode_num, &mut inode)?;
     let external_xattr = read_external_store(block_dev, fs, &inode)?;
     let owned_blocks = inode_owned_blocks(fs, block_dev, inode_num, &mut inode)?;
     let credits = reap_transaction_credits(

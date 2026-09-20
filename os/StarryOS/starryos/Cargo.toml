@@ -26,6 +26,7 @@ qemu = [
 # individual driver feature list at runtime.
 qperf = ["ax-driver/nvme", "ax-driver/virtio-net", "ax-driver/virtio-socket"]
 qperf-metrics = ["starry-kernel/qperf-metrics"]
+guest-profile = ["starry-kernel/guest-profile"]
 smp = ["ax-runtime/smp", "axplat-dyn/smp", "ax-hal/smp", "starry-kernel/ipi"]
 lockdep = ["ax-std/lockdep"]
 

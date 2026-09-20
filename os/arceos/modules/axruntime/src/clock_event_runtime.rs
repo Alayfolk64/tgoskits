@@ -362,6 +362,8 @@ pub(crate) fn next_periodic_deadline(
 }
 pub(crate) fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
     debug_assert!(!ax_cpu::interrupt::irqs_enabled());
+    #[cfg(feature = "profile")]
+    crate::profile::sample(ax_hal::irq::interrupted_context());
     let tick_mode = match ctx.origin {
         ax_hal::irq::IrqOrigin::Kernel => ax_task::runtime::service::SchedulerTickMode::System,
         ax_hal::irq::IrqOrigin::User => ax_task::runtime::service::SchedulerTickMode::User,

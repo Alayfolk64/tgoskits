@@ -1,6 +1,68 @@
 use super::*;
 
 #[test]
+fn sequential_same_size_reads_reuse_dma_backing() {
+    let _registrar_guard = lock_test_irq_registrar();
+    crate::os::task::install_test_runtime_ops();
+    install_dma_op(&TEST_DMA_OP);
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    *TEST_IRQ_REGISTRAR.log.lock().unwrap() = Some(log);
+    *TEST_IRQ_REGISTRAR.action.lock().unwrap() = None;
+    TEST_IRQ_REGISTRAR
+        .fail_registration
+        .store(false, Ordering::Release);
+    set_irq_registrar(&TEST_IRQ_REGISTRAR);
+
+    let counters = Arc::new(BatchingQueueCounters::default());
+    let controller = BatchingReadController {
+        queue: Some(BatchingReadQueue {
+            counters: Arc::clone(&counters),
+            reported_info: batching_queue_info(),
+            next_id: 0,
+            pending: Vec::new(),
+            fail_next_drain: false,
+            probe: None,
+        }),
+    };
+    let irq = IrqId::new(IrqDomainId(1), HwIrq(11));
+    let handle = BlockDeviceHandle::start(RdifBlockDevice::new_with_irqs(
+        "dma-reuse",
+        [BlockIrqSource { source_id: 0, irq }],
+        Box::new(controller),
+    ))
+    .unwrap();
+    let allocations_before = TEST_DMA_OP.allocations.load(Ordering::Acquire);
+
+    for completed in 1..=2 {
+        let reader = Arc::clone(&handle);
+        let read_thread = thread::spawn(move || {
+            let mut buffer = [0; 512];
+            reader.read_blocks(0, &mut buffer)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while counters.submitted.load(Ordering::Acquire) < completed {
+            assert!(
+                Instant::now() < deadline,
+                "read request was not submitted before the deadline"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            TEST_IRQ_REGISTRAR.run_registered_action(),
+            BlockIrqOutcome::Wake
+        );
+        assert!(read_thread.join().unwrap().is_ok());
+    }
+
+    assert_eq!(
+        TEST_DMA_OP.allocations.load(Ordering::Acquire) - allocations_before,
+        1,
+        "the completed buffer should be reused by the second request"
+    );
+    assert_eq!(handle.shutdown(), 1);
+}
+
+#[test]
 fn read_blocks_queues_the_next_bounded_window_before_waiting() {
     let _registrar_guard = lock_test_irq_registrar();
     crate::os::task::install_test_runtime_ops();

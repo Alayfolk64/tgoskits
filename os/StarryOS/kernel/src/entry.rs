@@ -30,6 +30,9 @@ pub fn init(args: &[String], envs: &[String]) {
     static_keys::global_init();
     crate::cgroup::init();
 
+    #[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+    crate::profiler::init();
+
     tracepoint_init().expect("Failed to initialize tracepoints");
 
     crate::ebpf::init_ebpf();

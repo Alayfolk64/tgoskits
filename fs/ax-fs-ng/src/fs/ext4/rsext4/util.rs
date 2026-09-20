@@ -2,6 +2,10 @@ use axfs_ng_vfs::{NodeType, VfsError};
 use rsext4::{DirectoryEntryType, Ext4Error, Ext4ErrorKind};
 
 pub fn into_vfs_err(err: Ext4Error) -> VfsError {
+    #[cfg(feature = "profile")]
+    if matches!(err.kind(), Ext4ErrorKind::Busy | Ext4ErrorKind::NoSpace) {
+        log::error!("ext4 error escaped to VFS: {err}");
+    }
     match err.kind() {
         Ext4ErrorKind::NotFound => VfsError::NotFound,
         Ext4ErrorKind::AlreadyExists => VfsError::AlreadyExists,

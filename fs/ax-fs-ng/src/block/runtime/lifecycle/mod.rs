@@ -30,11 +30,10 @@ use rdif_block::{
     validate_owned_request,
 };
 
-#[cfg(axtest)]
-use super::dma;
 use super::{
     channel::{BoundedChannel, SendError},
     completion::{CompletionGroup, CompletionSubscription},
+    dma::DmaBufferPool,
     hctx::{
         ActivatedHctx, ControllerEventPort, Hctx, HctxIrqToken, HctxObserver, PreparedHctx,
         Submission, request_is_nowait,
@@ -886,6 +885,7 @@ struct DeviceInner {
     admission_wait_hook: IrqMutex<Option<Box<dyn FnOnce() + Send>>>,
     state_notification: Arc<dyn BlockNotification>,
     lifecycle_gate: IrqMutex<LifecycleGateState>,
+    dma_pool: DmaBufferPool,
     shutdown_waiters: TaskWaiters,
     member_id: Option<usize>,
     group_owner: Option<Arc<GroupOwnerLink>>,
@@ -1040,6 +1040,7 @@ impl BlockDeviceHandle {
             irq_latches: IrqMutex::new(Vec::new()),
             terminal_confirmed: AtomicBool::new(false),
         });
+        let dma_pool = DmaBufferPool::try_new()?;
         let inner = Arc::new(DeviceInner {
             name,
             device_info: IrqMutex::new(DeviceInfoEpoch::new(info)),
@@ -1061,6 +1062,7 @@ impl BlockDeviceHandle {
             admission_wait_hook: IrqMutex::new(None),
             state_notification: ops.notification(),
             lifecycle_gate: IrqMutex::new(LifecycleGateState::new()),
+            dma_pool,
             shutdown_waiters: TaskWaiters::new(),
             member_id,
             group_owner,
@@ -1132,7 +1134,10 @@ impl BlockDeviceHandle {
     #[cfg(axtest)]
     pub async fn axtest_read(&self, lba: u64) -> Result<CompletedRequest, BlockError> {
         let info = self.inner.selected_queue_info().ok_or(BlockError::Io)?;
-        let data = dma::prepare_read(info.limits, info.device.logical_block_size)?;
+        let data = self
+            .inner
+            .dma_pool
+            .prepare_read(info.limits, info.device.logical_block_size)?;
         let request = OwnedRequest {
             op: RequestOp::Read,
             lba,
@@ -1203,6 +1208,11 @@ impl BlockDeviceHandle {
         &self,
         requests: OwnedRequestBatch,
     ) -> Result<CompletionGroup, BatchSubmitError> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::BlockAdmission,
+            Arc::as_ptr(&self.inner) as usize,
+        );
         if !self.inner.accepting.load(Ordering::Acquire) {
             return Err(BatchSubmitError::new(BlkError::Io, requests));
         }

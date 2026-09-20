@@ -40,6 +40,8 @@ pub mod kprobe;
 mod mm;
 mod namespace;
 mod perf;
+#[cfg(all(feature = "guest-profile", target_arch = "aarch64"))]
+mod profiler;
 mod pseudofs;
 mod rdrive_osal;
 mod stop_machine;

@@ -90,6 +90,11 @@ impl CompletionSubscription {
     /// Returns an error if the runtime adapter is unavailable or the current
     /// context is not allowed to sleep.
     pub fn recv(self) -> Result<CompletedRequest, BlkError> {
+        #[cfg(feature = "profile")]
+        let _profile = ax_sync::ProfileScope::new(
+            ax_sync::ProfileEvent::BlockCompletionWait,
+            Arc::as_ptr(&self.cell) as usize,
+        );
         let ops =
             runtime_ops().map_err(|_| BlkError::Other("block runtime adapter is not installed"))?;
         if !ops.can_block() {
