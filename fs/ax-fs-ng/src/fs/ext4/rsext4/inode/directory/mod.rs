@@ -256,7 +256,8 @@ impl DirNodeOps for Inode {
                 state.ext4.unlink(self.number(), raw_name)
             }?;
             if outcome.requires_reap() {
-                Ok(state.publish_zero_link(outcome.inode))
+                let access = self.fs().inode_access(outcome.inode);
+                Ok(state.publish_zero_link(outcome.inode, access))
             } else {
                 Ok(None)
             }
@@ -301,7 +302,10 @@ impl DirNodeOps for Inode {
                 )?;
                 Ok(
                     match outcome.replaced.filter(|outcome| outcome.requires_reap()) {
-                        Some(outcome) => state.publish_zero_link(outcome.inode),
+                        Some(outcome) => {
+                            let access = self.fs().inode_access(outcome.inode);
+                            state.publish_zero_link(outcome.inode, access)
+                        }
                         None => None,
                     },
                 )

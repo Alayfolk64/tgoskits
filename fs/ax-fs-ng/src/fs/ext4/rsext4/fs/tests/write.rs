@@ -78,6 +78,7 @@ fn unlink_during_real_data_write_keeps_zero_links_and_the_open_inode() {
     assert_eq!(input.read_at(&mut output, 4096), Ok(12));
     assert_eq!(&output, b"after unlink");
     drop(input);
+    filesystem.reap_pending_inodes().unwrap();
     assert!(!filesystem.lock().has_pending_reaps());
 }
 
@@ -270,7 +271,8 @@ pub(super) fn observe_device_write(sector: u64, bytes: usize) -> BlockResult {
                     .unwrap();
                 assert_eq!(outcome.inode, probe.number);
                 assert!(outcome.requires_reap());
-                assert!(state.publish_zero_link(probe.number).is_none());
+                let access = probe.filesystem.inode_access(probe.number);
+                assert!(state.publish_zero_link(probe.number, access).is_none());
             }
             Interference::IoFailure => result = Err(BlockError::Io),
             Interference::FailProgress => {

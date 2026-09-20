@@ -332,7 +332,8 @@ fn late_inode_drop_leaves_orphan_reclamation_to_the_shutdown_owner() {
             .unlink(root, FileName::new(b"input").unwrap())
             .unwrap();
         assert!(outcome.requires_reap());
-        assert_eq!(state.publish_zero_link(number), None);
+        let access = filesystem.inode_access(number);
+        assert_eq!(state.publish_zero_link(number, access), None);
     }
     filesystem.admission.close_and_drain().unwrap();
     let before = flushes.load(Ordering::Relaxed);

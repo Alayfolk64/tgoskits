@@ -201,13 +201,17 @@ fn mount_test_storage(
 fn zero_link_reap_claim_is_unique_and_retryable() {
     let inode = InodeNumber::new(42).unwrap();
     let mut tracker = InodeLifetimeTracker::default();
-    tracker.inc_ref(inode);
-    tracker.inc_ref(inode);
+    let access = Arc::new(AccessGate::new());
+    access.retain_lifetime();
+    access.retain_lifetime();
 
-    assert_eq!(tracker.publish_zero_link(inode), None);
-    assert_eq!(tracker.release_ref(inode), None);
+    assert_eq!(tracker.publish_zero_link(inode, access.clone()), None);
+    assert!(access.is_zero_link());
+    assert!(!access.release_lifetime());
+    assert_eq!(tracker.claim_pending_reap(), None);
+    assert!(access.release_lifetime());
     let claim = tracker
-        .release_ref(inode)
+        .claim_pending_reap()
         .expect("last ref must claim reap");
     assert_eq!(tracker.claim_if_ready(inode), None);
 
@@ -216,6 +220,25 @@ fn zero_link_reap_claim_is_unique_and_retryable() {
         .claim_pending_reap()
         .expect("failed reap must remain retryable");
     tracker.finish_reap(retry, true);
+    assert!(!access.is_zero_link());
+    assert!(!tracker.has_pending_reaps());
+}
+
+#[test]
+fn zero_link_publish_claims_reap_if_the_last_owner_won_the_race() {
+    let inode = InodeNumber::new(42).unwrap();
+    let mut tracker = InodeLifetimeTracker::default();
+    let access = Arc::new(AccessGate::new());
+    access.retain_lifetime();
+
+    assert!(!access.release_lifetime());
+    let claim = tracker
+        .publish_zero_link(inode, access.clone())
+        .expect("zero-link publication must observe the released owner");
+    assert!(access.is_zero_link());
+
+    tracker.finish_reap(claim, true);
+    assert!(!access.is_zero_link());
     assert!(!tracker.has_pending_reaps());
 }
 

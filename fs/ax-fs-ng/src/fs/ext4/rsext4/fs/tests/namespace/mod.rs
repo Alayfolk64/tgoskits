@@ -114,9 +114,10 @@ fn unlink_and_rmdir_staging_release_both_namespace_scopes() {
         assert_eq!(root.lookup("victim").unwrap_err(), VfsError::NotFound);
         assert_eq!(victim.metadata().unwrap().nlink, 0);
         let number = InodeNumber::new(victim.inode().try_into().unwrap()).unwrap();
-        assert!(filesystem.lock().lifetimes.zero_link.contains(&number));
+        assert!(filesystem.lock().lifetimes.zero_link.contains_key(&number));
         drop(victim);
-        assert!(!filesystem.lock().lifetimes.zero_link.contains(&number));
+        filesystem.reap_pending_inodes().unwrap();
+        assert!(!filesystem.lock().lifetimes.zero_link.contains_key(&number));
         assert_admission_released(&filesystem);
     }
 }

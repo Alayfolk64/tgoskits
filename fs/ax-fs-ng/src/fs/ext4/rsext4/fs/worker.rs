@@ -62,6 +62,10 @@ impl MountWorker {
 
     pub(super) fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
+        self.notify();
+    }
+
+    pub(super) fn notify(&self) {
         let notification = self.notification.lock().clone();
         if let Some(notification) = notification {
             notification.notify();

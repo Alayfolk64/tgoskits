@@ -1,5 +1,7 @@
 //! Allocation references exist independently of VFS wrapper publication.
 
+use std::{sync::mpsc, thread, time::Duration};
+
 use rsext4::{FileName, FilePermissions, MutationContext};
 
 use super::*;
@@ -35,7 +37,8 @@ fn unwrapped_inode_reference_prevents_reap_until_the_last_owner_is_dropped() {
             .unlink(root, FileName::new(b"pending-publication").unwrap())
             .unwrap();
         assert!(outcome.requires_reap());
-        assert_eq!(state.publish_zero_link(number), None);
+        let access = filesystem.inode_access(number);
+        assert_eq!(state.publish_zero_link(number, access), None);
         assert!(state.claim_pending_reap().is_none());
     }
 
@@ -44,6 +47,7 @@ fn unwrapped_inode_reference_prevents_reap_until_the_last_owner_is_dropped() {
     assert!(filesystem.lock().claim_pending_reap().is_none());
     assert_eq!(second.metadata().unwrap().links, 0);
     drop(second);
+    filesystem.sync_to_disk().unwrap();
 
     let mut state = filesystem.lock();
     assert!(!state.has_pending_reaps());
@@ -63,9 +67,39 @@ fn moving_an_allocation_reference_into_a_wrapper_does_not_register_it_twice() {
         state.retain_inode(&filesystem, root)
     };
     let number = lifetime.number();
-    assert_eq!(filesystem.lock().lifetimes.live_refs.get(&number), Some(&1));
+    let access = lifetime.content_access().clone();
+    assert_eq!(access.lifetime_refs(), 1);
     let inode = Inode::new(lifetime, None);
-    assert_eq!(filesystem.lock().lifetimes.live_refs.get(&number), Some(&1));
+    assert_eq!(access.lifetime_refs(), 1);
     drop(inode);
-    assert!(!filesystem.lock().lifetimes.live_refs.contains_key(&number));
+    assert_eq!(access.lifetime_refs(), 0);
+    assert_eq!(number, filesystem.lock().ext4.root_inode());
+}
+
+#[test]
+fn dropping_an_inode_lifetime_never_waits_for_mount_state() {
+    let (filesystem, _) = test_filesystem(false);
+    let filesystem = Arc::new(filesystem);
+    let lifetime = {
+        let mut state = filesystem.lock();
+        let root = state.ext4.root_inode();
+        state.retain_inode(&filesystem, root)
+    };
+
+    let state = filesystem.lock();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let dropper = thread::spawn(move || {
+        drop(lifetime);
+        completed_tx.send(()).unwrap();
+    });
+    let completed_without_mount_state = completed_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    drop(state);
+    dropper.join().unwrap();
+
+    assert!(
+        completed_without_mount_state,
+        "inode lifetime drop waited for the ext4 mount-state mutex"
+    );
 }

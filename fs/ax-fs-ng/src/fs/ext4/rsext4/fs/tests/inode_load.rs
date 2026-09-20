@@ -55,10 +55,11 @@ fn unlink_during_cold_metadata_io_cannot_reap_the_live_inode() {
 
     assert_read_observed();
     assert!(filesystem.lock().claim_pending_reap().is_none());
-    // The independent read is complete. Final reference release below runs
-    // the existing serialized reap writer, not the cold read being observed.
+    // The independent read is complete. Final reference release below wakes
+    // the deferred serialized reap writer, not the cold read being observed.
     drop(probe);
     drop(input);
+    filesystem.reap_pending_inodes().unwrap();
     assert!(!filesystem.lock().has_pending_reaps());
 }
 
@@ -100,9 +101,10 @@ fn child_lookup_keeps_its_reference_across_cold_metadata_io_and_unlink() {
     assert_eq!(located.lifetime.metadata().unwrap().links, 0);
     drop(input);
     assert!(filesystem.lock().claim_pending_reap().is_none());
-    // Stop observing reads before the final owner triggers the reap writer.
+    // Stop observing reads before the final owner wakes the reap writer.
     drop(probe);
     drop(located);
+    filesystem.reap_pending_inodes().unwrap();
     assert!(!filesystem.lock().has_pending_reaps());
 }
 
@@ -316,15 +318,7 @@ pub(super) fn observe_read() -> BlockResult {
         // guard released; an inline writer before that point would deadlock the
         // test itself instead of representing a schedulable concurrent task.
         if probe.interference == ReadInterference::UnlinkAfterChildRetention
-            && probe
-                .filesystem
-                .lock()
-                .lifetimes
-                .live_refs
-                .get(&probe.number)
-                .copied()
-                .unwrap_or(0)
-                >= 2
+            && probe.filesystem.inode_access(probe.number).lifetime_refs() >= 2
         {
             probe.interference = ReadInterference::Unlink;
         }
@@ -343,7 +337,8 @@ pub(super) fn observe_read() -> BlockResult {
                 .unwrap();
             assert_eq!(outcome.inode, probe.number);
             assert!(outcome.requires_reap());
-            assert!(state.publish_zero_link(probe.number).is_none());
+            let access = probe.filesystem.inode_access(probe.number);
+            assert!(state.publish_zero_link(probe.number, access).is_none());
         }
         if probe.interference == ReadInterference::IoFailure {
             Err(BlockError::Io)

@@ -56,6 +56,12 @@ impl Writeback {
     pub(super) fn stop(&self) {
         self.task.stop();
     }
+
+    pub(super) fn notify(&self) {
+        if self.enabled {
+            self.task.notify();
+        }
+    }
 }
 
 impl Ext4Filesystem {
@@ -116,6 +122,9 @@ impl Ext4Filesystem {
     }
 
     pub(crate) fn sync_to_disk(&self) -> VfsResult<()> {
+        // Synchronous mounts have no worker to consume the last-reference
+        // notification. Explicit sync is their normal deferred-reap owner.
+        self.reap_pending_inodes()?;
         let _operation = self.admission.enter().map_err(into_vfs_err)?;
         self.sync_core(CheckpointPolicy::LogPressure)
             .map_err(into_vfs_err)
@@ -279,6 +288,7 @@ impl Ext4Filesystem {
     /// Flush a finite set of cached files before sealing their metadata. Page
     /// writes can request journal progress, so they must run outside `gate`.
     pub(super) fn periodic_writeback(&self) -> VfsResult<()> {
+        self.reap_pending_inodes()?;
         let pages = crate::file::writeback_filesystem_pages(self);
 
         // A failed page write can still have completed a valid prefix. Commit

@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn linked_last_lifetime_release_does_not_request_orphan_reap() {
+    let gate = AccessGate::new();
+    gate.retain_lifetime();
+
+    assert!(!gate.release_lifetime());
+    assert_eq!(gate.lifetime_refs(), 0);
+}
+
+#[test]
+fn unlinked_last_lifetime_release_requests_orphan_reap() {
+    let gate = AccessGate::new();
+    gate.retain_lifetime();
+    gate.publish_zero_link();
+
+    assert!(gate.release_lifetime());
+    assert_eq!(gate.lifetime_refs(), 0);
+}
+
+#[test]
 fn independent_readers_share_ownership_until_the_last_release() {
     let gate = Arc::new(AccessGate::new());
     let first = gate.read().unwrap();

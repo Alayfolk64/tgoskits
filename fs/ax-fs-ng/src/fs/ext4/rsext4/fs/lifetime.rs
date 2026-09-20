@@ -11,8 +11,8 @@ use super::{AccessGate, Ext4Filesystem, Ext4State, into_vfs_err, namespace::Name
 /// exist before its VFS wrapper: an independent metadata read must not rely on
 /// a bare inode number while unlink/reap can run on another task.
 ///
-/// Drop outside the mount lock. Release may claim the final orphan and perform
-/// sleepable reap; the mount's existing admission and retry rules still apply.
+/// Drop outside the mount lock. Release only updates the atomic owner count;
+/// the sleepable writeback owner performs any final orphan reap.
 pub(crate) struct InodeLifetime {
     filesystem: Arc<Ext4Filesystem>,
     number: InodeNumber,
@@ -30,7 +30,7 @@ impl Ext4State {
     /// The lifetime tracker is the existing authority for that publication;
     /// do not reload inode tables or create another parent-version registry.
     pub(crate) fn ensure_linked_parent(&self, number: InodeNumber) -> rsext4::Ext4Result<()> {
-        if self.lifetimes.zero_link.contains(&number) {
+        if self.lifetimes.zero_link.contains_key(&number) {
             Err(rsext4::Ext4Error::not_found().with_operation("namespace:removed_parent"))
         } else {
             Ok(())
@@ -47,7 +47,7 @@ impl Ext4State {
         number: InodeNumber,
     ) -> InodeLifetime {
         let access = filesystem.inode_access(number);
-        self.lifetimes.inc_ref(number);
+        access.retain_lifetime();
         InodeLifetime {
             filesystem: filesystem.clone(),
             number,
@@ -135,11 +135,11 @@ impl InodeLifetime {
 
 impl Drop for InodeLifetime {
     fn drop(&mut self) {
-        let claim = self.filesystem.lock().release_ref(self.number);
-        if let Some(claim) = claim
-            && let Err(error) = self.filesystem.reap(claim)
-        {
-            log::error!("failed to reap zero-link ext4 inode: {error:?}");
+        // Linux drops `i_count` atomically and leaves final orphan eviction to
+        // a sleepable owner. Arc destruction may run while a non-sleeping VFS
+        // or MM guard is held, so it must never wait for mount state here.
+        if self.access.release_lifetime() {
+            self.filesystem.writeback.notify();
         }
     }
 }

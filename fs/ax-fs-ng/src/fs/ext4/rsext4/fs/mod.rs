@@ -46,64 +46,45 @@ pub(crate) struct ReapClaim(InodeNumber);
 
 #[derive(Default)]
 struct InodeLifetimeTracker {
-    live_refs: BTreeMap<InodeNumber, usize>,
-    zero_link: BTreeSet<InodeNumber>,
+    zero_link: BTreeMap<InodeNumber, Arc<AccessGate>>,
     reaping: BTreeSet<InodeNumber>,
 }
 
 impl InodeLifetimeTracker {
-    fn inc_ref(&mut self, inode: InodeNumber) {
-        self.live_refs
-            .entry(inode)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-    }
-
     fn claim_if_ready(&mut self, inode: InodeNumber) -> Option<ReapClaim> {
-        (!self.live_refs.contains_key(&inode)
-            && self.zero_link.contains(&inode)
+        (self
+            .zero_link
+            .get(&inode)
+            .is_some_and(|access| access.lifetime_refs() == 0)
             && self.reaping.insert(inode))
         .then_some(ReapClaim(inode))
     }
 
-    fn publish_zero_link(&mut self, inode: InodeNumber) -> Option<ReapClaim> {
-        self.zero_link.insert(inode);
+    fn publish_zero_link(
+        &mut self,
+        inode: InodeNumber,
+        access: Arc<AccessGate>,
+    ) -> Option<ReapClaim> {
+        access.publish_zero_link();
+        self.zero_link.insert(inode, access);
         self.claim_if_ready(inode)
-    }
-
-    fn release_ref(&mut self, inode: InodeNumber) -> Option<ReapClaim> {
-        use alloc::collections::btree_map::Entry;
-
-        let became_unreferenced = match self.live_refs.entry(inode) {
-            Entry::Occupied(mut entry) => {
-                let count = entry.get_mut();
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    entry.remove();
-                    true
-                } else {
-                    false
-                }
-            }
-            Entry::Vacant(_) => false,
-        };
-        became_unreferenced
-            .then(|| self.claim_if_ready(inode))
-            .flatten()
     }
 
     fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) {
         self.reaping.remove(&claim.0);
         if succeeded {
-            self.zero_link.remove(&claim.0);
+            let access = self
+                .zero_link
+                .remove(&claim.0)
+                .expect("successful inode reap must retain its access gate");
+            access.clear_zero_link();
         }
     }
 
     fn claim_pending_reap(&mut self) -> Option<ReapClaim> {
-        let inode =
-            self.zero_link.iter().copied().find(|inode| {
-                !self.live_refs.contains_key(inode) && !self.reaping.contains(inode)
-            })?;
+        let inode = self.zero_link.iter().find_map(|(inode, access)| {
+            (access.lifetime_refs() == 0 && !self.reaping.contains(inode)).then_some(*inode)
+        })?;
         self.reaping.insert(inode);
         Some(ReapClaim(inode))
     }
@@ -128,12 +109,12 @@ impl Ext4State {
         self.ext4.unmount().map_err(into_vfs_err)
     }
 
-    pub(crate) fn release_ref(&mut self, ino: InodeNumber) -> Option<ReapClaim> {
-        self.lifetimes.release_ref(ino)
-    }
-
-    pub(crate) fn publish_zero_link(&mut self, ino: InodeNumber) -> Option<ReapClaim> {
-        self.lifetimes.publish_zero_link(ino)
+    pub(crate) fn publish_zero_link(
+        &mut self,
+        ino: InodeNumber,
+        access: Arc<AccessGate>,
+    ) -> Option<ReapClaim> {
+        self.lifetimes.publish_zero_link(ino, access)
     }
 
     fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) {
@@ -315,6 +296,21 @@ impl Ext4Filesystem {
             }
         };
         self.reap_admitted(claim)
+    }
+
+    /// Reaps every unlinked inode whose last allocation owner was released.
+    ///
+    /// Lifetime drops only publish an atomic zero transition. This sleepable
+    /// worker boundary performs the journal and block operations, matching
+    /// Linux's separation between `i_count` release and deferred eviction.
+    pub(super) fn reap_pending_inodes(&self) -> VfsResult<()> {
+        loop {
+            let claim = self.lock().claim_pending_reap();
+            let Some(claim) = claim else {
+                return Ok(());
+            };
+            self.reap(claim)?;
+        }
     }
 
     /// Called with operation admission or by the exclusive shutdown owner.
