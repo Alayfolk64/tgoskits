@@ -19,6 +19,13 @@ The users of this feature are the `ax-fs-ng` ext4 and FAT adapters, `rsext4`
 metadata and journal paths, allocator reclaim, filesystem shutdown, and the
 StarryOS durability syscalls that reach these layers.
 
+A follow-up concurrency audit found that the original implementation held one
+sleepable `BlockAddressSpace` lock across cache lookup and synchronous device
+I/O. Independent filesystem workers therefore could not submit unrelated
+folios to a multi-queue device concurrently. The cache now partitions folio
+indices into independent lock domains while retaining one explicit durability
+admission barrier for direct I/O and flush.
+
 ## Success Criteria
 
 - Every live filesystem consumer of one runtime block-device handle resolves
@@ -33,6 +40,9 @@ StarryOS durability syscalls that reach these layers.
   trees without extending device lifetime indefinitely.
 - Allocation, geometry, registry, writeback, and device failures remain typed
   and observable at kernel boundaries.
+- One-folio requests to independent cache domains can enter separate device
+  endpoints concurrently; a queued durability barrier drains earlier requests
+  and prevents later requests from overtaking it.
 - Deterministic host tests cover shared views, partition offsets, partial I/O
   failure, writeback retry, reclaim, registry teardown, and journal re-editing;
   the block benchmark verifies content across independent file descriptors.
@@ -94,11 +104,15 @@ The design is compared against Linux v7.1 commit
 - [`block/fops.c`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/block/fops.c)
   supplies the aggregate direct-I/O rule that submitted work reaches terminal
   completion before the synchronous caller returns.
+- [blk-mq](https://docs.kernel.org/block/blk-mq.html) supplies the scalability
+  rule that independent submitters must not converge on one global request
+  lock before reaching the hardware queues.
 
 TGOSKits borrows these ownership and coherence rules, not Linux's background
 flusher implementation. The current block boundary is synchronous and has no
-observable writeback state, so each device uses one sleepable tree lock and
-per-operation synchronous writeback.
+observable writeback state, so each device uses sharded sleepable cache locks,
+per-operation synchronous writeback, and a shared/exclusive admission barrier
+for durability ordering.
 
 Linux `sync(2)` iterates every superblock before syncing block devices. StarryOS
 currently syncs only its root filesystem metadata before the new device-wide
@@ -183,7 +197,8 @@ The registry is keyed by the allocation identity of a live
 `BlockDeviceHandle`. A live `BlockCacheShared` owns:
 
 - a weakly registered identity entry;
-- one bounded `BlockAddressSpace`;
+- 64 bounded `BlockAddressSpace` shards forming one coherent device cache;
+- one shared/exclusive I/O admission barrier;
 - one equivalent endpoint for global writeback;
 - an atomic count of filesystem wrappers, excluding temporary global-sync
   references.
@@ -196,18 +211,30 @@ creation and global sync prune stale entries. Drop and allocator reclaim use
 nonblocking registry/tree acquisition so they do not introduce a destructor or
 memory-pressure lock inversion.
 
-The lock order is registry before tree when both are required. Device I/O is
-never issued while holding the registry lock. One sleepable tree lock
-serializes cached state with direct requests across wrappers of the same
-device. The endpoint lock is used only by global writeback.
+The lock order is registry, endpoint, I/O admission, then cache shard when
+those boundaries are combined. Device I/O is never issued while holding the
+registry lock. One-folio operations take shared admission and exactly one
+shard; their shard lock remains held through the synchronous endpoint call so
+the folio cannot change underneath that I/O. Direct multi-folio requests and
+flush take exclusive admission, which first drains admitted one-folio work and
+then visits the affected shards without holding more than one shard lock at a
+time. The endpoint lock is used only by global writeback. Allocator reclaim
+try-enters shared admission and only try-locks one shard at a time; it skips a
+queued or active durability writer instead of waiting. It can discard clean
+cache state but cannot issue I/O.
 
 ## Cache State and Resource Bound
 
-One folio is 4 KiB or one device block, whichever is larger. Each device tree
-contains at most 1024 folios: 4 MiB for 512-byte or 4-KiB devices. Each folio
-has per-block uptodate and dirty state, while an ordered frame index records
-which folios need writeback. The fixed-capacity LRU allocates a replacement
-before evicting an existing entry so allocation failure preserves prior state.
+One folio is 4 KiB or one device block, whichever is larger. Each device cache
+contains at most 1024 folios: 4 MiB for 512-byte or 4-KiB devices. The frame
+index selects one of 64 shards; sequential folios spread across the shards and
+each shard owns 16 entries. Each folio has per-block uptodate and dirty state,
+while a per-shard ordered frame index records which folios need writeback. The
+fixed-capacity LRUs allocate a replacement before evicting an existing entry
+so allocation failure preserves prior state. A stride that repeatedly selects
+one shard receives that shard's bounded capacity rather than borrowing idle
+entries from another shard; this is an accepted tradeoff for independent I/O
+locks without an allocating global capacity coordinator.
 
 Clean folios can be reclaimed without I/O. A dirty eviction first writes its
 dirty runs; a failed write leaves the folio dirty and retryable. Global sync
@@ -222,12 +249,21 @@ A request contained within one folio reads only missing slots. Writes update
 folio bytes, set per-slot dirty state, and defer device I/O until writeback,
 eviction, explicit flush, global sync, or last-consumer teardown.
 
+These requests enter the durability barrier in shared mode and then lock only
+the selected shard. Different shards and distinct device endpoints can run in
+parallel. A queued exclusive operation has preference over new shared
+admissions, preventing a sustained request stream from starving `flush()`.
+
 ### Direct reads
 
 Before a multi-folio read, overlapping dirty slots are written to the device.
 The direct read then runs against current device contents and overlays only
 clean cached slots; newer dirty slots remain authoritative if the policy is
 extended to permit them.
+
+Direct reads hold exclusive admission from the dirty-range writeback through
+the final cache overlay. No buffered request can observe or publish an
+intermediate device/cache image.
 
 ### Direct writes
 
@@ -236,6 +272,9 @@ successful direct write overlays its bytes onto every already-cached folio. If
 the device reports an error, its successfully written prefix is unknown, so
 the cache discards every overlapping folio. The next buffered read must fetch
 the device's observable contents again.
+
+Direct writes and FUA writes likewise hold exclusive admission through range
+writeback, device completion, and cache overlay or invalidation.
 
 The synchronous runtime must drain every submission window already handed to
 hardware before returning the first write error. It stops submitting new
@@ -254,6 +293,12 @@ Cache `flush()` performs dirty writeback before the device barrier. Therefore
 the existing sequence remains descriptor/data write, barrier, commit-record
 write, barrier. A writeback failure preserves dirty ownership and prevents the
 later barrier or commit stage from being reported as successful.
+
+Flush takes exclusive admission before scanning dirty shards. All previously
+admitted operations have completed, and writer preference prevents a later
+buffered mutation from entering until the device barrier has returned. No
+sleepable cache lock is held merely while waiting for earlier operations to
+drain.
 
 StarryOS `sync(2)` attempts page-cache, root-filesystem, and device-cache
 stages even after an earlier error. Matching Linux, it logs writeback failures
@@ -297,6 +342,8 @@ and durability tests named here.
 Deterministic host tests must cover:
 
 - repeated reads and partial-folio slot state;
+- concurrent reads of independent folios reaching separate endpoints, plus
+  writer-preferred drain and resumption at the durability barrier;
 - deferred writes, merged writeback, eviction, retry, and barrier ordering;
 - shared wrappers and physically distinct partition offsets;
 - direct-read/write coherence and a direct write that commits a prefix before

@@ -278,6 +278,7 @@ mod tests {
             512
         }
 
+        #[cfg(feature = "ext4")]
         fn is_read_only(&self) -> bool {
             false
         }

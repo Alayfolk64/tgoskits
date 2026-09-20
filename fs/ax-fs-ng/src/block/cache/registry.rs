@@ -27,7 +27,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use ax_lazyinit::LazyLock;
 
 #[cfg(feature = "vfs")]
-use super::address_space::BlockAddressSpace;
+use super::device::BlockCacheState;
 use super::{address_space::FolioGeometry, device::BlockCacheShared};
 use crate::{BlockError, BlockResult, block::FsBlockDevice, os::sync::SleepMutex};
 
@@ -35,12 +35,12 @@ struct DeviceCacheEntry {
     device_key: usize,
     cache: Weak<BlockCacheShared>,
     #[cfg(feature = "vfs")]
-    reclaim: Weak<SleepMutex<BlockAddressSpace>>,
+    reclaim: Weak<BlockCacheState>,
 }
 
 impl DeviceCacheEntry {
     #[cfg(feature = "vfs")]
-    fn reclaim_tree(&self) -> Option<Arc<SleepMutex<BlockAddressSpace>>> {
+    fn reclaim_tree(&self) -> Option<Arc<BlockCacheState>> {
         self.reclaim.upgrade()
     }
 }
@@ -68,8 +68,8 @@ pub(crate) fn shared_cache_for(
     endpoint: Box<dyn FsBlockDevice>,
 ) -> BlockResult<Arc<BlockCacheShared>> {
     let geometry = FolioGeometry::new(block_size)?;
-    // Lock order: registry first, then the device tree lock. No path takes
-    // them in the opposite order.
+    // Cache construction publishes only weak state while holding the
+    // registry. No cache shard, endpoint, or I/O admission is acquired here.
     let mut registry = BLOCK_CACHE_REGISTRY.lock();
     prune_stale_entries(&mut registry);
     let stale_index = if let Some(index) = registry
@@ -198,9 +198,7 @@ pub(crate) fn reclaim_clean_folios(num_folios: usize) -> usize {
         let Some(shared) = try_live_tree(index) else {
             continue;
         };
-        if let Some(mut state) = shared.try_lock() {
-            reclaimed += state.reclaim_clean_folios(num_folios - reclaimed);
-        }
+        reclaimed += shared.reclaim_clean_folios(num_folios - reclaimed);
     }
     reclaimed
 }
@@ -211,7 +209,7 @@ pub(crate) fn reclaim_clean_folios(num_folios: usize) -> usize {
 /// removed or contended entry is skipped; the returned strong reference is
 /// dropped only after the registry guard has gone out of scope.
 #[cfg(feature = "vfs")]
-fn try_live_tree(index: usize) -> Option<Arc<SleepMutex<BlockAddressSpace>>> {
+fn try_live_tree(index: usize) -> Option<Arc<BlockCacheState>> {
     let registry = BLOCK_CACHE_REGISTRY.try_lock()?;
     registry.get(index)?.reclaim_tree()
 }

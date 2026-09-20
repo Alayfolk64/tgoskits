@@ -66,7 +66,7 @@ impl FolioGeometry {
         self.slots
     }
 
-    fn frame_of(&self, block: u64) -> u64 {
+    pub(crate) fn frame_of(&self, block: u64) -> u64 {
         block >> self.slots_log2
     }
 
@@ -102,10 +102,6 @@ pub(crate) struct BlockAddressSpace {
 }
 
 impl BlockAddressSpace {
-    pub(crate) fn new(geometry: FolioGeometry) -> Self {
-        Self::with_capacity(geometry, BLOCK_CACHE_FOLIO_CAP)
-    }
-
     /// Builds a tree with an explicit frame capacity (used by tests to
     /// exercise LRU eviction deterministically).
     pub(crate) fn with_capacity(geometry: FolioGeometry, capacity: usize) -> Self {
@@ -115,10 +111,6 @@ impl BlockAddressSpace {
             folios: FolioCache::new(capacity),
             dirty_frames: Vec::new(),
         }
-    }
-
-    pub(crate) fn geometry(&self) -> FolioGeometry {
-        self.geometry
     }
 
     pub(crate) fn has_dirty(&self) -> bool {

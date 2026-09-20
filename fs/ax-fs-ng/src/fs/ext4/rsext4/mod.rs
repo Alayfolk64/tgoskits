@@ -12,7 +12,10 @@ use rsext4::{
     error::{Ext4Error, Ext4Result},
 };
 
-use crate::block::{BlockRegion, FsBlockDevice, RegionBlockDevice};
+use crate::{
+    BlockError,
+    block::{BlockRegion, FsBlockDevice, RegionBlockDevice},
+};
 
 pub(crate) struct Ext4Disk {
     device: RegionBlockDevice<Box<dyn FsBlockDevice>>,
@@ -78,6 +81,32 @@ impl Ext4Disk {
     }
 }
 
+fn block_error_to_ext4(error: BlockError) -> Ext4Error {
+    match error {
+        BlockError::InvalidRequest => Ext4Error::invalid_input(),
+        BlockError::WouldBlock | BlockError::ResourceBusy => Ext4Error::busy(),
+        BlockError::NoMemory => Ext4Error::no_memory(),
+        BlockError::Unsupported | BlockError::RuntimeUnavailable => {
+            Ext4Error::unsupported_capability("runtime:block_io")
+        }
+        BlockError::TimedOut => Ext4Error::timeout(),
+        BlockError::InvalidState
+        | BlockError::Io
+        | BlockError::NotFound
+        | BlockError::Irq(_)
+        | BlockError::Device { .. } => Ext4Error::io(),
+    }
+}
+
+fn fork_block_error_to_ext4(error: BlockError) -> Ext4Error {
+    match error {
+        BlockError::Unsupported => {
+            Ext4Error::unsupported_capability("runtime:independent_block_io")
+        }
+        error => block_error_to_ext4(error),
+    }
+}
+
 impl BlockIo for Ext4Disk {
     fn write(&mut self, buffer: &[u8], sector: SectorId, count: u32) -> Ext4Result<()> {
         #[cfg(feature = "profile")]
@@ -95,7 +124,7 @@ impl BlockIo for Ext4Disk {
         }
         self.device
             .write_block(sector.raw(), &buffer[..required_size])
-            .map_err(|_| Ext4Error::io())
+            .map_err(block_error_to_ext4)
     }
 
     fn read(&mut self, buffer: &mut [u8], sector: SectorId, count: u32) -> Ext4Result<()> {
@@ -111,7 +140,7 @@ impl BlockIo for Ext4Disk {
         }
         self.device
             .read_block(sector.raw(), &mut buffer[..required_size])
-            .map_err(|_| Ext4Error::io())
+            .map_err(block_error_to_ext4)
     }
 
     fn write_with_flags(
@@ -142,7 +171,7 @@ impl BlockIo for Ext4Disk {
         }
         self.device
             .write_block_fua(sector.raw(), &buffer[..required_size])
-            .map_err(|_| Ext4Error::io())
+            .map_err(block_error_to_ext4)
     }
 
     fn geometry(&self) -> DeviceGeometry {
@@ -166,7 +195,7 @@ impl BlockIo for Ext4Disk {
         if !self.device.supports_flush() {
             return Err(Ext4Error::unsupported_capability("block_io:flush"));
         }
-        self.device.flush().map_err(|_| Ext4Error::io())
+        self.device.flush().map_err(block_error_to_ext4)
     }
 
     fn barrier(&mut self) -> Ext4Result<()> {
@@ -187,13 +216,10 @@ impl rsext4::Clock for Ext4Clock {
 
 impl rsext4::ForkBlockIo for Ext4Disk {
     fn fork_io(&self) -> Ext4Result<Self> {
-        let device = self.device.fork_region().map_err(|error| match error {
-            crate::BlockError::Unsupported => {
-                Ext4Error::unsupported_capability("runtime:independent_block_io")
-            }
-            crate::BlockError::NoMemory => Ext4Error::no_memory(),
-            _ => Ext4Error::io(),
-        })?;
+        let device = self
+            .device
+            .fork_region()
+            .map_err(fork_block_error_to_ext4)?;
         Ok(Self {
             device,
             geometry: self.geometry,
@@ -210,6 +236,22 @@ mod tests {
 
     use super::*;
     use crate::BlockResult;
+
+    #[test]
+    fn block_errors_keep_retry_and_resource_categories() {
+        let cases = [
+            (BlockError::InvalidRequest, Ext4ErrorKind::InvalidInput),
+            (BlockError::WouldBlock, Ext4ErrorKind::Busy),
+            (BlockError::ResourceBusy, Ext4ErrorKind::Busy),
+            (BlockError::NoMemory, Ext4ErrorKind::NoMemory),
+            (BlockError::TimedOut, Ext4ErrorKind::Timeout),
+            (BlockError::Io, Ext4ErrorKind::Io),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(block_error_to_ext4(source).kind(), expected);
+        }
+    }
 
     struct CapabilityDevice {
         read_only: bool,

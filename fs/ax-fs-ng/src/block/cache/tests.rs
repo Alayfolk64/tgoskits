@@ -6,7 +6,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -112,6 +112,74 @@ impl FsBlockDevice for ShutdownTrackedDevice {
 struct GeometryOnlyDevice {
     block_size: usize,
     io_calls: Arc<AtomicUsize>,
+}
+
+struct ConcurrentReadState {
+    entered: mpsc::Sender<u64>,
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[derive(Clone)]
+struct ConcurrentReadDevice {
+    state: Arc<ConcurrentReadState>,
+}
+
+impl ConcurrentReadDevice {
+    fn new(entered: mpsc::Sender<u64>) -> (Self, Arc<ConcurrentReadState>) {
+        let state = Arc::new(ConcurrentReadState {
+            entered,
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        (
+            Self {
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl ConcurrentReadState {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+impl FsBlockDevice for ConcurrentReadDevice {
+    fn name(&self) -> &str {
+        "concurrent-read"
+    }
+
+    fn num_blocks(&self) -> u64 {
+        64
+    }
+
+    fn block_size(&self) -> usize {
+        512
+    }
+
+    fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> BlockResult<()> {
+        self.state.entered.send(block_id).unwrap();
+        let released = self.state.released.lock().unwrap();
+        let _released = self
+            .state
+            .changed
+            .wait_while(released, |released| !*released)
+            .unwrap();
+        buf.fill(block_id as u8);
+        Ok(())
+    }
+
+    fn write_block(&mut self, _block_id: u64, _buf: &[u8]) -> BlockResult<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> BlockResult<()> {
+        Ok(())
+    }
 }
 
 impl FsBlockDevice for GeometryOnlyDevice {
@@ -322,6 +390,55 @@ fn atomic_read_does_not_wait_for_contended_cache_state() {
     drop(cached);
 
     assert_eq!(completed_without_wait.unwrap(), Err(BlockError::WouldBlock));
+}
+
+#[test]
+fn reads_of_distinct_folios_enter_independent_endpoints_concurrently() {
+    let _registry_test = REGISTRY_TEST.lock().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (device, state) = ConcurrentReadDevice::new(entered_tx);
+    let first =
+        BufferedBlockDevice::with_device_key(KEY_A + 37, Box::new(device.clone()), device.clone())
+            .unwrap();
+    let second =
+        BufferedBlockDevice::with_device_key(KEY_A + 37, Box::new(device.clone()), device).unwrap();
+    let start = Arc::new(Barrier::new(3));
+
+    let first_start = Arc::clone(&start);
+    let first_worker = thread::spawn(move || {
+        let mut first = first;
+        let mut buffer = [0u8; 512];
+        first_start.wait();
+        let result = first.read_block(0, &mut buffer);
+        (first, result, buffer)
+    });
+    let second_start = Arc::clone(&start);
+    let second_worker = thread::spawn(move || {
+        let mut second = second;
+        let mut buffer = [0u8; 512];
+        second_start.wait();
+        let result = second.read_block(8, &mut buffer);
+        (second, result, buffer)
+    });
+
+    start.wait();
+    let first_entered = entered_rx.recv_timeout(Duration::from_secs(1));
+    let second_entered = entered_rx.recv_timeout(Duration::from_secs(1));
+    state.release();
+    let (first, first_result, first_buffer) = first_worker.join().unwrap();
+    let (second, second_result, second_buffer) = second_worker.join().unwrap();
+    drop(first);
+    drop(second);
+
+    assert!(first_entered.is_ok(), "one endpoint must enter device IO");
+    assert!(
+        second_entered.is_ok(),
+        "a different folio must not wait behind the device-wide cache lock"
+    );
+    assert_eq!(first_result, Ok(()));
+    assert_eq!(second_result, Ok(()));
+    assert!(first_buffer.iter().all(|byte| *byte == 0));
+    assert!(second_buffer.iter().all(|byte| *byte == 8));
 }
 
 #[test]

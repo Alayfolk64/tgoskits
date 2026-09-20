@@ -6,7 +6,7 @@ pub mod sync;
 pub mod task;
 pub mod time;
 
-#[cfg(feature = "ext4")]
+#[cfg(any(feature = "ext4", feature = "fat"))]
 pub(crate) mod waiters;
 
 pub use dma::{dma_op, has_dma_op, install_dma_op};

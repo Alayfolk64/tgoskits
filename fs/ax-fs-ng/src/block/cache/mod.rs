@@ -25,10 +25,11 @@
 //!   Linux has per-BDI flusher threads. The current `FsBlockDevice` model
 //!   is fully synchronous, so a WRITEBACK mark and a background flusher
 //!   would have no observable effect.
-//! * One sleepable lock serializes each device tree instead of per-folio
-//!   locks. All current callers already serialize filesystem IO per
-//!   instance; the shared tree only adds serialization between partitions
-//!   of the same physical device.
+//! * Folio indices are partitioned across 64 sleepable shards rather than
+//!   carrying a lock in every folio. One-folio operations on different
+//!   shards can submit concurrently. Direct multi-folio I/O and durability
+//!   barriers take exclusive admission, preserving coherent cache overlay and
+//!   flush ordering without a device-wide lock on the common path.
 //! * The metadata/data split is expressed at folio granularity: requests
 //!   inside one folio take the buffered path, multi-folio requests go
 //!   device-direct. Linux declares the same split at the filesystem layer
@@ -44,6 +45,7 @@
 //! journal ordering without any change to the commit sequence.
 
 mod address_space;
+mod barrier;
 mod buffer_head;
 mod device;
 mod folio;
