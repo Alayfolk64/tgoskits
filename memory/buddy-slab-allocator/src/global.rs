@@ -200,9 +200,40 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
         self.buddy().alloc_pages(count, align)
     }
 
+    /// Allocates independent order-0 pages under one buddy-lock acquisition.
+    ///
+    /// Every initialized entry in `pages` remains a separately owned one-page
+    /// allocation and may later be returned alone or through
+    /// [`Self::dealloc_order0_batch`]. A short successful result means the
+    /// buddy ran out of pages after making partial progress.
+    pub fn alloc_order0_batch(&self, pages: &mut [usize]) -> AllocResult<usize> {
+        let mut buddy = self.buddy();
+        let mut allocated = 0;
+        for page in pages {
+            match buddy.alloc_pages(1, PAGE_SIZE) {
+                Ok(address) => {
+                    *page = address;
+                    allocated += 1;
+                }
+                Err(AllocError::NoMemory) => break,
+                Err(error) if allocated == 0 => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok(allocated)
+    }
+
     /// Free pages previously obtained via [`alloc_pages`](Self::alloc_pages).
     pub fn dealloc_pages(&self, addr: usize, count: usize) {
         self.buddy().dealloc_pages(addr, count);
+    }
+
+    /// Returns independent order-0 allocations under one buddy lock.
+    pub fn dealloc_order0_batch(&self, pages: &[usize]) {
+        let mut buddy = self.buddy();
+        for page in pages {
+            buddy.dealloc_pages(*page, 1);
+        }
     }
 
     /// Allocate pages with physical address below 4 GiB.

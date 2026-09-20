@@ -739,6 +739,50 @@ fn global_page_alloc() {
 }
 
 #[test]
+fn global_order0_batch_keeps_pages_independently_owned() {
+    let mut region = HostRegion::new(TEST_HEAP_SIZE, PAGE_SIZE * 4);
+    let allocator = GlobalAllocator::<PAGE_SIZE>::new();
+    let _ctx = init_global(&allocator, &mut region, 1);
+    let free_before = primary_section(&allocator).free_pages;
+    let mut pages = [0; 32];
+
+    let allocated = allocator.alloc_order0_batch(&mut pages).unwrap();
+    assert_eq!(allocated, pages.len());
+    assert_eq!(
+        pages.iter().copied().collect::<BTreeSet<_>>().len(),
+        pages.len()
+    );
+    allocator.dealloc_pages(pages[0], 1);
+    allocator.dealloc_order0_batch(&pages[1..]);
+
+    assert_eq!(primary_section(&allocator).free_pages, free_before);
+}
+
+#[test]
+fn global_order0_batch_reports_partial_progress_without_leaking_pages() {
+    let mut region = HostRegion::new(TEST_HEAP_SIZE, PAGE_SIZE * 4);
+    let allocator = GlobalAllocator::<PAGE_SIZE>::new();
+    let _ctx = init_global(&allocator, &mut region, 1);
+    let free_before = primary_section(&allocator).free_pages;
+    let mut pages = vec![0; free_before + 1];
+
+    let allocated = allocator.alloc_order0_batch(&mut pages).unwrap();
+    assert_eq!(allocated, free_before);
+    assert_eq!(pages[allocated], 0);
+    assert_eq!(
+        pages[..allocated]
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        allocated
+    );
+
+    allocator.dealloc_order0_batch(&pages[..allocated]);
+    assert_eq!(primary_section(&allocator).free_pages, free_before);
+}
+
+#[test]
 fn global_cross_cpu_free() {
     let mut region = HostRegion::new(TEST_HEAP_SIZE, PAGE_SIZE * 4);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
