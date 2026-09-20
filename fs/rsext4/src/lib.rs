@@ -48,7 +48,7 @@ pub use file::{
     create_symbol_link_with_owner, delete_dir, delete_file, inspect_inode_extents, is_dir_empty,
     link, mkfile, mkfile_with_owner, operate_inode_range, preallocate_inode, punch_hole_inode,
     read_file, read_inode_data_into, reap_unlinked_inode, rename, truncate, truncate_inode, unlink,
-    write_file, write_inode_data, zero_range_inode,
+    validate_file_growth, write_file, write_inode_data, zero_range_inode,
 };
 pub use io::{BlockIo, DeviceCapabilities, DeviceGeometry, SectorId, WriteFlags};
 pub use metadata::{chmod, chown, set_flags, set_project, utimens};

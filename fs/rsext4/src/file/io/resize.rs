@@ -77,6 +77,31 @@ impl InodeResize {
     }
 }
 
+/// Validates a prospective regular-file size extension without accessing
+/// filesystem or device state.
+///
+/// Buffered-write users can call this before publishing an in-memory size.
+/// The eventual writeback path performs the same validation before allocating
+/// mappings and persisting the inode size.
+pub fn validate_file_growth(
+    block_size: usize,
+    uses_extents: bool,
+    target_size: u64,
+) -> Ext4Result<()> {
+    let block_size = u64::try_from(block_size).map_err(|_| Ext4Error::overflow())?;
+    if block_size == 0 {
+        return Err(Ext4Error::bad_superblock().with_operation("resize:block_size"));
+    }
+    let blocks = target_size.div_ceil(block_size);
+    if blocks > u64::from(u32::MAX) {
+        return Err(Ext4Error::file_too_large().with_operation("resize:file_size"));
+    }
+    if !uses_extents {
+        crate::indirect::validate_legacy_block_count(block_size as usize, blocks)?;
+    }
+    Ok(())
+}
+
 pub fn truncate_inode<B: BlockIo>(
     device: &mut Jbd2Dev<B>,
     fs: &mut Ext4FileSystem,
@@ -173,9 +198,7 @@ fn truncate_inode_mapping<B: BlockIo>(
     }
 
     if truncate_size > old_size {
-        if !inode.uses_extents() {
-            crate::indirect::validate_legacy_block_count(fs.block_size(), new_blocks)?;
-        }
+        validate_file_growth(fs.block_size(), inode.uses_extents(), truncate_size)?;
         // Linux clears the old partial EOF before publishing a larger size so
         // bytes hidden by an earlier shrink can never become visible again.
         zero_mapped_inode_tail(device, fs, inode_num, &mut inode, old_size)?;
@@ -389,4 +412,32 @@ fn finish_orphaned_truncate<B: BlockIo>(
         fs.sync_superblock(device)?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_file_growth;
+
+    #[test]
+    fn extent_growth_accepts_the_last_addressable_block() {
+        const BLOCK_SIZE: usize = 4096;
+        let maximum_size = u64::from(u32::MAX) * BLOCK_SIZE as u64;
+
+        assert_eq!(validate_file_growth(BLOCK_SIZE, true, maximum_size), Ok(()));
+        assert!(validate_file_growth(BLOCK_SIZE, true, maximum_size + 1).is_err());
+    }
+
+    #[test]
+    fn legacy_growth_respects_the_triple_indirect_limit() {
+        const BLOCK_SIZE: usize = 4096;
+        let pointers = (BLOCK_SIZE / core::mem::size_of::<u32>()) as u64;
+        let maximum_blocks = 12 + pointers + pointers.pow(2) + pointers.pow(3);
+        let maximum_size = maximum_blocks * BLOCK_SIZE as u64;
+
+        assert_eq!(
+            validate_file_growth(BLOCK_SIZE, false, maximum_size),
+            Ok(())
+        );
+        assert!(validate_file_growth(BLOCK_SIZE, false, maximum_size + 1).is_err());
+    }
 }

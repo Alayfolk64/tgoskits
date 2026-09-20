@@ -120,6 +120,8 @@ impl InodeLifetime {
         let info = self.filesystem.read_live_inode_info(self.number)?;
         if info.file_type() == DirectoryEntryType::RegularFile {
             self.access.initialize_regular_file_size(info.size);
+            self.access
+                .initialize_regular_file_layout(info.flags.contains(InodeFlags::EXTENTS));
         }
         self.access
             .initialize_writeback_policy(writeback_policy(info.flags));
@@ -139,6 +141,23 @@ impl InodeLifetime {
 
     pub(crate) fn publish_file_size(&self, size: u64) {
         self.access.publish_regular_file_size(size);
+    }
+
+    /// Validates and publishes a page-cache-owned size extension without
+    /// entering the persistent resize path.
+    pub(crate) fn publish_cached_write_size(&self, size: u64) -> rsext4::Ext4Result<()> {
+        let uses_extents = match self.access.regular_file_uses_extents() {
+            Some(uses_extents) => uses_extents,
+            None => {
+                let info = self.metadata()?;
+                info.flags.contains(InodeFlags::EXTENTS)
+            }
+        };
+        let block_size = usize::try_from(self.filesystem.block_size())
+            .map_err(|_| rsext4::Ext4Error::overflow())?;
+        rsext4::validate_file_growth(block_size, uses_extents, size)?;
+        self.access.publish_regular_file_size(size);
+        Ok(())
     }
 
     pub(crate) fn writeback_policy(&self) -> rsext4::Ext4Result<WritebackPolicy> {

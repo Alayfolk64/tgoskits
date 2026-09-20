@@ -85,6 +85,8 @@ struct CacheTestFileState {
 struct CacheTestFile {
     state: StdMutex<CacheTestFileState>,
     read_observer: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    cached_size_publications: AtomicUsize,
+    set_len_calls: AtomicUsize,
     fail_next_set_len: AtomicBool,
     fail_next_write: AtomicBool,
     fail_next_range_operation: AtomicBool,
@@ -106,6 +108,8 @@ impl CacheTestFile {
                 write_lengths: Vec::new(),
             }),
             read_observer: StdMutex::new(None),
+            cached_size_publications: AtomicUsize::new(0),
+            set_len_calls: AtomicUsize::new(0),
             fail_next_set_len: AtomicBool::new(false),
             fail_next_write: AtomicBool::new(false),
             fail_next_range_operation: AtomicBool::new(false),
@@ -136,6 +140,14 @@ impl CacheTestFile {
 
     fn read_requests(&self) -> Vec<(u64, usize)> {
         self.state.lock().unwrap().read_requests.clone()
+    }
+
+    fn set_len_calls(&self) -> usize {
+        self.set_len_calls.load(Ordering::Acquire)
+    }
+
+    fn cached_size_publications(&self) -> usize {
+        self.cached_size_publications.load(Ordering::Acquire)
     }
 }
 
@@ -242,9 +254,17 @@ impl FileNodeOps for CacheTestFile {
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
+        self.set_len_calls.fetch_add(1, Ordering::AcqRel);
         if self.fail_next_set_len.swap(false, Ordering::AcqRel) {
             return Err(VfsError::Io);
         }
+        self.state.lock().unwrap().logical_len =
+            usize::try_from(len).map_err(|_| VfsError::InvalidInput)?;
+        Ok(())
+    }
+
+    fn publish_cached_write_size(&self, len: u64) -> VfsResult<()> {
+        self.cached_size_publications.fetch_add(1, Ordering::AcqRel);
         self.state.lock().unwrap().logical_len =
             usize::try_from(len).map_err(|_| VfsError::InvalidInput)?;
         Ok(())
@@ -325,6 +345,19 @@ fn disk_cache_does_not_expose_a_per_file_capacity_as_ebusy() {
         let input = vec![0x5a; (LEGACY_PER_FILE_PAGE_LIMIT + 1) * PAGE_SIZE];
 
         assert_eq!(cached.write_at(input.as_slice(), 0), Ok(input.len()));
+    });
+}
+
+#[test]
+fn buffered_write_growth_does_not_run_the_truncate_path() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let cached = reopen_cached_file(backing.clone());
+
+        assert_eq!(cached.write_at(&b"compiler output"[..], 0), Ok(15));
+        assert_eq!(backing.set_len_calls(), 0);
+        assert_eq!(backing.cached_size_publications(), 1);
+        assert_eq!(backing.metadata().unwrap().size, 15);
     });
 }
 

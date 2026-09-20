@@ -5,7 +5,47 @@ use core::time::Duration;
 use axfs_ng_vfs::{Location, MetadataUpdate, Mountpoint, NodePermission, NodeType};
 
 use super::*;
-use crate::file::{File, FileBackend, FileFlags};
+use crate::{
+    file::{File, FileBackend, FileFlags},
+    os::memory::test_support::with_test_page_provider,
+};
+
+#[test]
+fn buffered_growth_persists_data_and_size_after_sync() {
+    with_test_page_provider(true, |_| {
+        let (storage, flushes) = formatted_test_storage();
+        let (filesystem, root) = mount_background(storage.clone(), flushes);
+        let entry = root
+            .create(
+                "buffered-output",
+                NodeType::RegularFile,
+                NodePermission::default(),
+                0,
+                0,
+            )
+            .unwrap();
+        let file = File::new(
+            FileBackend::new_cached(entry.clone()).unwrap(),
+            FileFlags::WRITE,
+        );
+
+        assert_eq!(file.write_at(&b"compiler output"[..], 0), Ok(15));
+        assert_eq!(entry.metadata().unwrap().size, 15);
+        file.sync(false).unwrap();
+        filesystem.sync_to_disk().unwrap();
+
+        let snapshot = Arc::new(StdMutex::new(storage.lock().unwrap().clone()));
+        let (_recovered, recovered_root) =
+            mount_background(snapshot, Arc::new(AtomicUsize::new(0)));
+        let persisted = recovered_root.lookup_no_follow("buffered-output").unwrap();
+        let reader = File::new(FileBackend::new_direct(persisted.clone()), FileFlags::READ);
+        let mut bytes = [0; 15];
+
+        assert_eq!(persisted.metadata().unwrap().size, 15);
+        assert_eq!(reader.read_at(&mut bytes[..], 0), Ok(bytes.len()));
+        assert_eq!(&bytes, b"compiler output");
+    });
+}
 
 #[test]
 fn metadata_owner_and_times_remain_durable_after_explicit_sync() {

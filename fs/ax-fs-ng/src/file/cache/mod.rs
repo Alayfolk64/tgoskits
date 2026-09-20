@@ -1280,7 +1280,7 @@ impl CachedFile {
                     (end - page_start).min(PAGE_SIZE as u64) as usize,
                 )?;
             }
-            file.set_len(end)?;
+            file.publish_cached_write_size(end)?;
             self.shared.update_len_max(end);
             self.shared.publish_mapping_epoch(next_epoch);
         }

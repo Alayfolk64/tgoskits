@@ -2,7 +2,7 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use axfs_ng_vfs::NodeOps;
+use axfs_ng_vfs::{FileNodeOps, NodeOps};
 use rsext4::{FileName, FilePermissions, MutationContext};
 
 use super::*;
@@ -171,4 +171,45 @@ fn hot_regular_file_metadata_does_not_wait_for_mount_state() {
         completed_without_mount_state,
         "hot regular-file metadata waited for the ext4 mount-state mutex"
     );
+}
+
+#[test]
+fn buffered_size_publication_does_not_wait_for_mount_state() {
+    let (filesystem, _) = test_filesystem(false);
+    let filesystem = Arc::new(filesystem);
+    let inode = {
+        let mut state = filesystem.lock();
+        let root = state.ext4.root_inode();
+        let created = state
+            .ext4
+            .create_regular_file(
+                MutationContext::new(0, 0, 0, 0),
+                root,
+                FileName::new(b"buffered-size").unwrap(),
+                FilePermissions::new(0o600).unwrap(),
+            )
+            .unwrap();
+        Inode::new(state.retain_inode(&filesystem, created.number), None)
+    };
+    assert_eq!(inode.metadata().unwrap().size, 0);
+
+    let state = filesystem.lock();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let publisher = inode.clone();
+    let worker = thread::spawn(move || {
+        publisher.publish_cached_write_size(4096).unwrap();
+        assert_eq!(publisher.len().unwrap(), 4096);
+        completed_tx.send(()).unwrap();
+    });
+    let completed_without_mount_state = completed_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    drop(state);
+    worker.join().unwrap();
+
+    assert!(
+        completed_without_mount_state,
+        "buffered size publication waited for the ext4 mount-state mutex"
+    );
+    assert_eq!(inode.metadata().unwrap().size, 4096);
 }

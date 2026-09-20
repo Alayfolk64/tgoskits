@@ -27,6 +27,10 @@ fn hot_metadata_initialization_does_not_overwrite_writer_publication() {
     gate.initialize_regular_file_size(5);
     assert_eq!(gate.regular_file_size(), Some(9));
 
+    gate.initialize_regular_file_layout(true);
+    gate.initialize_regular_file_layout(false);
+    assert_eq!(gate.regular_file_uses_extents(), Some(true));
+
     gate.initialize_writeback_policy(WritebackPolicy::empty());
     gate.initialize_writeback_policy(WritebackPolicy::SYNCHRONOUS);
     assert_eq!(gate.writeback_policy(), Some(WritebackPolicy::empty()));

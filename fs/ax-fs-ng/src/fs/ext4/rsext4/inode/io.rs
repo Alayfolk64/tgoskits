@@ -52,6 +52,17 @@ impl FileNodeOps for Inode {
         self.finish_metadata_change()
     }
 
+    fn publish_cached_write_size(&self, len: u64) -> VfsResult<()> {
+        let _inode = self.content_access().write()?;
+        let old_size = self.lifetime.file_size().map_err(into_vfs_err)?;
+        if len > old_size {
+            self.lifetime
+                .publish_cached_write_size(len)
+                .map_err(into_vfs_err)?;
+        }
+        Ok(())
+    }
+
     fn operate_range(&self, offset: u64, len: u64, operation: VfsRangeOperation) -> VfsResult<()> {
         let core_operation = match operation {
             VfsRangeOperation::Allocate(mode) => RangeOperation::Allocate(match mode {

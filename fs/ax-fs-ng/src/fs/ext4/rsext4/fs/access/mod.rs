@@ -15,12 +15,16 @@ pub(crate) struct AccessGate {
     changed: TaskWaiters,
     lifetime_state: AtomicUsize,
     regular_file_size: AtomicU64,
+    regular_file_layout: AtomicU8,
     writeback_policy: AtomicU8,
 }
 
 const ZERO_LINK: usize = 1 << (usize::BITS - 1);
 const LIFETIME_REFS: usize = !ZERO_LINK;
 const UNKNOWN_REGULAR_FILE_SIZE: u64 = u64::MAX;
+const UNKNOWN_REGULAR_FILE_LAYOUT: u8 = 0;
+const LEGACY_REGULAR_FILE_LAYOUT: u8 = 1;
+const EXTENT_REGULAR_FILE_LAYOUT: u8 = 2;
 const UNKNOWN_WRITEBACK_POLICY: u8 = u8::MAX;
 
 struct AccessState {
@@ -50,6 +54,7 @@ impl AccessGate {
             changed: TaskWaiters::new(),
             lifetime_state: AtomicUsize::new(0),
             regular_file_size: AtomicU64::new(UNKNOWN_REGULAR_FILE_SIZE),
+            regular_file_layout: AtomicU8::new(UNKNOWN_REGULAR_FILE_LAYOUT),
             writeback_policy: AtomicU8::new(UNKNOWN_WRITEBACK_POLICY),
         }
     }
@@ -120,6 +125,29 @@ impl AccessGate {
     pub(crate) fn publish_regular_file_size(&self, size: u64) {
         debug_assert_ne!(size, UNKNOWN_REGULAR_FILE_SIZE);
         self.regular_file_size.store(size, Ordering::Release);
+    }
+
+    /// Initializes the immutable block-mapping layout of a regular inode.
+    pub(crate) fn initialize_regular_file_layout(&self, uses_extents: bool) {
+        let layout = if uses_extents {
+            EXTENT_REGULAR_FILE_LAYOUT
+        } else {
+            LEGACY_REGULAR_FILE_LAYOUT
+        };
+        let _ = self.regular_file_layout.compare_exchange(
+            UNKNOWN_REGULAR_FILE_LAYOUT,
+            layout,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn regular_file_uses_extents(&self) -> Option<bool> {
+        match self.regular_file_layout.load(Ordering::Acquire) {
+            LEGACY_REGULAR_FILE_LAYOUT => Some(false),
+            EXTENT_REGULAR_FILE_LAYOUT => Some(true),
+            _ => None,
+        }
     }
 
     pub(crate) fn initialize_writeback_policy(&self, policy: WritebackPolicy) {

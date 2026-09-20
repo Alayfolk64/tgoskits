@@ -28,7 +28,11 @@ impl NodeOps for Inode {
             node_type,
             uid: inode.uid,
             gid: inode.gid,
-            size: inode.size,
+            size: if node_type == axfs_ng_vfs::NodeType::RegularFile {
+                self.lifetime.file_size().map_err(into_vfs_err)?
+            } else {
+                inode.size
+            },
             block_size,
             blocks: inode.blocks,
             rdev: inode

@@ -74,6 +74,16 @@ pub trait FileNodeOps: NodeOps + Pollable {
     /// Sets the size of the file.
     fn set_len(&self, len: u64) -> VfsResult<()>;
 
+    /// Publishes a size extension owned by dirty buffered data.
+    ///
+    /// The page cache retains the bytes until writeback completes. Filesystems
+    /// that keep a separate in-memory inode size may override this hook to
+    /// avoid running their persistent truncate path before every buffered
+    /// write. The default preserves the existing eager-resize behavior.
+    fn publish_cached_write_size(&self, len: u64) -> VfsResult<()> {
+        self.set_len(len)
+    }
+
     /// Applies one storage or mapping operation to a byte range.
     fn operate_range(
         &self,
