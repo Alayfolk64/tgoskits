@@ -1,11 +1,23 @@
 extern crate alloc;
 
+#[cfg(feature = "block")]
+use alloc::{boxed::Box, sync::Arc};
+#[cfg(feature = "block")]
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use ax_driver::{
     BindingInfo, BindingIrq, BindingIrqSource, Error, FdtIrqSpec, binding_info_from_acpi_route,
 };
+#[cfg(feature = "block")]
+use ax_driver::{IrqBindingLease, IrqSourceGate, block::IrqBoundBlock};
 use irq_framework::{
     AcpiGsiController, AcpiGsiRoute, AcpiIrqPolarity, AcpiIrqTrigger, HwIrq, IrqDomainId, IrqId,
     IrqSource,
+};
+#[cfg(feature = "block")]
+use rdif_block::{
+    BlkError, BlockController, ControlEvent, ControllerEvent, ControllerState, ControllerUpdate,
+    DeviceInfo, DriverGeneric, HardIrqHandler, IrqAck, IrqDisposition, IrqEndpoint, IrqQueueMask,
 };
 use rdrive::{DeviceId, ProbeError, error::DriverError, probe::OnProbeError};
 
@@ -116,4 +128,115 @@ fn ax_driver_error_conversions_preserve_driver_and_probe_categories() {
 
     let on_probe = Error::from(ProbeError::from(OnProbeError::NotMatch));
     assert!(matches!(on_probe, Error::Probe(_)));
+}
+
+#[cfg(feature = "block")]
+struct ClearedIrqHandler;
+
+#[cfg(feature = "block")]
+impl HardIrqHandler for ClearedIrqHandler {
+    fn ack(&mut self) -> IrqAck {
+        IrqAck::cleared(IrqQueueMask::from_queue(0), ControlEvent::new(1, 0))
+    }
+}
+
+#[cfg(feature = "block")]
+struct TestController;
+
+#[cfg(feature = "block")]
+impl DriverGeneric for TestController {
+    fn name(&self) -> &str {
+        "test"
+    }
+}
+
+#[cfg(feature = "block")]
+impl BlockController for TestController {
+    fn device_info(&self) -> DeviceInfo {
+        DeviceInfo::new(1, 512)
+    }
+
+    fn max_io_queues(&self) -> usize {
+        1
+    }
+
+    fn advance(&mut self, _event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
+        Ok(ControllerUpdate::with_resources(
+            ControllerState::Ready,
+            alloc::vec![],
+            alloc::vec![IrqEndpoint::new(
+                1,
+                IrqQueueMask::from_queue(0),
+                Box::new(ClearedIrqHandler),
+            )],
+        ))
+    }
+}
+
+#[cfg(feature = "block")]
+struct TestGate {
+    masked: AtomicBool,
+}
+
+#[cfg(feature = "block")]
+impl IrqSourceGate for TestGate {
+    fn mask(&self) {
+        self.masked.store(true, Ordering::Release);
+    }
+
+    fn unmask(&self) {
+        self.masked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "block")]
+struct TestLease {
+    gate: Arc<TestGate>,
+}
+
+#[cfg(feature = "block")]
+impl IrqBindingLease for TestLease {
+    fn binding_info(&self) -> BindingInfo {
+        BindingInfo::empty()
+    }
+
+    fn enable_binding_irq(&self) {}
+
+    fn enable_binding_source(&self, source_id: usize) {
+        assert_eq!(source_id, 1);
+        self.gate.unmask();
+    }
+
+    fn source_gate(&self, source_id: usize) -> Option<Arc<dyn IrqSourceGate>> {
+        (source_id == 1).then(|| Arc::clone(&self.gate) as Arc<dyn IrqSourceGate>)
+    }
+
+    fn disable_binding_irq(&self) {}
+}
+
+#[cfg(feature = "block")]
+#[test]
+fn bound_irq_is_masked_until_deferred_work_rearms_its_source() {
+    let gate = Arc::new(TestGate {
+        masked: AtomicBool::new(false),
+    });
+    let lease = TestLease {
+        gate: Arc::clone(&gate),
+    };
+    let mut controller = IrqBoundBlock::new(TestController, lease);
+    let mut update = controller
+        .advance(ControllerEvent::Start { target_queues: 1 })
+        .unwrap();
+    let mut handler = update.take_irq_endpoints().remove(0).into_handler();
+
+    assert_eq!(
+        handler.ack().disposition(),
+        IrqDisposition::MaskedNeedsRearm
+    );
+    assert!(gate.masked.load(Ordering::Acquire));
+
+    controller
+        .advance(ControllerEvent::Rearm { source_id: 1 })
+        .unwrap();
+    assert!(!gate.masked.load(Ordering::Acquire));
 }

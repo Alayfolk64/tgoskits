@@ -157,4 +157,4 @@ pub use binding_resolver::{
     binding_irq_from_named_fdt_interrupt,
 };
 pub use error::{Error, Result};
-pub use irq_binding::IrqBindingLease;
+pub use irq_binding::{IrqBindingLease, IrqSourceGate};

@@ -1,10 +1,11 @@
 extern crate alloc;
 
-use alloc::{format, vec::Vec};
+use alloc::{format, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use fdt_edit::{Fdt, NodeType, Phandle};
 use log::warn;
-use pcie::{Endpoint, MsixError, MsixTableRegion};
+use pcie::{Endpoint, MsixError, MsixTableEntry, MsixTableRegion};
 use rdif_msi::{Msi, MsiAllocation, MsiDeviceId, MsiRequest};
 use rdrive::{
     DeviceId,
@@ -14,7 +15,7 @@ use rdrive::{
     },
 };
 
-use crate::{BindingInfo, BindingIrq, BindingIrqBinding};
+use crate::{BindingInfo, BindingIrq, BindingIrqBinding, IrqSourceGate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciMsiTarget {
@@ -25,8 +26,50 @@ pub struct PciMsiTarget {
 pub struct PciIrqLease {
     provider: DeviceId,
     allocation: Option<MsiAllocation>,
-    table: MsixTableRegion,
-    _table_mmio: mmio_api::Mmio,
+    source_gates: Vec<Arc<PciMsixVectorGate>>,
+}
+
+struct PciMsixVectorGate {
+    entry: MsixTableEntry,
+    _table_mmio: Arc<mmio_api::Mmio>,
+    masked: AtomicBool,
+    active: AtomicBool,
+}
+
+// SAFETY: `entry` addresses one fixed MSI-X table entry whose mapping is kept
+// alive by `_table_mmio`. `masked` serializes mask/unmask transitions for that
+// entry, while configuration writes happen only before activation or while the
+// entry is masked. Different gates address disjoint table entries.
+unsafe impl Sync for PciMsixVectorGate {}
+
+impl PciMsixVectorGate {
+    fn new(entry: MsixTableEntry, table_mmio: Arc<mmio_api::Mmio>) -> Self {
+        Self {
+            entry,
+            _table_mmio: table_mmio,
+            masked: AtomicBool::new(true),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    fn deactivate(&self) {
+        self.mask();
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl IrqSourceGate for PciMsixVectorGate {
+    fn mask(&self) {
+        if !self.masked.swap(true, Ordering::AcqRel) {
+            self.entry.mask();
+        }
+    }
+
+    fn unmask(&self) {
+        if self.masked.swap(false, Ordering::AcqRel) {
+            self.entry.unmask();
+        }
+    }
 }
 
 pub type PciMsixAllocation = PciIrqLease;
@@ -65,10 +108,14 @@ impl PciIrqLease {
         );
 
         let setup = (|| {
-            let table_mmio = axklib::mmio::ioremap(table_range.start.into(), table_range.len())
-                .map_err(|err| OnProbeError::other(format!("failed to map MSI-X table: {err}")))?;
+            let table_mmio = Arc::new(
+                axklib::mmio::ioremap(table_range.start.into(), table_range.len()).map_err(
+                    |err| OnProbeError::other(format!("failed to map MSI-X table: {err}")),
+                )?,
+            );
             let table =
                 unsafe { MsixTableRegion::new(table_mmio.as_nonnull_ptr(), table_info.entries) };
+            let mut source_gates = Vec::with_capacity(usize::from(vector_count));
 
             endpoint
                 .set_msix_function_mask(true)
@@ -87,6 +134,11 @@ impl PciIrqLease {
                     table
                         .program_masked(vector.index.0, message)
                         .map_err(msix_probe_error)?;
+                    let entry = table.entry(vector.index.0).map_err(msix_probe_error)?;
+                    source_gates.push(Arc::new(PciMsixVectorGate::new(
+                        entry,
+                        Arc::clone(&table_mmio),
+                    )));
                     provider.set_vector_enabled(vector, false).map_err(|err| {
                         OnProbeError::other(format!("failed to disable MSI vector: {err:?}"))
                     })?;
@@ -103,8 +155,7 @@ impl PciIrqLease {
             Ok(Self {
                 provider: target.provider,
                 allocation: allocation.take(),
-                table,
-                _table_mmio: table_mmio,
+                source_gates,
             })
         })();
 
@@ -133,37 +184,8 @@ impl PciIrqLease {
     }
 
     pub fn enable(&self) {
-        if let Some(allocation) = &self.allocation
-            && let Ok(provider) = rdrive::get::<Msi>(self.provider)
-            && let Ok(mut provider) = provider.lock()
-        {
-            for vector in allocation.vectors() {
-                let Ok(message) = provider.compose_message(vector) else {
-                    warn!(
-                        "failed to compose MSI-X message while enabling vector {:?}",
-                        vector.index
-                    );
-                    continue;
-                };
-                if let Err(err) = self.table.program_masked(vector.index.0, message) {
-                    warn!(
-                        "failed to program MSI-X table entry {:?}: {err}",
-                        vector.index
-                    );
-                    continue;
-                }
-                if let Err(err) = provider.set_vector_enabled(vector, true) {
-                    warn!("failed to enable MSI vector {:?}: {err:?}", vector.index);
-                    continue;
-                }
-                if let Err(err) = self.table.unmask(vector.index.0) {
-                    let _ = provider.set_vector_enabled(vector, false);
-                    warn!(
-                        "failed to unmask MSI-X table entry {:?}: {err}",
-                        vector.index
-                    );
-                }
-            }
+        for vector in self.vectors() {
+            self.enable_source(usize::from(vector.index.0));
         }
     }
 
@@ -172,14 +194,19 @@ impl PciIrqLease {
             warn!("MSI-X source id {source_id} is outside the vector index range");
             return;
         };
-        let Some(vector) = self
+        let Some((vector, gate)) = self
             .vectors()
             .iter()
-            .find(|vector| vector.index.0 == source_id)
+            .zip(&self.source_gates)
+            .find(|(vector, _)| vector.index.0 == source_id)
         else {
             warn!("MSI-X source id {source_id} is not owned by this allocation");
             return;
         };
+        if gate.active.load(Ordering::Acquire) {
+            gate.unmask();
+            return;
+        }
         let Ok(provider) = rdrive::get::<Msi>(self.provider) else {
             warn!("failed to find MSI provider while enabling vector {source_id}");
             return;
@@ -188,36 +215,21 @@ impl PciIrqLease {
             warn!("failed to lock MSI provider while enabling vector {source_id}");
             return;
         };
-        let Ok(message) = provider.compose_message(vector) else {
-            warn!("failed to compose MSI-X message while enabling vector {source_id}");
-            return;
-        };
-        if let Err(err) = self.table.program_masked(vector.index.0, message) {
-            warn!(
-                "failed to program MSI-X table entry {:?}: {err}",
-                vector.index
-            );
-            return;
+        if !gate.active.load(Ordering::Acquire) {
+            if let Err(err) = provider.set_vector_enabled(vector, true) {
+                warn!("failed to enable MSI vector {:?}: {err:?}", vector.index);
+                return;
+            }
+            gate.active.store(true, Ordering::Release);
         }
-        if let Err(err) = provider.set_vector_enabled(vector, true) {
-            warn!("failed to enable MSI vector {:?}: {err:?}", vector.index);
-            return;
-        }
-        if let Err(err) = self.table.unmask(vector.index.0) {
-            let _ = provider.set_vector_enabled(vector, false);
-            warn!(
-                "failed to unmask MSI-X table entry {:?}: {err}",
-                vector.index
-            );
-        }
+        drop(provider);
+        gate.unmask();
     }
 
     pub fn disable(&self) {
         if let Some(allocation) = &self.allocation {
-            for vector in allocation.vectors() {
-                if let Err(err) = self.table.mask(vector.index.0) {
-                    warn!("failed to mask MSI-X table entry {:?}: {err}", vector.index);
-                }
+            for gate in &self.source_gates {
+                gate.deactivate();
             }
             if let Ok(provider) = rdrive::get::<Msi>(self.provider)
                 && let Ok(mut provider) = provider.lock()
@@ -250,6 +262,15 @@ impl crate::IrqBindingLease for PciIrqLease {
 
     fn enable_binding_source(&self, source_id: usize) {
         self.enable_source(source_id);
+    }
+
+    fn source_gate(&self, source_id: usize) -> Option<Arc<dyn IrqSourceGate>> {
+        let source_id = u16::try_from(source_id).ok()?;
+        self.vectors()
+            .iter()
+            .position(|vector| vector.index.0 == source_id)
+            .and_then(|index| self.source_gates.get(index))
+            .map(|gate| Arc::clone(gate) as Arc<dyn IrqSourceGate>)
     }
 
     fn disable_binding_irq(&self) {

@@ -256,6 +256,15 @@ impl IrqEndpoint {
     pub fn into_handler(self) -> Box<dyn HardIrqHandler> {
         self.handler
     }
+
+    /// Wraps the fixed hard-IRQ handler while preserving its routing snapshot.
+    pub fn map_handler(
+        mut self,
+        map: impl FnOnce(Box<dyn HardIrqHandler>) -> Box<dyn HardIrqHandler>,
+    ) -> Self {
+        self.handler = map(self.handler);
+        self
+    }
 }
 
 /// Resources and state emitted by one controller transition.
@@ -310,6 +319,13 @@ impl ControllerUpdate {
     /// Transfers newly created IRQ endpoints to registration tokens.
     pub fn take_irq_endpoints(&mut self) -> Vec<IrqEndpoint> {
         core::mem::take(&mut self.irq_endpoints)
+    }
+
+    /// Transforms every newly emitted endpoint without changing the other
+    /// resources or controller state carried by this update.
+    pub fn map_irq_endpoints(mut self, map: impl FnMut(IrqEndpoint) -> IrqEndpoint) -> Self {
+        self.irq_endpoints = self.irq_endpoints.into_iter().map(map).collect();
+        self
     }
 
     /// Takes newly discovered device geometry, if this transition produced it.
