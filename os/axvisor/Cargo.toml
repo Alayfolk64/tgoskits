@@ -55,6 +55,7 @@ vpci-test-device = ["axvm/vpci-test-device"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace"]
+test-virq-delivery = []
 vcpu-perf-load = []
 # axum-based management HTTP server. Pulls `ax-std/net` explicitly so the
 # ArceOS network stack (which probes the QEMU virtio-net NIC and backs the
