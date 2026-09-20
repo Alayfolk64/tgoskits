@@ -6,6 +6,7 @@ use alloc::{
 use core::slice;
 
 use ax_fs_ng::vfs::FileBackend;
+use ax_lazyinit::OnceLock;
 use ax_memory_addr::{
     MemoryAddr, PAGE_SIZE_2M, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_down_4k,
 };
@@ -33,6 +34,49 @@ use super::{
     RssKind, alloc_frame, occupied_leaf_ranges, pages_in, validate_occupied_leaf_range,
 };
 use crate::{StarryError, StarryResult, sync::IrqMutex};
+
+/// One immutable base page shared by anonymous read faults.
+///
+/// The static owner keeps the frame alive for the kernel lifetime. User PTEs
+/// never receive write permission for this frame; the first store replaces it
+/// with a private anonymous page.
+static SHARED_ZERO_PAGE: OnceLock<Arc<PageObject>> = OnceLock::new();
+
+fn shared_zero_page() -> StarryResult<Arc<PageObject>> {
+    SHARED_ZERO_PAGE
+        .get_or_try_init(|| {
+            let frame = alloc_frame(true, PAGE_SIZE_4K)?;
+            Ok(PageObject::new_special_present(
+                PageId::allocate(),
+                // SAFETY: `alloc_frame` returned this unique base-page
+                // allocation and the static PageObject takes over its release
+                // duty for the remainder of the kernel lifetime.
+                unsafe { FrameLease::owned(frame, PAGE_SIZE_4K) },
+            ))
+        })
+        .cloned()
+}
+
+fn initialized_shared_zero_page_for(paddr: PhysAddr) -> Option<Arc<PageObject>> {
+    SHARED_ZERO_PAGE
+        .get()
+        .filter(|page| page.frame().paddr() == paddr)
+        .cloned()
+}
+
+fn is_shared_zero_page(page: &Arc<PageObject>) -> bool {
+    SHARED_ZERO_PAGE
+        .get()
+        .is_some_and(|zero| Arc::ptr_eq(zero, page))
+}
+
+fn page_provider_publication(page: &Arc<PageObject>) -> ProviderPublication {
+    if is_shared_zero_page(page) {
+        ProviderPublication::Complete
+    } else {
+        ProviderPublication::Pending
+    }
+}
 
 /// Non-owning lookup state scoped to one logical anonymous mapping source.
 ///
@@ -703,7 +747,10 @@ impl CowBackend {
     }
 
     pub(crate) fn page_object_for_frame(&self, paddr: PhysAddr) -> Option<Arc<PageObject>> {
-        self.pages.lock().get(paddr)
+        self.pages
+            .lock()
+            .get(paddr)
+            .or_else(|| initialized_shared_zero_page_for(paddr))
     }
 
     fn page_object_at(&self, vaddr: VirtAddr, paddr: PhysAddr) -> Option<Arc<PageObject>> {
@@ -718,6 +765,9 @@ impl CowBackend {
         vaddr: VirtAddr,
         page: &Arc<PageObject>,
     ) -> StarryResult {
+        if is_shared_zero_page(page) {
+            return Ok(());
+        }
         if let Some(file) = &self.file
             && file.finish_page_publication(vaddr, page)?
         {
@@ -736,6 +786,9 @@ impl CowBackend {
         vaddr: VirtAddr,
         page: &Arc<PageObject>,
     ) -> StarryResult {
+        if is_shared_zero_page(page) {
+            return Ok(());
+        }
         if let Some(file) = &self.file
             && file.ensure_page_identity(vaddr, page)?
         {
@@ -834,13 +887,15 @@ impl CowBackend {
     /// PTE flags for fault-in of file-backed private pages.
     ///
     /// Read faults keep PTEs read-only so the first store still faults into
-    /// [`Self::handle_cow_fault`] for RSS reclassify (Linux `PAGE_COPY` path).
+    /// [`Self::handle_cow_fault`]. File pages then copy and reclassify RSS;
+    /// anonymous mappings replace the shared zero page or reuse an exclusive
+    /// private page, matching Linux's `PAGE_COPY`/`ZERO_PAGE` paths.
     fn pte_flags_for_fault_in(
         &self,
         vma_flags: MappingFlags,
         access_flags: MappingFlags,
     ) -> MappingFlags {
-        if self.file.is_some() && !access_flags.contains(MappingFlags::WRITE) {
+        if !access_flags.contains(MappingFlags::WRITE) {
             vma_flags - MappingFlags::WRITE
         } else {
             vma_flags
@@ -848,6 +903,9 @@ impl CowBackend {
     }
 
     fn discard_pending_page(&self, page: &Arc<PageObject>) {
+        if is_shared_zero_page(page) {
+            return;
+        }
         if let Err(error) = self.discard_pending_index_entry(page) {
             warn!(
                 "failed to discard pending COW page {:?}: {error}",
@@ -861,6 +919,9 @@ impl CowBackend {
         vaddr: VirtAddr,
         page: &Arc<PageObject>,
     ) -> StarryResult {
+        if is_shared_zero_page(page) {
+            return Ok(());
+        }
         if let Some(file) = &self.file
             && file.cancel_page_publication(vaddr, page)?
         {
@@ -870,6 +931,9 @@ impl CowBackend {
     }
 
     fn discard_pending_index_entry(&self, page: &Arc<PageObject>) -> StarryResult {
+        if is_shared_zero_page(page) {
+            return Ok(());
+        }
         let retired = {
             let mut pages = self.pages.lock();
             pages.discard_pending(page)?
@@ -981,6 +1045,12 @@ impl CowBackend {
         leaf_size: usize,
         access_flags: MappingFlags,
     ) -> StarryResult<Arc<PageObject>> {
+        if self.file.is_none()
+            && leaf_size == PAGE_SIZE_4K
+            && !access_flags.contains(MappingFlags::WRITE)
+        {
+            return shared_zero_page();
+        }
         if !access_flags.contains(MappingFlags::WRITE)
             && let Some(file) = &self.file
             && let Some(page) = file.prepare_cached_read_page(vaddr, leaf_size)?
@@ -1268,7 +1338,8 @@ impl CowBackend {
         let page = self
             .page_object_at(vaddr, paddr)
             .ok_or(StarryError::BadAddress)?;
-        if page.mapping_refs() == 0 {
+        let shared_zero = is_shared_zero_page(&page);
+        if page.mapping_refs() == 0 && !shared_zero {
             return Err(StarryError::BadState);
         }
         if leaf_size < PAGE_SIZE_4K || !leaf_size.is_power_of_two() {
@@ -1278,7 +1349,7 @@ impl CowBackend {
             .file
             .as_ref()
             .is_some_and(|file| file.owns_cached_page(vaddr, &page));
-        if page.exclusively_mapped_by(space_id) && !cache_backed {
+        if page.exclusively_mapped_by(space_id) && !cache_backed && !shared_zero {
             let resident_kind = if self.file.is_some() && vma_flags.contains(MappingFlags::WRITE) {
                 Some(RssKind::Anon)
             } else {
@@ -1293,14 +1364,16 @@ impl CowBackend {
             ));
         }
 
-        let new_page = self.alloc_new_frame_sized(false, RssKind::Anon, leaf_size)?;
+        let new_page = self.alloc_new_frame_sized(shared_zero, RssKind::Anon, leaf_size)?;
         let new_frame = new_page.frame().paddr();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(paddr).as_ptr(),
-                phys_to_virt(new_frame).as_mut_ptr(),
-                leaf_size,
-            );
+        if !shared_zero {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(paddr).as_ptr(),
+                    phys_to_virt(new_frame).as_mut_ptr(),
+                    leaf_size,
+                );
+            }
         }
         // The enclosing address-space transaction replaces the MappingSlot,
         // records the old PageObject in its retire batch, and performs the
@@ -1661,7 +1734,7 @@ impl MappingExecution for CowBackend {
                     installed_size,
                     page.clone(),
                     page.resident_kind(),
-                    ProviderPublication::Pending,
+                    page_provider_publication(&page),
                 );
                 Ok(FaultMaterialization::with_owner(1, owner, pte_flags))
             }
@@ -1729,7 +1802,7 @@ impl MappingExecution for CowBackend {
                         PAGE_SIZE_4K,
                         page.clone(),
                         page.resident_kind(),
-                        ProviderPublication::Pending,
+                        page_provider_publication(&page),
                     ));
                     materialization.set_satisfied_pages(1);
                     Ok(materialization)
@@ -1809,7 +1882,7 @@ impl MappingExecution for CowBackend {
                             installed_size,
                             page.clone(),
                             page.resident_kind(),
-                            ProviderPublication::Pending,
+                            page_provider_publication(&page),
                         ));
                         materialization.increment_satisfied(1)?;
                         i += 1;
@@ -1841,7 +1914,7 @@ impl MappingExecution for CowBackend {
             let page = self
                 .page_object_at(vaddr, paddr)
                 .ok_or(StarryError::BadState)?;
-            if page.mapping_refs() == 0 {
+            if page.mapping_refs() == 0 && !is_shared_zero_page(&page) {
                 return Err(StarryError::BadState);
             }
             page.prepare_executable_mapping(paddr, page_size, cow_flags);
@@ -2017,6 +2090,129 @@ fn private_file_read_fault_maps_cache_and_write_fault_copies_for_test() -> bool 
         && cache_byte == 0x5a;
     drop(cache_pin);
     read_maps_cache && write_copied && aspace.reset_uninstalled_for_loader().is_ok()
+}
+
+#[cfg(all(test, axtest))]
+fn anonymous_read_faults_share_zero_page_and_write_fault_copies_for_test() -> bool {
+    let start = VirtAddr::from_usize(0x7480_0000);
+    let second = start + PAGE_SIZE_4K;
+    let flags = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
+    let Ok(mut aspace) = AddrSpace::new_empty(start, 2 * PAGE_SIZE_4K) else {
+        return false;
+    };
+    if aspace
+        .map(
+            start,
+            2 * PAGE_SIZE_4K,
+            flags,
+            false,
+            MappingOperation::new_alloc(start, PAGE_SIZE_4K, "[zero-page-test]"),
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    for address in [start, second] {
+        if !matches!(
+            aspace.handle_page_fault_result(
+                address,
+                ax_runtime::hal::trap::PageFaultFlags::READ
+                    | ax_runtime::hal::trap::PageFaultFlags::USER,
+            ),
+            super::super::FaultResult::Handled
+        ) {
+            return false;
+        }
+    }
+    let Ok((first_read_frame, first_read_flags, first_read_size)) = aspace.pt.query(start) else {
+        return false;
+    };
+    let Ok((second_read_frame, second_read_flags, second_read_size)) = aspace.pt.query(second)
+    else {
+        return false;
+    };
+    let reads_share_unaccounted_zero_page = first_read_frame == second_read_frame
+        && first_read_size == PAGE_SIZE_4K
+        && second_read_size == PAGE_SIZE_4K
+        && !first_read_flags.contains(MappingFlags::WRITE)
+        && !second_read_flags.contains(MappingFlags::WRITE)
+        && aspace.resident_page_counts().total() == 0
+        && SHARED_ZERO_PAGE
+            .get()
+            .is_some_and(|page| page.mapping_refs() == 0 && page.rmap.is_empty())
+        && unsafe {
+            *phys_to_virt(first_read_frame).as_ptr() == 0
+                && *phys_to_virt(second_read_frame).as_ptr() == 0
+        };
+    if !reads_share_unaccounted_zero_page {
+        let _ = aspace.reset_uninstalled_for_loader();
+        return false;
+    }
+
+    let forked_zero_pages = match aspace.try_clone() {
+        Ok(child) => {
+            let mut child = child.lock();
+            let mappings_share_zero = child.resident_page_counts().total() == 0
+                && child.mapping_slots.len() == 2
+                && child
+                    .pt
+                    .query(start)
+                    .is_ok_and(|(paddr, flags, size)| {
+                        paddr == first_read_frame
+                            && size == PAGE_SIZE_4K
+                            && !flags.contains(MappingFlags::WRITE)
+                    })
+                && child
+                    .pt
+                    .query(second)
+                    .is_ok_and(|(paddr, flags, size)| {
+                        paddr == second_read_frame
+                            && size == PAGE_SIZE_4K
+                            && !flags.contains(MappingFlags::WRITE)
+                    })
+                && child
+                    .mapping_slots
+                    .values()
+                    .all(|slot| is_shared_zero_page(&slot.page));
+            mappings_share_zero && child.reset_uninstalled_for_loader().is_ok()
+        }
+        Err(_) => false,
+    };
+    if !forked_zero_pages {
+        let _ = aspace.reset_uninstalled_for_loader();
+        return false;
+    }
+
+    if !matches!(
+        aspace.handle_page_fault_result(
+            start,
+            ax_runtime::hal::trap::PageFaultFlags::WRITE
+                | ax_runtime::hal::trap::PageFaultFlags::USER,
+        ),
+        super::super::FaultResult::Handled
+    ) {
+        return false;
+    }
+    let Ok((write_frame, write_flags, write_size)) = aspace.pt.query(start) else {
+        return false;
+    };
+    // SAFETY: both queried mappings remain installed and retain their full
+    // 4 KiB frames through `aspace` for the duration of these byte accesses.
+    let (copied_byte, shared_byte) = unsafe {
+        let copied_byte = *phys_to_virt(write_frame).as_ptr();
+        *phys_to_virt(write_frame).as_mut_ptr() = 0xa5;
+        let shared_byte = *phys_to_virt(second_read_frame).as_ptr();
+        (copied_byte, shared_byte)
+    };
+    let write_copied = write_frame != second_read_frame
+        && write_size == PAGE_SIZE_4K
+        && write_flags.contains(MappingFlags::WRITE)
+        && copied_byte == 0
+        && shared_byte == 0
+        && aspace.resident_page_counts().anon == 1;
+
+    write_copied && aspace.reset_uninstalled_for_loader().is_ok()
 }
 
 #[cfg(all(test, not(axtest)))]
@@ -3435,7 +3631,7 @@ fn forked_split_thp_write_copies_only_faulting_subpage_for_test() -> bool {
 }
 
 #[cfg(all(test, axtest))]
-fn discarded_split_thp_refaults_only_one_base_page_for_test() -> bool {
+fn discarded_split_thp_refaults_zero_then_one_private_page_for_test() -> bool {
     let start = VirtAddr::from(0x7200_0000);
     let protected = start + PAGE_SIZE_4K;
     let discarded = protected + PAGE_SIZE_4K;
@@ -3491,27 +3687,66 @@ fn discarded_split_thp_refaults_only_one_base_page_for_test() -> bool {
             ),
             super::super::FaultResult::Handled
         );
-    let Some(new_slot) = aspace.mapping_slots.get(&key).cloned() else {
+    let Some(zero_slot) = aspace.mapping_slots.get(&key).cloned() else {
         let _ = aspace.reset_uninstalled_for_loader();
         return false;
     };
-    let refaulted_one = handled
-        && aspace.pt.query(discarded).is_ok_and(|(paddr, _, size)| {
+    let zero_paddr = zero_slot.page.frame().paddr();
+    let read_refaulted_zero = handled
+        && aspace
+            .pt
+            .query(discarded)
+            .is_ok_and(|(paddr, flags, size)| {
             paddr != old_paddr
+                && paddr == zero_paddr
                 && size == PAGE_SIZE_4K
+                    && !flags.contains(MappingFlags::WRITE)
                 && unsafe { phys_to_virt(paddr).as_ptr().read_volatile() } == 0
         })
-        && new_slot.mapping == mapping_id
-        && new_slot.page.frame().size() == PAGE_SIZE_4K
-        && new_slot.page.mapping_refs() == 1
-        && new_slot.page.rmap.snapshot().as_slice() == [key]
+        && zero_slot.mapping == mapping_id
+        && is_shared_zero_page(&zero_slot.page)
+        && zero_slot.page.mapping_refs() == 0
+        && zero_slot.page.rmap.is_empty()
+        && old_page.mapping_refs() == (PAGE_SIZE_2M / PAGE_SIZE_4K - 1) as u32
+        && old_page.rmap.snapshot().len() == PAGE_SIZE_2M / PAGE_SIZE_4K - 1
+        && aspace.mapping_slots.len() == PAGE_SIZE_2M / PAGE_SIZE_4K;
+    let write_handled = read_refaulted_zero
+        && matches!(
+            aspace.handle_page_fault_result(
+                discarded,
+                ax_runtime::hal::trap::PageFaultFlags::WRITE
+                    | ax_runtime::hal::trap::PageFaultFlags::USER,
+            ),
+            super::super::FaultResult::Handled
+        );
+    let Some(private_slot) = aspace.mapping_slots.get(&key).cloned() else {
+        let _ = aspace.reset_uninstalled_for_loader();
+        return false;
+    };
+    let wrote_one_private_page = write_handled
+        && aspace
+            .pt
+            .query(discarded)
+            .is_ok_and(|(paddr, flags, size)| {
+                paddr != old_paddr
+                    && paddr != zero_paddr
+                    && size == PAGE_SIZE_4K
+                    && flags.contains(MappingFlags::WRITE)
+                    && unsafe { phys_to_virt(paddr).as_ptr().read_volatile() } == 0
+            })
+        && private_slot.mapping == mapping_id
+        && !is_shared_zero_page(&private_slot.page)
+        && private_slot.page.frame().size() == PAGE_SIZE_4K
+        && private_slot.page.mapping_refs() == 1
+        && private_slot.page.rmap.snapshot().as_slice() == [key]
         && old_page.mapping_refs() == (PAGE_SIZE_2M / PAGE_SIZE_4K - 1) as u32
         && old_page.rmap.snapshot().len() == PAGE_SIZE_2M / PAGE_SIZE_4K - 1
         && aspace.mapping_slots.len() == PAGE_SIZE_2M / PAGE_SIZE_4K;
     let cleared = aspace.reset_uninstalled_for_loader().is_ok()
         && old_page.mapping_refs() == 0
-        && new_slot.page.mapping_refs() == 0;
-    discarded_one && refaulted_one && cleared
+        && zero_slot.page.mapping_refs() == 0
+        && private_slot.page.mapping_refs() == 0;
+    discarded_one && read_refaulted_zero && wrote_one_private_page && cleared
 }
 
 #[cfg(all(test, axtest))]
@@ -3547,7 +3782,7 @@ fn unpublished_loader_abort_is_not_a_published_mutation_for_test() -> bool {
 }
 
 #[cfg(all(test, axtest))]
-fn fault_receipt_records_resident_delta_for_test() -> bool {
+fn fault_receipts_account_zero_page_then_private_cow_for_test() -> bool {
     let start = VirtAddr::from(0x7900_0000);
     let flags = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
     let Ok(mut aspace) = AddrSpace::new_empty(start, PAGE_SIZE_4K) else {
@@ -3579,7 +3814,25 @@ fn fault_receipt_records_resident_delta_for_test() -> bool {
         ),
         super::super::FaultResult::Handled
     );
-    let recorded = aspace
+    let read_recorded = aspace
+        .mutation_gate
+        .last_retired_receipt()
+        .is_some_and(|receipt| {
+            receipt.resident_delta.anon == 0
+                && receipt.resident_delta.file == 0
+                && receipt.resident_delta.shmem == 0
+        });
+    let read_incremental = aspace.mapping_graph_snapshot_calls_for_test() == 0
+        && aspace.resident_page_counts().total() == 0;
+    let write_handled = matches!(
+        aspace.handle_page_fault_result(
+            start,
+            ax_runtime::hal::trap::PageFaultFlags::WRITE
+                | ax_runtime::hal::trap::PageFaultFlags::USER,
+        ),
+        super::super::FaultResult::Handled
+    );
+    let write_recorded = aspace
         .mutation_gate
         .last_retired_receipt()
         .is_some_and(|receipt| {
@@ -3587,10 +3840,16 @@ fn fault_receipt_records_resident_delta_for_test() -> bool {
                 && receipt.resident_delta.file == 0
                 && receipt.resident_delta.shmem == 0
         });
-    let incremental = aspace.mapping_graph_snapshot_calls_for_test() == 0
+    let write_incremental = aspace.mapping_graph_snapshot_calls_for_test() == 0
         && aspace.resident_page_counts().anon == 1;
     let cleared = aspace.reset_uninstalled_for_loader().is_ok();
-    handled && recorded && incremental && cleared
+    handled
+        && read_recorded
+        && read_incremental
+        && write_handled
+        && write_recorded
+        && write_incremental
+        && cleared
 }
 
 #[cfg(all(test, axtest))]
@@ -3703,6 +3962,12 @@ mod tests {
         assert!(super::private_file_read_fault_maps_cache_and_write_fault_copies_for_test());
     }
 
+    #[cfg(all(test, axtest))]
+    #[axtest::axtest]
+    fn anonymous_read_faults_share_zero_page_and_write_fault_copies() {
+        assert!(super::anonymous_read_faults_share_zero_page_and_write_fault_copies_for_test());
+    }
+
     #[cfg(all(test, not(axtest)))]
     #[test]
     fn private_mmap_rejects_fault_at_file_eof() {
@@ -3765,8 +4030,8 @@ mod tests {
 
     #[cfg(all(test, axtest))]
     #[axtest::axtest]
-    fn fault_receipt_records_resident_delta() {
-        assert!(super::fault_receipt_records_resident_delta_for_test());
+    fn fault_receipts_account_zero_page_then_private_cow() {
+        assert!(super::fault_receipts_account_zero_page_then_private_cow_for_test());
     }
 
     #[cfg(all(test, axtest))]
@@ -3915,8 +4180,8 @@ mod tests {
 
     #[cfg(all(test, axtest))]
     #[axtest::axtest]
-    fn discarded_split_thp_refaults_only_one_base_page() {
-        assert!(super::discarded_split_thp_refaults_only_one_base_page_for_test());
+    fn discarded_split_thp_refaults_zero_then_one_private_page() {
+        assert!(super::discarded_split_thp_refaults_zero_then_one_private_page_for_test());
     }
 
     #[cfg(all(test, axtest))]

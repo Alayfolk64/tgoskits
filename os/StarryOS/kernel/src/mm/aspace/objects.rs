@@ -403,6 +403,11 @@ impl RmapSet {
 pub struct PageObject {
     pub id: PageId,
     frame: FrameLease,
+    /// Ordinary pages publish one reverse-mapping record per MappingSlot.
+    /// Kernel-lifetime special pages (currently the anonymous zero page) are
+    /// immutable and unreclaimable, so tracking every user PTE would only
+    /// create one global lock and an unbounded rmap vector.
+    tracks_mappings: bool,
     state: AtomicU8,
     /// Origin of the resident contents.  Mapping-specific policy (for example
     /// whether a cached file page is reported as File or Shmem) still belongs
@@ -436,9 +441,19 @@ impl PageObject {
         frame: FrameLease,
         resident_kind: Option<RssKind>,
     ) -> Arc<Self> {
+        Self::new_inner(id, frame, resident_kind, true)
+    }
+
+    fn new_inner(
+        id: PageId,
+        frame: FrameLease,
+        resident_kind: Option<RssKind>,
+        tracks_mappings: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             frame,
+            tracks_mappings,
             state: AtomicU8::new(PageState::Reserved as u8),
             resident_kind: AtomicU8::new(RssKind::slot_value(resident_kind)),
             mapping_refs: core::sync::atomic::AtomicU32::new(0),
@@ -462,6 +477,17 @@ impl PageObject {
         // A freshly allocated frame is reserved until its first PTE is ready.
         // This transition cannot fail for a new object; retaining the explicit
         // check keeps the invariant visible to callers and tests.
+        let _ = page.transition(PageState::Reserved, PageState::Present);
+        page
+    }
+
+    /// Creates a kernel-lifetime special page without per-PTE reverse maps.
+    ///
+    /// The caller must keep an independent static owner for the PageObject and
+    /// must never expose a writable PTE for its frame. Such a page cannot be
+    /// reclaimed, write-backed, or reused as an exclusive COW page.
+    pub(crate) fn new_special_present(id: PageId, frame: FrameLease) -> Arc<Self> {
+        let page = Self::new_inner(id, frame, None, false);
         let _ = page.transition(PageState::Reserved, PageState::Present);
         page
     }
@@ -532,6 +558,9 @@ impl PageObject {
     /// belongs to this MM; fork introduces another MM identity and therefore
     /// forces a base-page COW copy.
     pub(crate) fn exclusively_mapped_by(&self, mm_id: AddressSpaceId) -> bool {
+        if !self.tracks_mappings {
+            return false;
+        }
         let _graph = self.mapping_graph.lock();
         if !matches!(self.state(), PageState::Present | PageState::LazyFree) {
             return false;
@@ -541,6 +570,9 @@ impl PageObject {
     }
 
     fn publish_slot_graph(&self, key: MappingSlotKey) -> bool {
+        if !self.tracks_mappings {
+            return true;
+        }
         let Ok(mut reservation) = self.rmap.prepare_replace(1) else {
             return false;
         };
@@ -573,6 +605,9 @@ impl PageObject {
     }
 
     fn detach_slot_graph(&self, key: MappingSlotKey) -> bool {
+        if !self.tracks_mappings {
+            return true;
+        }
         let Ok(mut reservation) = self.rmap.prepare_replace(0) else {
             return false;
         };
@@ -609,6 +644,9 @@ impl PageObject {
         old: &[MappingSlotKey],
         new: &[MappingSlotKey],
     ) -> Result<MappingGraphReservation<'_>, MappingGraphError> {
+        if !self.tracks_mappings {
+            return self.rmap.prepare_replace(0);
+        }
         self.rmap
             .prepare_replace(new.len().saturating_sub(old.len()))
     }
@@ -619,6 +657,9 @@ impl PageObject {
         new: &[MappingSlotKey],
         reservation: &mut MappingGraphReservation<'_>,
     ) -> Result<(), MappingGraphError> {
+        if !self.tracks_mappings {
+            return Ok(());
+        }
         let became_exclusive = {
             let _graph = self.mapping_graph.lock();
             if !matches!(self.state(), PageState::Present | PageState::LazyFree) {

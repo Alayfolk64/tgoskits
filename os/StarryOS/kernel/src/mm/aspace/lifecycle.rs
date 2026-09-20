@@ -1964,7 +1964,11 @@ mod tests {
         );
         {
             let guard = aspace.lock();
-            assert_eq!(guard.resident_page_counts().anon, 1);
+            assert_eq!(
+                guard.resident_page_counts().anon,
+                0,
+                "a read fault on anonymous memory must not charge the shared zero page"
+            );
             assert!(guard.pending_tlb_requests().unwrap().is_empty());
             assert_eq!(
                 guard
