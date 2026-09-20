@@ -1634,11 +1634,7 @@ mod fault_tests {
                 .inode_is_allocated_checked(&mut journal, inode_number)
                 .expect("check restored inode allocation")
         );
-        assert!(
-            filesystem
-                .orphan_contains(&mut journal, inode_number)
-                .expect("check restored orphan membership")
-        );
+        assert!(filesystem.orphan_contains(inode_number));
         let restored_inode = filesystem
             .get_inode_by_num(&mut journal, inode_number)
             .expect("read restored inode");

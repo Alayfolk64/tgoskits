@@ -1,3 +1,5 @@
+use ::alloc::collections::BTreeSet;
+
 use super::*;
 use crate::blockdev::TransactionCredits;
 
@@ -36,6 +38,8 @@ pub struct Ext4FileSystem {
     pub journal_sb_block_start: Option<AbsoluteBN>,
     /// Immutable index of filesystem metadata blocks protected from file mappings.
     pub(crate) system_zones: SystemZoneMap,
+    /// Complete in-memory view of the classic orphan chain for this mount.
+    pub(crate) orphan_inodes: BTreeSet<InodeNumber>,
 }
 
 /// In-memory filesystem metadata restored when one journal handle aborts.
@@ -52,6 +56,7 @@ struct MetadataTransactionSnapshot {
     bitmap_cache: BitmapCache,
     inodetable_cache: InodeCache,
     datablock_cache: DataBlockCache,
+    orphan_inodes: BTreeSet<InodeNumber>,
 }
 
 impl MetadataTransactionSnapshot {
@@ -64,6 +69,7 @@ impl MetadataTransactionSnapshot {
             bitmap_cache: filesystem.bitmap_cache.clone(),
             inodetable_cache: filesystem.inodetable_cache.clone(),
             datablock_cache: filesystem.datablock_cache.clone(),
+            orphan_inodes: filesystem.orphan_inodes.clone(),
         }
     }
 
@@ -77,6 +83,7 @@ impl MetadataTransactionSnapshot {
             .inodetable_cache
             .restore_snapshot(self.inodetable_cache);
         filesystem.datablock_cache = self.datablock_cache;
+        filesystem.orphan_inodes = self.orphan_inodes;
     }
 }
 

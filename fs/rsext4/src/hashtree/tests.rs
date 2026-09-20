@@ -142,6 +142,7 @@ fn create_test_fs() -> Ext4FileSystem {
         mmp: Default::default(),
         journal_sb_block_start: None,
         system_zones: SystemZoneMap::default(),
+        orphan_inodes: Default::default(),
     }
 }
 

@@ -66,7 +66,7 @@ impl InodeResize {
                 self.target_size,
                 TruncatePurpose::OrphanRecovery,
             )?;
-            if inode.i_links_count != 0 && fs.orphan_contains(device, self.inode)? {
+            if inode.i_links_count != 0 && fs.orphan_contains(self.inode) {
                 finish_orphaned_truncate(device, fs, self.inode)?;
             }
         } else {
@@ -84,7 +84,7 @@ pub fn truncate_inode<B: BlockIo>(
     truncate_size: u64,
 ) -> Ext4Result<()> {
     let inode = fs.get_inode_by_num(device, inode_num)?;
-    if inode.i_links_count != 0 && fs.orphan_contains(device, inode_num)? {
+    if inode.i_links_count != 0 && fs.orphan_contains(inode_num) {
         // A prior bounded truncate may have published its new size before
         // yielding for journal space. Finish that exact orphan intent before
         // interpreting another resize; size equality alone is not completion.

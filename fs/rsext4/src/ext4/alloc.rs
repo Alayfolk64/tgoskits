@@ -625,6 +625,7 @@ mod tests {
             mmp: Default::default(),
             journal_sb_block_start: None,
             system_zones: SystemZoneMap::default(),
+            orphan_inodes: Default::default(),
         }
     }
 
@@ -675,6 +676,7 @@ mod tests {
             mmp: Default::default(),
             journal_sb_block_start: None,
             system_zones,
+            orphan_inodes: Default::default(),
         }
     }
 
@@ -721,6 +723,7 @@ mod tests {
             mmp: Default::default(),
             journal_sb_block_start: None,
             system_zones: SystemZoneMap::default(),
+            orphan_inodes: Default::default(),
         }
     }
 

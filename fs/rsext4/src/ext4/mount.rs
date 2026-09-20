@@ -112,6 +112,7 @@ impl Ext4FileSystem {
         self.inodetable_cache =
             InodeCache::new(INODE_CACHE_MAX, Self::inode_cache_size(&self.superblock));
         self.datablock_cache = DataBlockCache::new(DATABLOCK_CACHE_MAX, self.block_size());
+        self.orphan_inodes.clear();
         Ok(())
     }
 
@@ -539,6 +540,7 @@ impl Ext4FileSystem {
             mmp: super::mmp::MmpState::Disabled,
             journal_sb_block_start: None,
             system_zones,
+            orphan_inodes: Default::default(),
         };
 
         if !options.readonly {
@@ -696,9 +698,8 @@ impl Ext4FileSystem {
             // Classic orphan-list recovery must observe metadata after JBD2 replay
             // and complete before ordinary namespace repair can allocate inodes or
             // blocks. Read-only mounts validate but never mutate the chain.
-            if options.readonly {
-                fs.validate_orphan_chain(block_dev)?;
-            } else {
+            fs.load_orphan_index(block_dev)?;
+            if !options.readonly {
                 fs.recover_orphans(block_dev)?;
             }
 

@@ -255,7 +255,7 @@ pub fn reap_unlinked_inode<B: BlockIo>(
     if inode.i_links_count != 0 {
         return Err(Ext4Error::invalid_input().with_operation("orphan:reap_linked"));
     }
-    if !fs.orphan_contains(block_dev, inode_num)? {
+    if !fs.orphan_contains(inode_num) {
         return Err(Ext4Error::not_found().with_operation("orphan:reap_not_listed"));
     }
     preflight_inode_free(fs, block_dev, inode_num, &inode)?;
