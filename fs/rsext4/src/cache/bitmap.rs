@@ -127,19 +127,7 @@ impl BitmapCache {
         let mut data = alloc::vec![0u8; block_dev.block_size() as usize];
         block_dev.read_blocks(&mut data, block_num, 1)?;
 
-        if self.cache.len() >= self.max_entries
-            && let Some(victim_key) = self.lru_key()
-        {
-            let victim = self
-                .cache
-                .get(&victim_key)
-                .cloned()
-                .ok_or(Ext4Error::corrupted())?;
-            if victim.dirty {
-                Self::write_bitmap_static(block_dev, victim.block_num, &victim.data)?;
-            }
-            self.cache.remove(&victim_key);
-        }
+        self.make_room();
 
         self.cache.insert(key, CachedBitmap::new(data, block_num));
         Ok(())
@@ -153,11 +141,22 @@ impl BitmapCache {
         }
     }
 
-    fn lru_key(&self) -> Option<CacheKey> {
-        self.cache
-            .iter()
-            .min_by_key(|(_, bitmap)| bitmap.last_access)
-            .map(|(key, _)| *key)
+    fn make_room(&mut self) {
+        // A bitmap miss must not spend the caller's journal credits on an
+        // unrelated dirty group. Permit temporary overflow until explicit
+        // metadata writeback makes an entry reclaimable.
+        while self.cache.len() >= self.max_entries {
+            let victim = self
+                .cache
+                .iter()
+                .filter(|(_, bitmap)| !bitmap.dirty)
+                .min_by_key(|(_, bitmap)| bitmap.last_access)
+                .map(|(key, _)| *key);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.cache.remove(&victim);
+        }
     }
 
     /// Returns a cached bitmap without loading from disk.
@@ -300,4 +299,85 @@ pub struct CacheStats {
     pub total_entries: usize,
     pub dirty_entries: usize,
     pub max_entries: usize,
+}
+
+#[cfg(all(test, feature = "USE_MULTILEVEL_CACHE"))]
+mod tests {
+    use super::*;
+    use crate::{
+        DeviceCapabilities, DeviceGeometry, SectorId,
+        config::{BLOCK_SIZE, BLOCK_SIZE_U32},
+        disknode::Ext4Timestamp,
+    };
+
+    struct MemoryDevice {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl crate::Clock for MemoryDevice {
+        fn now(&self) -> Ext4Result<Ext4Timestamp> {
+            Ok(Ext4Timestamp::UNIX_EPOCH)
+        }
+    }
+
+    impl BlockIo for MemoryDevice {
+        fn geometry(&self) -> DeviceGeometry {
+            DeviceGeometry::new(BLOCK_SIZE_U32, 8)
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            DeviceCapabilities {
+                flush: true,
+                ..Default::default()
+            }
+        }
+
+        fn read(&mut self, bytes: &mut [u8], sector: SectorId, _: u32) -> Ext4Result<()> {
+            let offset = sector.as_usize()? * BLOCK_SIZE;
+            bytes.copy_from_slice(&self.bytes[offset..offset + bytes.len()]);
+            Ok(())
+        }
+
+        fn write(&mut self, bytes: &[u8], sector: SectorId, _: u32) -> Ext4Result<()> {
+            self.writes += 1;
+            let offset = sector.as_usize()? * BLOCK_SIZE;
+            self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Ext4Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cache_pressure_does_not_write_back_an_unrelated_dirty_bitmap() {
+        let mut cache = BitmapCache::new(1);
+        let device = MemoryDevice {
+            bytes: alloc::vec![0; 8 * BLOCK_SIZE],
+            writes: 0,
+        };
+        let mut journal = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let dirty = CacheKey::new_block(BGIndex::new(0));
+        let loaded = CacheKey::new_inode(BGIndex::new(1));
+
+        cache
+            .modify(&mut journal, dirty, AbsoluteBN::new(1), |bytes| {
+                bytes[0] = 1;
+            })
+            .expect("create dirty bitmap entry");
+        cache
+            .get_or_load(&mut journal, loaded, AbsoluteBN::new(2))
+            .expect("load unrelated bitmap without hidden writeback");
+
+        assert!(
+            cache
+                .get(&dirty)
+                .expect("dirty bitmap remains cached")
+                .dirty
+        );
+        assert!(cache.get(&loaded).is_some());
+        assert_eq!(journal.into_inner().writes, 0);
+    }
 }

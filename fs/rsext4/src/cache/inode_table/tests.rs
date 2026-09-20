@@ -156,6 +156,22 @@ fn demand_load_can_replace_a_clean_record() {
 }
 
 #[test]
+fn transactional_cache_miss_does_not_write_back_an_unrelated_dirty_inode() {
+    let (mut cache, mut device, number) = populated_cache();
+    cache.max_entries = 1;
+    cache.mark_dirty(number);
+    let other = InodeNumber::new(2).unwrap();
+
+    cache
+        .get_or_load(&mut device, other, AbsoluteBN::new(1), 0)
+        .expect("load an unrelated inode without hidden writeback");
+
+    assert!(cache.get(number).expect("dirty inode remains cached").dirty);
+    assert!(cache.get(other).is_some());
+    assert_eq!(device.into_inner().writes, 0);
+}
+
+#[test]
 fn unrelated_inode_mutation_does_not_cancel_a_pending_load() {
     let (mut cache, mut device, number) = populated_cache();
     let other = InodeNumber::new(2).unwrap();
@@ -239,6 +255,7 @@ fn abandoned_load_registrations_are_retired_on_the_next_preparation() {
 struct MemoryDevice {
     bytes: Vec<u8>,
     reader: Option<InodeCacheReader>,
+    writes: usize,
 }
 
 impl crate::Clock for MemoryDevice {
@@ -268,6 +285,7 @@ impl BlockIo for MemoryDevice {
 
     fn write(&mut self, bytes: &[u8], sector: SectorId, _: u32) -> Ext4Result<()> {
         self.observe_unlocked_cache();
+        self.writes += 1;
         let offset = sector.as_usize()? * BLOCK_SIZE;
         self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
@@ -312,6 +330,7 @@ fn populated_cache() -> (InodeCache, Jbd2Dev<MemoryDevice>, InodeNumber) {
         MemoryDevice {
             bytes: alloc::vec![0; 8 * BLOCK_SIZE],
             reader: None,
+            writes: 0,
         },
         false,
     );

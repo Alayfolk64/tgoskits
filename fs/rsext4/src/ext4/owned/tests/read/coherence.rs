@@ -35,7 +35,7 @@ fn journal_only_file_images_override_home_bytes_without_device_reads() {
     mount
         .filesystem
         .datablock_cache
-        .create_new(&mut mount.device, physical)
+        .modify_new_metadata(&mut mount.device, physical, |_| {})
         .unwrap();
     mount
         .filesystem

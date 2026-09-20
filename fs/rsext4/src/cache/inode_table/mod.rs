@@ -168,35 +168,29 @@ impl InodeCache {
         // A failed load leaves the previous cache contents untouched.
         let (inode, raw_inode) = self.load_inode(block_dev, block_num, offset)?;
 
-        self.make_room(block_dev)?;
+        self.make_room();
 
         let cached = CachedInode::new(inode, raw_inode, inode_num, block_num, offset);
         self.cache.entries.lock().insert(inode_num, cached);
         Ok(())
     }
 
-    fn make_room<B: BlockIo>(&mut self, block_dev: &mut Jbd2Dev<B>) -> Ext4Result<()> {
-        let full = self.cache.entries.lock().len() >= self.max_entries;
-        if full && let Some(victim_num) = self.lru_inode() {
-            let victim = self
-                .cache
-                .entries
-                .lock()
-                .get(&victim_num)
-                .cloned()
-                .ok_or(Ext4Error::corrupted())?;
-            if victim.dirty {
-                Self::write_inode_bytes_static(
-                    block_dev,
-                    victim.block_num,
-                    victim.offset_in_block,
-                    &victim.raw_inode,
-                )?;
-            }
-            self.cache.entries.lock().remove(&victim_num);
+    fn make_room(&mut self) {
+        let mut entries = self.cache.entries.lock();
+        // The limit is a clean-cache target, not permission to write metadata
+        // from an unrelated caller's journal handle. Linux reclaim likewise
+        // leaves dirty inode writeback to its explicit writeback owner.
+        while entries.len() >= self.max_entries {
+            let victim = entries
+                .iter()
+                .filter(|(_, cached)| !cached.dirty)
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(inode_num, _)| *inode_num);
+            let Some(victim) = victim else {
+                break;
+            };
+            entries.remove(&victim);
         }
-
-        Ok(())
     }
 
     /// Installs an all-zero record for a newly allocated inode without reading
@@ -225,7 +219,7 @@ impl InodeCache {
             return Err(Ext4Error::corrupted().with_operation("inode_cache:initialize_range"));
         }
         self.cache.entries.lock().remove(&inode_num);
-        self.make_room(block_dev)?;
+        self.make_room();
 
         let cached = CachedInode::new(
             Ext4Inode::default(),
@@ -236,15 +230,6 @@ impl InodeCache {
         );
         self.cache.entries.lock().insert(inode_num, cached);
         Ok(())
-    }
-
-    fn lru_inode(&self) -> Option<InodeNumber> {
-        self.cache
-            .entries
-            .lock()
-            .iter()
-            .min_by_key(|(_, cached)| cached.last_access)
-            .map(|(inode_num, _)| *inode_num)
     }
 
     fn touch(&mut self, inode_num: InodeNumber) {

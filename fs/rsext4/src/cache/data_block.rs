@@ -17,12 +17,19 @@ enum DataCacheMode {
 struct DirtyBlock {
     block_num: AbsoluteBN,
     generation: u64,
+    kind: DirtyBlockKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WritebackCompletion {
-    MarkClean,
-    RetainDirty,
+enum DirtyBlockKind {
+    FileData,
+    Metadata,
+}
+
+impl DirtyBlockKind {
+    const fn is_metadata(self) -> bool {
+        matches!(self, Self::Metadata)
+    }
 }
 
 /// Cached data block.
@@ -38,6 +45,7 @@ pub struct CachedBlock {
     pub last_access: u64,
     /// Generation counter bumped whenever the cached state changes.
     pub generation: u64,
+    dirty_kind: Option<DirtyBlockKind>,
 }
 
 impl CachedBlock {
@@ -48,12 +56,23 @@ impl CachedBlock {
             block_num,
             last_access: 0,
             generation: 0,
+            dirty_kind: None,
         }
     }
 
     /// Marks the block dirty.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.dirty_kind.get_or_insert(DirtyBlockKind::FileData);
+    }
+
+    fn mark_dirty_as(&mut self, kind: DirtyBlockKind) -> Ext4Result<()> {
+        if self.dirty && self.dirty_kind != Some(kind) {
+            return Err(Ext4Error::corrupted().with_operation("data_cache:dirty_kind_alias"));
+        }
+        self.dirty = true;
+        self.dirty_kind = Some(kind);
+        Ok(())
     }
 }
 
@@ -162,41 +181,46 @@ impl DataBlockCache {
 
         // Finish the potentially failing read before changing cache contents.
         let data = self.load_block(block_dev, block_num)?;
-        self.evict_lru_if_full(block_dev)?;
+        self.make_room(block_dev)?;
         self.cache
             .insert(block_num, CachedBlock::new(data, block_num));
         self.lru_order.push(block_num);
         Ok(())
     }
 
-    fn evict_lru_if_full<B: BlockIo>(&mut self, block_dev: &mut Jbd2Dev<B>) -> Ext4Result<()> {
+    fn make_room<B: BlockIo>(&mut self, block_dev: &mut Jbd2Dev<B>) -> Ext4Result<()> {
         if self.cache.len() < self.max_entries {
             return Ok(());
         }
 
-        if self.lru_order.is_empty() {
-            return Ok(());
-        }
-
-        // Reclaim one quarter of the cache at a time. Small, one-entry caches
-        // retain the old behavior, while the normal 128-entry cache can merge
-        // physically contiguous dirty blocks into a bounded device request.
+        // Metadata writeback belongs to the filesystem transaction owner.
+        // Standalone file-data caching retains bounded synchronous writeback;
+        // shared-device mode never stores dirty file data here.
         let victim_count = self.max_entries.div_ceil(4).max(1);
-        let victim_count = core::cmp::min(victim_count, self.lru_order.len());
         let mut victims = Vec::new();
         victims
             .try_reserve_exact(victim_count)
             .map_err(|_| Ext4Error::no_memory())?;
-        victims.extend_from_slice(&self.lru_order[..victim_count]);
-        let dirty_blocks = self.dirty_blocks_for_keys(&victims)?;
-
-        // Keep every selected entry dirty and resident unless all writeback
-        // requests succeed. Retrying a partially persisted batch is safe.
-        self.write_dirty_runs(block_dev, &dirty_blocks, WritebackCompletion::RetainDirty)?;
-        for block_num in &victims {
-            self.cache.remove(block_num);
+        victims.extend(
+            self.lru_order
+                .iter()
+                .filter(|block_num| {
+                    self.cache.get(block_num).is_some_and(|cached| {
+                        !cached.dirty || cached.dirty_kind == Some(DirtyBlockKind::FileData)
+                    })
+                })
+                .take(victim_count)
+                .copied(),
+        );
+        if victims.is_empty() {
+            return Ok(());
         }
-        self.lru_order.drain(..victim_count);
+        let dirty_blocks = self.dirty_blocks_for_keys(&victims)?;
+        self.write_dirty_runs(block_dev, &dirty_blocks)?;
+        for victim in victims {
+            self.cache.remove(&victim);
+            self.remove_from_lru(victim);
+        }
         Ok(())
     }
 
@@ -239,7 +263,16 @@ impl DataBlockCache {
             return Ok(());
         };
         if cached.dirty {
-            Self::write_block_static(block_dev, block_num, &cached.data, self.block_size, false)?;
+            let kind = cached
+                .dirty_kind
+                .ok_or_else(|| Ext4Error::corrupted().with_operation("data_cache:dirty_kind"))?;
+            Self::write_block_static(
+                block_dev,
+                block_num,
+                &cached.data,
+                self.block_size,
+                kind.is_metadata(),
+            )?;
         }
         Ok(())
     }
@@ -261,17 +294,36 @@ impl DataBlockCache {
         block_dev: &mut Jbd2Dev<B>,
         block_num: AbsoluteBN,
     ) -> Ext4Result<CachedBlock> {
-        if self.cache.contains_key(&block_num) {
+        self.create_new_with_kind(block_dev, block_num, DirtyBlockKind::FileData)
+    }
+
+    fn create_new_with_kind<B: BlockIo>(
+        &mut self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+        kind: DirtyBlockKind,
+    ) -> Ext4Result<CachedBlock> {
+        if let Some(cached) = self.cache.get(&block_num) {
+            if cached.dirty {
+                let existing_kind = cached.dirty_kind.ok_or_else(|| {
+                    Ext4Error::corrupted().with_operation("data_cache:dirty_kind")
+                })?;
+                if existing_kind != kind {
+                    return Err(
+                        Ext4Error::corrupted().with_operation("data_cache:dirty_kind_alias")
+                    );
+                }
+            }
             // A failed replacement writeback leaves the old incarnation intact.
             self.write_back_if_dirty(block_dev, block_num)?;
             self.cache.remove(&block_num);
             self.remove_from_lru(block_num);
         } else {
-            self.evict_lru_if_full(block_dev)?;
+            self.make_room(block_dev)?;
         }
 
         let mut cached = CachedBlock::new(alloc::vec![0u8; self.block_size], block_num);
-        cached.dirty = true;
+        cached.mark_dirty_as(kind)?;
         self.access_counter = self.access_counter.saturating_add(1);
         cached.last_access = self.access_counter;
         self.cache.insert(block_num, cached);
@@ -301,7 +353,7 @@ impl DataBlockCache {
         B: BlockIo,
         F: FnOnce(&mut [u8]),
     {
-        self.modify_with_kind(block_dev, block_num, false, f)
+        self.modify_with_kind(block_dev, block_num, DirtyBlockKind::FileData, f)
     }
 
     /// Modifies one filesystem metadata block and routes write-through through
@@ -316,21 +368,21 @@ impl DataBlockCache {
         B: BlockIo,
         F: FnOnce(&mut [u8]),
     {
-        self.modify_with_kind(block_dev, block_num, true, f)
+        self.modify_with_kind(block_dev, block_num, DirtyBlockKind::Metadata, f)
     }
 
     fn modify_with_kind<B, F>(
         &mut self,
         block_dev: &mut Jbd2Dev<B>,
         block_num: AbsoluteBN,
-        is_metadata: bool,
+        kind: DirtyBlockKind,
         f: F,
     ) -> Ext4Result<()>
     where
         B: BlockIo,
         F: FnOnce(&mut [u8]),
     {
-        if !is_metadata && self.mode == DataCacheMode::SharedDevice {
+        if kind == DirtyBlockKind::FileData && self.mode == DataCacheMode::SharedDevice {
             let mut block = self.get_or_load(block_dev, block_num)?;
             f(Arc::make_mut(&mut block.data).as_mut_slice());
             self.write_run(block_dev, block_num, 1, &block.data)?;
@@ -343,18 +395,25 @@ impl DataBlockCache {
             .cache
             .get_mut(&block_num)
             .ok_or(Ext4Error::corrupted())?;
+        cached.mark_dirty_as(kind)?;
         f(Arc::make_mut(&mut cached.data).as_mut_slice());
-        cached.mark_dirty();
         cached.generation = cached.generation.saturating_add(1);
 
         if !USE_MULTILEVEL_CACHE {
             let data = cached.data.clone();
-            Self::write_block_static(block_dev, block_num, &data, self.block_size, is_metadata)?;
+            Self::write_block_static(
+                block_dev,
+                block_num,
+                &data,
+                self.block_size,
+                kind.is_metadata(),
+            )?;
             let cached = self
                 .cache
                 .get_mut(&block_num)
                 .ok_or(Ext4Error::corrupted())?;
             cached.dirty = false;
+            cached.dirty_kind = None;
             cached.generation = cached.generation.saturating_add(1);
         }
         Ok(())
@@ -376,7 +435,7 @@ impl DataBlockCache {
             f(&mut block);
             return self.write_run(block_dev, block_num, 1, &block);
         }
-        self.create_new(block_dev, block_num)?;
+        self.create_new_with_kind(block_dev, block_num, DirtyBlockKind::FileData)?;
         self.modify(block_dev, block_num, f)
     }
 
@@ -391,7 +450,7 @@ impl DataBlockCache {
         B: BlockIo,
         F: FnOnce(&mut [u8]),
     {
-        self.create_new(block_dev, block_num)?;
+        self.create_new_with_kind(block_dev, block_num, DirtyBlockKind::Metadata)?;
         self.modify_metadata(block_dev, block_num, f)
     }
 
@@ -416,6 +475,25 @@ impl DataBlockCache {
             return Err(Ext4Error::buffer_too_small(data.len(), required));
         }
 
+        for off in 0..count {
+            let block_num = start_block.checked_add(off)?;
+            let Some(cached) = self.cache.get(&block_num) else {
+                continue;
+            };
+            if !cached.dirty {
+                continue;
+            }
+            match cached.dirty_kind {
+                Some(DirtyBlockKind::FileData) => {}
+                Some(DirtyBlockKind::Metadata) => {
+                    return Err(Ext4Error::corrupted().with_operation("data_cache:metadata_alias"));
+                }
+                None => {
+                    return Err(Ext4Error::corrupted().with_operation("data_cache:dirty_kind"));
+                }
+            }
+        }
+
         block_dev.write_blocks(&data[..required], start_block, count, false)?;
 
         for off in 0..count {
@@ -430,6 +508,7 @@ impl DataBlockCache {
                 Arc::make_mut(&mut cached.data)
                     .copy_from_slice(&data[start..start + self.block_size]);
                 cached.dirty = false;
+                cached.dirty_kind = None;
                 cached.last_access = self.access_counter;
                 cached.generation = cached.generation.saturating_add(1);
             }
@@ -493,7 +572,7 @@ impl DataBlockCache {
             return Ok(());
         }
 
-        self.write_dirty_runs(block_dev, &dirty_blocks, WritebackCompletion::MarkClean)
+        self.write_dirty_runs(block_dev, &dirty_blocks)
     }
 
     /// Flushes one cached block to disk.
@@ -511,11 +590,21 @@ impl DataBlockCache {
 
         let generation = cached.generation;
         let data = cached.data.clone();
-        Self::write_block_static(block_dev, block_num, &data, self.block_size, false)?;
+        let kind = cached
+            .dirty_kind
+            .ok_or_else(|| Ext4Error::corrupted().with_operation("data_cache:dirty_kind"))?;
+        Self::write_block_static(
+            block_dev,
+            block_num,
+            &data,
+            self.block_size,
+            kind.is_metadata(),
+        )?;
         if let Some(cached) = self.cache.get_mut(&block_num)
             && cached.generation == generation
         {
             cached.dirty = false;
+            cached.dirty_kind = None;
             cached.generation = cached.generation.saturating_add(1);
         }
         Ok(())
@@ -533,6 +622,9 @@ impl DataBlockCache {
         if !cached.dirty {
             return Ok(());
         }
+        if cached.dirty_kind != Some(DirtyBlockKind::Metadata) {
+            return Err(Ext4Error::corrupted().with_operation("data_cache:metadata_alias"));
+        }
 
         let generation = cached.generation;
         let data = cached.data.clone();
@@ -541,6 +633,7 @@ impl DataBlockCache {
             && cached.generation == generation
         {
             cached.dirty = false;
+            cached.dirty_kind = None;
             cached.generation = cached.generation.saturating_add(1);
         }
         Ok(())
@@ -575,12 +668,19 @@ impl DataBlockCache {
         dirty_blocks
             .try_reserve_exact(dirty_count)
             .map_err(|_| Ext4Error::no_memory())?;
-        dirty_blocks.extend(self.cache.iter().filter_map(|(&block_num, cached)| {
-            cached.dirty.then_some(DirtyBlock {
+        for (&block_num, cached) in &self.cache {
+            if !cached.dirty {
+                continue;
+            }
+            let kind = cached
+                .dirty_kind
+                .ok_or_else(|| Ext4Error::corrupted().with_operation("data_cache:dirty_kind"))?;
+            dirty_blocks.push(DirtyBlock {
                 block_num,
                 generation: cached.generation,
-            })
-        }));
+                kind,
+            });
+        }
         Ok(dirty_blocks)
     }
 
@@ -589,14 +689,22 @@ impl DataBlockCache {
         dirty_blocks
             .try_reserve_exact(block_nums.len())
             .map_err(|_| Ext4Error::no_memory())?;
-        dirty_blocks.extend(block_nums.iter().filter_map(|block_num| {
-            self.cache.get(block_num).and_then(|cached| {
-                cached.dirty.then_some(DirtyBlock {
-                    block_num: *block_num,
-                    generation: cached.generation,
-                })
-            })
-        }));
+        for block_num in block_nums {
+            let Some(cached) = self.cache.get(block_num) else {
+                return Err(Ext4Error::corrupted().with_operation("data_cache:missing_victim"));
+            };
+            if !cached.dirty {
+                continue;
+            }
+            let kind = cached
+                .dirty_kind
+                .ok_or_else(|| Ext4Error::corrupted().with_operation("data_cache:dirty_kind"))?;
+            dirty_blocks.push(DirtyBlock {
+                block_num: *block_num,
+                generation: cached.generation,
+                kind,
+            });
+        }
         dirty_blocks.sort_by_key(|dirty| dirty.block_num);
         Ok(dirty_blocks)
     }
@@ -620,7 +728,6 @@ impl DataBlockCache {
         &mut self,
         block_dev: &mut Jbd2Dev<B>,
         dirty_blocks: &[DirtyBlock],
-        completion: WritebackCompletion,
     ) -> Ext4Result<()> {
         if dirty_blocks.is_empty() {
             return Ok(());
@@ -643,7 +750,9 @@ impl DataBlockCache {
 
             while idx + run_len < dirty_blocks.len() && run_len < MAX_BUFFERED_WRITE_BLOCKS {
                 let expected = start_block.checked_add_usize(run_len)?;
-                if dirty_blocks[idx + run_len].block_num != expected {
+                if dirty_blocks[idx + run_len].block_num != expected
+                    || dirty_blocks[idx + run_len].kind != dirty_blocks[idx].kind
+                {
                     break;
                 }
                 run_len += 1;
@@ -654,7 +763,10 @@ impl DataBlockCache {
                 let cached = self.cache.get(&dirty.block_num).ok_or_else(|| {
                     Ext4Error::corrupted().with_operation("data_cache:missing_dirty_block")
                 })?;
-                if !cached.dirty || cached.generation != dirty.generation {
+                if !cached.dirty
+                    || cached.generation != dirty.generation
+                    || cached.dirty_kind != Some(dirty.kind)
+                {
                     return Err(
                         Ext4Error::corrupted().with_operation("data_cache:stale_dirty_snapshot")
                     );
@@ -666,19 +778,27 @@ impl DataBlockCache {
             }
 
             let run_len_u32 = u32::try_from(run_len).map_err(|_| Ext4Error::overflow())?;
-            block_dev.write_blocks(&buffer, start_block, run_len_u32, false)?;
-            if completion == WritebackCompletion::MarkClean {
-                for dirty in &dirty_blocks[idx..idx + run_len] {
-                    let cached = self.cache.get_mut(&dirty.block_num).ok_or_else(|| {
-                        Ext4Error::corrupted().with_operation("data_cache:lost_written_block")
-                    })?;
-                    if !cached.dirty || cached.generation != dirty.generation {
-                        return Err(Ext4Error::corrupted()
-                            .with_operation("data_cache:changed_written_block"));
-                    }
-                    cached.dirty = false;
-                    cached.generation = cached.generation.saturating_add(1);
+            block_dev.write_blocks(
+                &buffer,
+                start_block,
+                run_len_u32,
+                dirty_blocks[idx].kind.is_metadata(),
+            )?;
+            for dirty in &dirty_blocks[idx..idx + run_len] {
+                let cached = self.cache.get_mut(&dirty.block_num).ok_or_else(|| {
+                    Ext4Error::corrupted().with_operation("data_cache:lost_written_block")
+                })?;
+                if !cached.dirty
+                    || cached.generation != dirty.generation
+                    || cached.dirty_kind != Some(dirty.kind)
+                {
+                    return Err(
+                        Ext4Error::corrupted().with_operation("data_cache:changed_written_block")
+                    );
                 }
+                cached.dirty = false;
+                cached.dirty_kind = None;
+                cached.generation = cached.generation.saturating_add(1);
             }
             idx += run_len;
         }
@@ -869,42 +989,151 @@ mod tests {
     }
 
     #[test]
-    fn create_new_respects_lru_limit() {
+    fn dirty_entries_may_exceed_the_soft_lru_limit() {
         let mut cache = DataBlockCache::new(2, BLOCK_SIZE);
         let device = TestBlockDevice::new(1024);
         let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
 
         for block in 10..14 {
             cache
-                .create_new(&mut jbd2_dev, AbsoluteBN::new(block))
-                .expect("create new block");
+                .modify_new_metadata(&mut jbd2_dev, AbsoluteBN::new(block), |_| {})
+                .expect("create dirty metadata block");
         }
 
-        assert_eq!(cache.stats().total_entries, 2);
+        assert_eq!(cache.stats().total_entries, 4);
+        assert_eq!(cache.stats().dirty_entries, 4);
         assert_eq!(cache.stats().max_entries, 2);
+        assert!(jbd2_dev.into_inner().write_calls.is_empty());
     }
 
     #[cfg(feature = "USE_MULTILEVEL_CACHE")]
     #[test]
-    fn dirty_lru_eviction_batches_contiguous_blocks() {
+    fn dirty_file_data_pressure_remains_bounded() {
+        let mut cache = DataBlockCache::new(2, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+
+        for block in 10..14 {
+            cache
+                .modify_new(&mut jbd2_dev, AbsoluteBN::new(block), |data| {
+                    data[0] = block as u8;
+                })
+                .expect("cache ordinary file data");
+        }
+
+        assert_eq!(cache.stats().total_entries, 2);
+        assert_eq!(cache.stats().dirty_entries, 2);
+        assert_eq!(jbd2_dev.into_inner().write_calls, [(10, 1), (11, 1)]);
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn cache_pressure_does_not_write_back_an_unrelated_dirty_block() {
+        let mut cache = DataBlockCache::new(1, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let dirty = AbsoluteBN::new(10);
+        let loaded = AbsoluteBN::new(20);
+
+        cache
+            .modify_new_metadata(&mut jbd2_dev, dirty, |data| data.fill(0xa5))
+            .expect("create dirty metadata entry");
+        cache
+            .get_or_load(&mut jbd2_dev, loaded)
+            .expect("load an unrelated block without hidden writeback");
+
+        assert!(cache.get(dirty).expect("dirty block remains cached").dirty);
+        assert!(cache.get(loaded).is_some());
+        assert!(jbd2_dev.into_inner().write_calls.is_empty());
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn dirty_kind_alias_is_rejected_before_mutating_cached_bytes() {
+        let mut cache = DataBlockCache::new(1, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let block = AbsoluteBN::new(10);
+
+        cache
+            .modify_new_metadata(&mut jbd2_dev, block, |data| data.fill(0xa5))
+            .expect("create dirty metadata entry");
+        let error = cache
+            .modify(&mut jbd2_dev, block, |data| data.fill(0x5a))
+            .expect_err("file data must not alias dirty metadata");
+
+        assert_eq!(error.kind(), Ext4ErrorKind::Corrupted);
+        let cached = cache.get(block).expect("metadata entry remains cached");
+        assert!(cached.data.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn direct_file_write_is_rejected_before_overwriting_dirty_metadata() {
+        let mut cache = DataBlockCache::new(1, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let block = AbsoluteBN::new(10);
+
+        cache
+            .modify_new_metadata(&mut jbd2_dev, block, |data| data.fill(0xa5))
+            .expect("create dirty metadata entry");
+        let replacement = alloc::vec![0x5a; BLOCK_SIZE];
+        let error = cache
+            .write_run(&mut jbd2_dev, block, 1, &replacement)
+            .expect_err("file data must not overwrite dirty metadata");
+
+        assert_eq!(error.kind(), Ext4ErrorKind::Corrupted);
+        let cached = cache.get(block).expect("metadata entry remains cached");
+        assert!(cached.dirty);
+        assert!(cached.data.iter().all(|byte| *byte == 0xa5));
+        assert!(jbd2_dev.into_inner().write_calls.is_empty());
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn new_file_block_is_rejected_before_replacing_dirty_metadata() {
+        let mut cache = DataBlockCache::new(1, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let block = AbsoluteBN::new(10);
+
+        cache
+            .modify_new_metadata(&mut jbd2_dev, block, |data| data.fill(0xa5))
+            .expect("create dirty metadata entry");
+        let error = cache
+            .modify_new(&mut jbd2_dev, block, |data| data.fill(0x5a))
+            .expect_err("file data must not replace dirty metadata");
+
+        assert_eq!(error.kind(), Ext4ErrorKind::Corrupted);
+        let cached = cache.get(block).expect("metadata entry remains cached");
+        assert!(cached.dirty);
+        assert!(cached.data.iter().all(|byte| *byte == 0xa5));
+        assert!(jbd2_dev.into_inner().write_calls.is_empty());
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn explicit_flush_batches_dirty_blocks_after_cache_pressure() {
         let mut cache = DataBlockCache::new(8, BLOCK_SIZE);
         let device = TestBlockDevice::new(1024);
         let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
 
         for block in 10..18 {
             cache
-                .modify_new(&mut jbd2_dev, AbsoluteBN::new(block), |data| {
+                .modify_new_metadata(&mut jbd2_dev, AbsoluteBN::new(block), |data| {
                     data.fill(block as u8);
                 })
-                .expect("fill dirty cache");
+                .expect("fill dirty metadata cache");
         }
         cache
-            .modify_new(&mut jbd2_dev, AbsoluteBN::new(18), |data| data.fill(18))
-            .expect("batch dirty eviction");
+            .modify_new_metadata(&mut jbd2_dev, AbsoluteBN::new(18), |data| data.fill(18))
+            .expect("retain dirty entries under cache pressure");
 
-        assert_eq!(cache.stats().total_entries, 7);
+        assert_eq!(cache.stats().total_entries, 9);
+        cache.flush_all(&mut jbd2_dev).expect("explicit writeback");
         let device = jbd2_dev.into_inner();
-        assert_eq!(device.write_calls, [(10, 2)]);
+        assert_eq!(device.write_calls, [(10, 9)]);
     }
 
     #[test]
@@ -923,6 +1152,31 @@ mod tests {
         let device = jbd2_dev.into_inner();
         assert!(device.read_calls.is_empty());
         assert_eq!(device.write_calls, [(10, 1)]);
+    }
+
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
+    #[test]
+    fn flush_all_routes_dirty_metadata_through_the_active_handle() {
+        let mut cache = DataBlockCache::new(8, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+        let block = AbsoluteBN::new(10);
+
+        cache
+            .modify_new_metadata(&mut jbd2_dev, block, |data| data.fill(0xa5))
+            .expect("create dirty metadata block");
+        let cause = Ext4Error::io().with_operation("test:rollback_metadata_flush");
+        let error = jbd2_dev
+            .with_transaction_handle(1, |device| {
+                cache.flush_all(device)?;
+                Err::<(), _>(cause)
+            })
+            .expect_err("the outer transaction must fail");
+        assert_eq!(error, cause);
+
+        let device = jbd2_dev.into_inner();
+        let start = block.as_usize().unwrap() * BLOCK_SIZE;
+        assert_eq!(&device.data[start..start + BLOCK_SIZE], &[0; BLOCK_SIZE]);
     }
 
     #[cfg(feature = "USE_MULTILEVEL_CACHE")]
@@ -986,7 +1240,7 @@ mod tests {
 
     #[cfg(feature = "USE_MULTILEVEL_CACHE")]
     #[test]
-    fn dirty_eviction_write_failure_preserves_victim() {
+    fn cache_pressure_does_not_surface_an_unrelated_write_failure() {
         let mut cache = DataBlockCache::new(1, BLOCK_SIZE);
         let device = TestBlockDevice::failing_writes(1024);
         let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
@@ -994,19 +1248,19 @@ mod tests {
         let replacement = AbsoluteBN::new(20);
 
         cache
-            .modify_new(&mut jbd2_dev, victim, |data| data.fill(0xa5))
-            .expect("dirty victim creation does not write through");
+            .modify_new_metadata(&mut jbd2_dev, victim, |data| data.fill(0xa5))
+            .expect("dirty metadata creation does not write through");
 
-        let error = cache
-            .create_new(&mut jbd2_dev, replacement)
-            .expect_err("dirty eviction must report the device write error");
-        assert_eq!(error.kind(), Ext4ErrorKind::Io);
+        cache
+            .modify_new_metadata(&mut jbd2_dev, replacement, |_| {})
+            .expect("cache pressure must not perform writeback");
 
-        let cached = cache.get(victim).expect("failed writeback keeps victim");
+        let cached = cache.get(victim).expect("dirty victim remains cached");
         assert!(cached.dirty);
         assert!(cached.data.iter().all(|byte| *byte == 0xa5));
-        assert!(cache.get(replacement).is_none());
-        assert_eq!(cache.stats().total_entries, 1);
+        assert!(cache.get(replacement).expect("replacement is cached").dirty);
+        assert_eq!(cache.stats().total_entries, 2);
+        assert_eq!(jbd2_dev.into_inner().write_attempts, 0);
     }
 
     #[cfg(not(feature = "USE_MULTILEVEL_CACHE"))]
