@@ -6,11 +6,11 @@
 //! from folios when possible (`bread`), writes only mark slots dirty
 //! (`mark_buffer_dirty`) and reach the device at writeback. Requests
 //! spanning multiple folios take the device-direct path (the analog of
-//! direct IO): overlapping dirty slots are written back first so the
-//! device is current, the request is submitted unchanged, and the result
-//! is overlaid onto cached folios. The buffered/direct split at folio
-//! granularity replaces Linux's filesystem-declared metadata/data split
-//! because the `FsBlockDevice` boundary only observes request shapes;
+//! direct IO): reads run concurrently under shared admission and reconcile
+//! newer dirty slots after device completion; writes retain exclusive
+//! admission and writeback-before-update ordering. The buffered/direct split
+//! at folio granularity replaces Linux's filesystem-declared metadata/data
+//! split because the `FsBlockDevice` boundary only observes request shapes;
 //! see the module documentation for the full mapping.
 
 use alloc::{boxed::Box, sync::Arc};
@@ -52,9 +52,9 @@ fn lock_for_current_context<T>(lock: &SleepMutex<T>) -> BlockResult<SleepMutexGu
 
 /// Device cache state whose lifetime is independent from a writeback endpoint.
 ///
-/// The durability barrier is shared by ordinary one-folio operations and
-/// exclusive to direct I/O and flush. Each shard owns disjoint frame indices,
-/// so unrelated folios retain separate sleepable locks while a flush can still
+/// The durability barrier is shared by reads and ordinary one-folio writes,
+/// and exclusive to direct writes and flush. Each shard owns disjoint frame
+/// indices, so unrelated I/O can proceed concurrently while a flush can still
 /// drain every admitted operation before publishing the device barrier.
 pub(super) struct BlockCacheState {
     geometry: FolioGeometry,
@@ -140,16 +140,18 @@ impl BlockCacheState {
         })
     }
 
-    fn apply_direct(
-        &self,
-        first: u64,
-        count: u64,
-        data: &[u8],
-        preserve_dirty: bool,
-    ) -> BlockResult<()> {
+    fn reconcile_direct_read(&self, first: u64, count: u64, data: &mut [u8]) -> BlockResult<()> {
         let mask = Self::shard_mask_for_range(self.geometry, first, count);
         self.for_each_shard_in_mask(mask, |shard| {
-            shard.apply_direct(first, count, data, preserve_dirty);
+            shard.reconcile_direct_read(first, count, data);
+            Ok(())
+        })
+    }
+
+    fn apply_direct_write(&self, first: u64, count: u64, data: &[u8]) -> BlockResult<()> {
+        let mask = Self::shard_mask_for_range(self.geometry, first, count);
+        self.for_each_shard_in_mask(mask, |shard| {
+            shard.apply_direct_write(first, count, data);
             Ok(())
         })
     }
@@ -417,14 +419,12 @@ impl<T: FsBlockDevice> FsBlockDevice for BufferedBlockDevice<T> {
                 buf,
             );
         }
-        let _barrier = self.shared.state.barrier.exclusive()?;
-        // Direct read: write overlapping dirty slots back first so stale
-        // device bytes cannot bypass newer cached data.
-        self.shared
-            .state
-            .writeback_range(&mut self.inner, Some((first, count)))?;
+        let _barrier = self.shared.state.barrier.shared()?;
+        // Direct reads do not need the durability barrier or eager writeback.
+        // Reconciliation below replaces stale device bytes with any newer
+        // buffered slots while holding each overlapping cache shard briefly.
         self.inner.read_block(block_id, buf)?;
-        self.shared.state.apply_direct(first, count, buf, true)?;
+        self.shared.state.reconcile_direct_read(first, count, buf)?;
         Ok(())
     }
 
@@ -451,7 +451,7 @@ impl<T: FsBlockDevice> FsBlockDevice for BufferedBlockDevice<T> {
             .writeback_range(&mut self.inner, Some((first, count)))?;
         match self.inner.write_block(block_id, buf) {
             Ok(()) => {
-                self.shared.state.apply_direct(first, count, buf, false)?;
+                self.shared.state.apply_direct_write(first, count, buf)?;
                 Ok(())
             }
             Err(error) => {
@@ -478,7 +478,7 @@ impl<T: FsBlockDevice> FsBlockDevice for BufferedBlockDevice<T> {
             .writeback_range(&mut self.inner, Some((first, count)))?;
         match self.inner.write_block_fua(block_id, buf) {
             Ok(()) => {
-                self.shared.state.apply_direct(first, count, buf, false)?;
+                self.shared.state.apply_direct_write(first, count, buf)?;
                 Ok(())
             }
             Err(error) => {

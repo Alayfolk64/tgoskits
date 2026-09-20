@@ -233,17 +233,12 @@ impl BlockAddressSpace {
         Ok(())
     }
 
-    /// Overlays a device-direct request result onto overlapping folios so
-    /// cached slots stay coherent with the bytes the device just saw.
-    /// Dirty slots keep their newer bytes when `preserve_dirty` is set
-    /// (direct reads); direct writes clear dirty state beforehand.
-    pub(crate) fn apply_direct(
-        &mut self,
-        first: u64,
-        count: u64,
-        data: &[u8],
-        preserve_dirty: bool,
-    ) {
+    /// Reconciles a completed direct read with cached folios.
+    ///
+    /// Dirty slots replace stale device bytes in `data`; other cached slots
+    /// consume the completed device result. The caller serializes this short
+    /// cache mutation with buffered access to the same shard.
+    pub(crate) fn reconcile_direct_read(&mut self, first: u64, count: u64, data: &mut [u8]) {
         let geometry = self.geometry;
         let Some(last) = count.checked_sub(1).and_then(|n| first.checked_add(n)) else {
             return;
@@ -256,12 +251,29 @@ impl BlockAddressSpace {
             let data_begin = (geometry.frame_base_block(frame) + slot_lo as u64 - first) as usize
                 * geometry.block_size;
             let data_end = data_begin + (slot_hi - slot_lo) * geometry.block_size;
-            folio.overlay_external(
+            folio.reconcile_external_read(
                 slot_lo,
                 slot_hi - slot_lo,
-                &data[data_begin..data_end],
-                preserve_dirty,
+                &mut data[data_begin..data_end],
             );
+        }
+    }
+
+    /// Overlays a completed direct write onto overlapping cached folios.
+    pub(crate) fn apply_direct_write(&mut self, first: u64, count: u64, data: &[u8]) {
+        let geometry = self.geometry;
+        let Some(last) = count.checked_sub(1).and_then(|n| first.checked_add(n)) else {
+            return;
+        };
+        for frame in geometry.frame_of(first)..=geometry.frame_of(last) {
+            let Some(folio) = self.folios.get_mut(&frame) else {
+                continue;
+            };
+            let (slot_lo, slot_hi) = overlap_slots(&geometry, frame, first, last);
+            let data_begin = (geometry.frame_base_block(frame) + slot_lo as u64 - first) as usize
+                * geometry.block_size;
+            let data_end = data_begin + (slot_hi - slot_lo) * geometry.block_size;
+            folio.overlay_external_write(slot_lo, slot_hi - slot_lo, &data[data_begin..data_end]);
         }
     }
 

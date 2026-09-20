@@ -27,9 +27,9 @@
 //!   would have no observable effect.
 //! * Folio indices are partitioned across 64 sleepable shards rather than
 //!   carrying a lock in every folio. One-folio operations on different
-//!   shards can submit concurrently. Direct multi-folio I/O and durability
-//!   barriers take exclusive admission, preserving coherent cache overlay and
-//!   flush ordering without a device-wide lock on the common path.
+//!   shards can submit concurrently. Multi-folio reads also use shared
+//!   admission and reconcile dirty cache bytes after device completion.
+//!   Direct writes and durability barriers retain exclusive admission.
 //! * The metadata/data split is expressed at folio granularity: requests
 //!   inside one folio take the buffered path, multi-folio requests go
 //!   device-direct. Linux declares the same split at the filesystem layer

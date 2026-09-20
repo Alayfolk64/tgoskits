@@ -442,6 +442,55 @@ fn reads_of_distinct_folios_enter_independent_endpoints_concurrently() {
 }
 
 #[test]
+fn multi_folio_reads_enter_independent_endpoints_concurrently() {
+    let _registry_test = REGISTRY_TEST.lock().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (device, state) = ConcurrentReadDevice::new(entered_tx);
+    let first =
+        BufferedBlockDevice::with_device_key(KEY_A + 38, Box::new(device.clone()), device.clone())
+            .unwrap();
+    let second =
+        BufferedBlockDevice::with_device_key(KEY_A + 38, Box::new(device.clone()), device).unwrap();
+    let start = Arc::new(Barrier::new(3));
+
+    let first_start = Arc::clone(&start);
+    let first_worker = thread::spawn(move || {
+        let mut first = first;
+        let mut buffer = [0u8; 16 * 512];
+        first_start.wait();
+        let result = first.read_block(0, &mut buffer);
+        (first, result, buffer)
+    });
+    let second_start = Arc::clone(&start);
+    let second_worker = thread::spawn(move || {
+        let mut second = second;
+        let mut buffer = [0u8; 16 * 512];
+        second_start.wait();
+        let result = second.read_block(16, &mut buffer);
+        (second, result, buffer)
+    });
+
+    start.wait();
+    let first_entered = entered_rx.recv_timeout(Duration::from_secs(1));
+    let second_entered = entered_rx.recv_timeout(Duration::from_secs(1));
+    state.release();
+    let (first, first_result, first_buffer) = first_worker.join().unwrap();
+    let (second, second_result, second_buffer) = second_worker.join().unwrap();
+    drop(first);
+    drop(second);
+
+    assert!(first_entered.is_ok(), "one endpoint must enter device IO");
+    assert!(
+        second_entered.is_ok(),
+        "multi-folio reads must not take device-wide exclusive admission"
+    );
+    assert_eq!(first_result, Ok(()));
+    assert_eq!(second_result, Ok(()));
+    assert!(first_buffer.iter().all(|byte| *byte == 0));
+    assert!(second_buffer.iter().all(|byte| *byte == 16));
+}
+
+#[test]
 fn read_is_served_from_cache_on_second_access() {
     let _registry_test = REGISTRY_TEST.lock().unwrap();
     let (device, state) = RecordingDevice::new(64, 512);
@@ -744,17 +793,44 @@ fn direct_read_observes_deferred_dirty_data() {
     assert_eq!(count_ops(&state, |op| matches!(op, IoOp::Write { .. })), 0);
 
     // A multi-folio read must not bypass the dirty folio with stale device
-    // bytes: writeback happens first, then the direct read.
+    // bytes, but reading does not need to force those bytes to storage.
     let mut buf = [0u8; 16 * 512];
     cached.read_block(0, &mut buf).unwrap();
     assert!(buf[..512].iter().all(|&b| b == 0x99));
     let log = state.lock().unwrap().log.clone();
-    let writeback = log.iter().position(|op| op.is_write_of(0, 1)).unwrap();
-    let direct_read = log
-        .iter()
-        .position(|op| matches!(op, IoOp::Read { lba: 0, blocks: 16 }))
-        .unwrap();
-    assert!(writeback < direct_read);
+    assert_eq!(log, vec![IoOp::Read { lba: 0, blocks: 16 }]);
+}
+
+#[test]
+fn buffered_write_during_multi_folio_read_wins_reconciliation() {
+    let _registry_test = REGISTRY_TEST.lock().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (device, state) = ConcurrentReadDevice::new(entered_tx);
+    let key = KEY_A + 39;
+    let reader =
+        BufferedBlockDevice::with_device_key(key, Box::new(device.clone()), device.clone())
+            .unwrap();
+    let mut writer =
+        BufferedBlockDevice::with_device_key(key, Box::new(device.clone()), device).unwrap();
+    let worker = thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = [0u8; 16 * 512];
+        let result = reader.read_block(0, &mut buffer);
+        (reader, result, buffer)
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("direct read must enter the device");
+    let dirty = [0xa5; 512];
+    writer.write_block(3, &dirty).unwrap();
+    state.release();
+    let (reader, result, buffer) = worker.join().unwrap();
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(&buffer[3 * 512..4 * 512], &dirty);
+    drop(reader);
+    drop(writer);
 }
 
 #[test]

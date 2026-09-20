@@ -104,30 +104,31 @@ impl CacheFolio {
         self.heads.iter().any(BufferHead::is_dirty)
     }
 
-    /// Overlays the result of a device-direct request onto this folio.
+    /// Reconciles a completed direct read with newer buffered slots.
     ///
-    /// `src` holds the bytes of the whole direct request starting at this
-    /// folio's first overlapping slot. Dirty slots hold data newer than the
-    /// device copy, so they keep their bytes when `preserve_dirty` is set
-    /// (direct reads); direct writes pass `false` because any overlapping
-    /// dirty state was written back before the device write.
-    pub(crate) fn overlay_external(
-        &mut self,
-        slot: usize,
-        count: usize,
-        src: &[u8],
-        preserve_dirty: bool,
-    ) {
+    /// Clean or missing slots accept the device bytes and become uptodate.
+    /// Dirty slots are newer than the device result, so their cached bytes
+    /// replace the corresponding output bytes before the read is returned.
+    pub(crate) fn reconcile_external_read(&mut self, slot: usize, count: usize, output: &mut [u8]) {
         let block = self.data.len() / self.heads.len();
-        for (offset, head) in self.heads[slot..slot + count].iter_mut().enumerate() {
-            let src_block = &src[offset * block..(offset + 1) * block];
-            if preserve_dirty && head.is_dirty() {
-                continue;
+        for offset in 0..count {
+            let cached_start = (slot + offset) * block;
+            let output_start = offset * block;
+            let cached = &mut self.data[cached_start..cached_start + block];
+            let external = &mut output[output_start..output_start + block];
+            if self.heads[slot + offset].is_dirty() {
+                external.copy_from_slice(cached);
+            } else {
+                cached.copy_from_slice(external);
+                self.heads[slot + offset].mark_uptodate();
             }
-            let start = (slot + offset) * block;
-            self.data[start..start + block].copy_from_slice(src_block);
-            head.mark_uptodate();
         }
+    }
+
+    /// Publishes a completed device-direct write into cached clean slots.
+    pub(crate) fn overlay_external_write(&mut self, slot: usize, count: usize, src: &[u8]) {
+        self.copy_into_slots(slot, count, src);
+        self.mark_slots_uptodate(slot, count);
     }
 
     /// Iterates runs of consecutive dirty slots in ascending order, so
