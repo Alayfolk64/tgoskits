@@ -266,8 +266,7 @@ impl FileLike for File {
     }
 
     fn inode_key(&self) -> Option<(u64, u64)> {
-        let m = self.inner().location().metadata().ok()?;
-        Some((m.device, m.inode))
+        Some(self.inner().location().inode_identity())
     }
 
     fn ioctl(
@@ -457,8 +456,7 @@ impl FileLike for Directory {
     }
 
     fn inode_key(&self) -> Option<(u64, u64)> {
-        let m = self.inner.metadata().ok()?;
-        Some((m.device, m.inode))
+        Some(self.inner.inode_identity())
     }
 
     fn open_flags(&self) -> u32 {

@@ -1421,6 +1421,7 @@ dependencies = [
 name = "axfs-ng-vfs"
 version = "0.7.1"
 dependencies = [
+ "ax-crate-interface",
  "ax-sync",
  "axpoll",
  "bitflags 2.13.2",

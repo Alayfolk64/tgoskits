@@ -804,6 +804,11 @@ impl Location {
 
     pub fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize>;
 
+    /// Returns the filesystem and inode identity used for inode-scoped state.
+    pub fn inode_identity(&self) -> (u64, u64) {
+        (self.mountpoint.device(), self.entry.inode())
+    }
+
     pub fn flags(&self) -> NodeFlags;
 
     pub fn user_data(&self) -> MutexGuard<'_, TypeMap>;

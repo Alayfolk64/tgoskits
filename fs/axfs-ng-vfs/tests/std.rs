@@ -7,11 +7,68 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    panic::Location,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
 extern crate alloc;
+
+struct HostSpinOps;
+
+#[ax_crate_interface::impl_interface]
+impl ax_sync::interface::SpinOps for HostSpinOps {
+    fn acquire(
+        locked: &AtomicBool,
+        _metadata: &ax_sync::interface::LockMetadata,
+        _lock_addr: usize,
+        _context: u8,
+        _subclass: u32,
+        _caller: &'static Location<'static>,
+    ) -> ax_sync::interface::ContextState {
+        while locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        ax_sync::interface::ContextState::new(0, 0)
+    }
+
+    fn try_acquire(
+        locked: &AtomicBool,
+        _metadata: &ax_sync::interface::LockMetadata,
+        _lock_addr: usize,
+        _context: u8,
+        _subclass: u32,
+        _caller: &'static Location<'static>,
+    ) -> ax_sync::interface::AcquireResult {
+        let acquired = locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        ax_sync::interface::AcquireResult::new(
+            acquired,
+            ax_sync::interface::ContextState::new(0, 0),
+        )
+    }
+
+    fn release(
+        locked: &AtomicBool,
+        _lock_addr: usize,
+        _context: u8,
+        _context_state: ax_sync::interface::ContextState,
+    ) {
+        locked.store(false, Ordering::Release);
+    }
+
+    fn force_release(locked: &AtomicBool, _lock_addr: usize, _context: u8) {
+        locked.store(false, Ordering::Release);
+    }
+
+    fn is_locked(locked: &AtomicBool) -> bool {
+        locked.load(Ordering::Acquire)
+    }
+}
 
 #[test]
 fn axfs_ng_vfs_path_rules_hold() {
@@ -1236,6 +1293,7 @@ struct MoreTestDir {
     self_ref: axfs_ng_vfs::WeakDirEntry,
     children: axfs_ng_vfs::Mutex<Vec<(String, axfs_ng_vfs::DirEntry)>>,
     next_inode: AtomicU64,
+    metadata_calls: AtomicUsize,
 }
 
 impl MoreTestDir {
@@ -1253,6 +1311,7 @@ impl MoreTestDir {
                         self_ref: weak,
                         children: axfs_ng_vfs::Mutex::new(Vec::new()),
                         next_inode: AtomicU64::new(inode * 10),
+                        metadata_calls: AtomicUsize::new(0),
                     }))
                 },
                 axfs_ng_vfs::Reference::new(self.parent(), name.into()),
@@ -1300,6 +1359,7 @@ impl axfs_ng_vfs::NodeOps for MoreTestDir {
     }
 
     fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> {
+        self.metadata_calls.fetch_add(1, Ordering::Relaxed);
         Ok(more_metadata(self.inode, axfs_ng_vfs::NodeType::Directory))
     }
 
@@ -1470,6 +1530,7 @@ fn new_more_root(inode: u64, child_dirs: &[&str], child_files: &[&str]) -> axfs_
                 self_ref: weak,
                 children: axfs_ng_vfs::Mutex::new(Vec::new()),
                 next_inode: AtomicU64::new(inode * 10),
+                metadata_calls: AtomicUsize::new(0),
             }))
         },
         axfs_ng_vfs::Reference::root(),
@@ -1498,6 +1559,25 @@ fn new_more_root(inode: u64, child_dirs: &[&str], child_files: &[&str]) -> axfs_
             .unwrap();
     }
     root
+}
+
+#[test]
+fn axfs_ng_vfs_inode_identity_does_not_read_metadata() {
+    use axfs_ng_vfs::Mountpoint;
+
+    let filesystem = new_more_fs("identity-root", false, 1800, &[], &[]);
+    let mountpoint = Mountpoint::new_root(&filesystem);
+    let location = mountpoint.root_location();
+    let directory = location
+        .entry()
+        .as_dir()
+        .unwrap()
+        .downcast::<MoreTestDir>()
+        .unwrap();
+
+    assert_eq!(directory.metadata_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(location.inode_identity(), (mountpoint.device(), 1800));
+    assert_eq!(directory.metadata_calls.load(Ordering::Relaxed), 0);
 }
 
 fn new_more_fs(
