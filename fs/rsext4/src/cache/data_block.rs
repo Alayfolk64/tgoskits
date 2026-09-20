@@ -988,6 +988,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "USE_MULTILEVEL_CACHE")]
     #[test]
     fn dirty_entries_may_exceed_the_soft_lru_limit() {
         let mut cache = DataBlockCache::new(2, BLOCK_SIZE);
@@ -1004,6 +1005,28 @@ mod tests {
         assert_eq!(cache.stats().dirty_entries, 4);
         assert_eq!(cache.stats().max_entries, 2);
         assert!(jbd2_dev.into_inner().write_calls.is_empty());
+    }
+
+    #[cfg(not(feature = "USE_MULTILEVEL_CACHE"))]
+    #[test]
+    fn metadata_pressure_remains_write_through_and_bounded_without_cache() {
+        let mut cache = DataBlockCache::new(2, BLOCK_SIZE);
+        let device = TestBlockDevice::new(1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, false);
+
+        for block in 10..14 {
+            cache
+                .modify_new_metadata(&mut jbd2_dev, AbsoluteBN::new(block), |_| {})
+                .expect("write metadata block through");
+        }
+
+        assert_eq!(cache.stats().total_entries, 2);
+        assert_eq!(cache.stats().dirty_entries, 0);
+        assert_eq!(cache.stats().max_entries, 2);
+        assert_eq!(
+            jbd2_dev.into_inner().write_calls,
+            [(10, 1), (11, 1), (12, 1), (13, 1)]
+        );
     }
 
     #[cfg(feature = "USE_MULTILEVEL_CACHE")]
