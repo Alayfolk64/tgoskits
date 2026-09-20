@@ -7,7 +7,7 @@ use axfs_ng_vfs::{
     DeviceId, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
     VfsResult, WritebackPolicy, XattrOps,
 };
-use rsext4::{DeviceNumber, Ext4Timestamp, FilePermissions, InodeFlags, InodeMetadataUpdate};
+use rsext4::{DeviceNumber, Ext4Timestamp, FilePermissions, InodeMetadataUpdate};
 
 use super::{super::util::directory_entry_type_to_vfs, Inode, into_vfs_err};
 
@@ -65,10 +65,7 @@ impl NodeOps for Inode {
     }
 
     fn len(&self) -> VfsResult<u64> {
-        self.lifetime
-            .metadata()
-            .map(|inode| inode.size)
-            .map_err(into_vfs_err)
+        self.lifetime.file_size().map_err(into_vfs_err)
     }
 
     fn filesystem(&self) -> &dyn FilesystemOps {
@@ -88,17 +85,7 @@ impl NodeOps for Inode {
     }
 
     fn writeback_policy(&self) -> VfsResult<WritebackPolicy> {
-        let flags = self.lifetime.metadata().map_err(into_vfs_err)?.flags;
-        let mut policy = WritebackPolicy::empty();
-        policy.set(
-            WritebackPolicy::SYNCHRONOUS,
-            flags.contains(InodeFlags::SYNC),
-        );
-        policy.set(
-            WritebackPolicy::DIRECTORY_SYNC,
-            flags.contains(InodeFlags::DIRECTORY_SYNC),
-        );
-        Ok(policy)
+        self.lifetime.writeback_policy().map_err(into_vfs_err)
     }
 
     fn xattr_ops(&self) -> Option<&dyn XattrOps> {

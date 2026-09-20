@@ -1,9 +1,9 @@
-//! Sleepable reader/writer admission for inode and namespace ownership, not data storage.
+//! Sleepable ownership admission with optional per-inode hot metadata.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use axfs_ng_vfs::{VfsError, VfsResult};
+use axfs_ng_vfs::{VfsError, VfsResult, WritebackPolicy};
 
 use crate::{
     error::block_error_to_vfs_error,
@@ -14,10 +14,14 @@ pub(crate) struct AccessGate {
     state: IrqMutex<AccessState>,
     changed: TaskWaiters,
     lifetime_state: AtomicUsize,
+    regular_file_size: AtomicU64,
+    writeback_policy: AtomicU8,
 }
 
 const ZERO_LINK: usize = 1 << (usize::BITS - 1);
 const LIFETIME_REFS: usize = !ZERO_LINK;
+const UNKNOWN_REGULAR_FILE_SIZE: u64 = u64::MAX;
+const UNKNOWN_WRITEBACK_POLICY: u8 = u8::MAX;
 
 struct AccessState {
     readers: usize,
@@ -45,6 +49,8 @@ impl AccessGate {
             }),
             changed: TaskWaiters::new(),
             lifetime_state: AtomicUsize::new(0),
+            regular_file_size: AtomicU64::new(UNKNOWN_REGULAR_FILE_SIZE),
+            writeback_policy: AtomicU8::new(UNKNOWN_WRITEBACK_POLICY),
         }
     }
 
@@ -90,6 +96,45 @@ impl AccessGate {
             previous, ZERO_LINK,
             "successful inode reap must have zero lifetime references"
         );
+    }
+
+    /// Initializes a regular inode's hot size without overwriting a value
+    /// published by a concurrent content writer.
+    pub(crate) fn initialize_regular_file_size(&self, size: u64) {
+        debug_assert_ne!(size, UNKNOWN_REGULAR_FILE_SIZE);
+        let _ = self.regular_file_size.compare_exchange(
+            UNKNOWN_REGULAR_FILE_SIZE,
+            size,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn regular_file_size(&self) -> Option<u64> {
+        let size = self.regular_file_size.load(Ordering::Acquire);
+        (size != UNKNOWN_REGULAR_FILE_SIZE).then_some(size)
+    }
+
+    /// Publishes after a successful mutation and before content-write access
+    /// is released, matching Linux's locked `i_size_write()` contract.
+    pub(crate) fn publish_regular_file_size(&self, size: u64) {
+        debug_assert_ne!(size, UNKNOWN_REGULAR_FILE_SIZE);
+        self.regular_file_size.store(size, Ordering::Release);
+    }
+
+    pub(crate) fn initialize_writeback_policy(&self, policy: WritebackPolicy) {
+        debug_assert_ne!(policy.bits(), UNKNOWN_WRITEBACK_POLICY);
+        let _ = self.writeback_policy.compare_exchange(
+            UNKNOWN_WRITEBACK_POLICY,
+            policy.bits(),
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn writeback_policy(&self) -> Option<WritebackPolicy> {
+        let policy = self.writeback_policy.load(Ordering::Acquire);
+        (policy != UNKNOWN_WRITEBACK_POLICY).then(|| WritebackPolicy::from_bits_retain(policy))
     }
 
     #[cfg(test)]

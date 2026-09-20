@@ -20,6 +20,19 @@ fn unlinked_last_lifetime_release_requests_orphan_reap() {
 }
 
 #[test]
+fn hot_metadata_initialization_does_not_overwrite_writer_publication() {
+    let gate = AccessGate::new();
+    gate.initialize_regular_file_size(5);
+    gate.publish_regular_file_size(9);
+    gate.initialize_regular_file_size(5);
+    assert_eq!(gate.regular_file_size(), Some(9));
+
+    gate.initialize_writeback_policy(WritebackPolicy::empty());
+    gate.initialize_writeback_policy(WritebackPolicy::SYNCHRONOUS);
+    assert_eq!(gate.writeback_policy(), Some(WritebackPolicy::empty()));
+}
+
+#[test]
 fn independent_readers_share_ownership_until_the_last_release() {
     let gate = Arc::new(AccessGate::new());
     let first = gate.read().unwrap();

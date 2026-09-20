@@ -2,8 +2,8 @@
 
 use alloc::sync::Arc;
 
-use axfs_ng_vfs::VfsResult;
-use rsext4::InodeNumber;
+use axfs_ng_vfs::{VfsResult, WritebackPolicy};
+use rsext4::{DirectoryEntryType, InodeFlags, InodeNumber};
 
 use super::{AccessGate, Ext4Filesystem, Ext4State, into_vfs_err, namespace::NamespaceChange};
 
@@ -117,7 +117,39 @@ impl InodeLifetime {
 
     /// Inspect while retaining the same allocation across any cold table read.
     pub(crate) fn metadata(&self) -> rsext4::Ext4Result<rsext4::InodeInfo> {
-        self.filesystem.read_live_inode_info(self.number)
+        let info = self.filesystem.read_live_inode_info(self.number)?;
+        if info.file_type() == DirectoryEntryType::RegularFile {
+            self.access.initialize_regular_file_size(info.size);
+        }
+        self.access
+            .initialize_writeback_policy(writeback_policy(info.flags));
+        Ok(info)
+    }
+
+    /// Reads Linux-style hot `i_size` state for regular files. Directories and
+    /// special nodes retain authoritative metadata reads because their size
+    /// changes are not serialized by regular-file content access.
+    pub(crate) fn file_size(&self) -> rsext4::Ext4Result<u64> {
+        if let Some(size) = self.access.regular_file_size() {
+            return Ok(size);
+        }
+        let info = self.metadata()?;
+        Ok(self.access.regular_file_size().unwrap_or(info.size))
+    }
+
+    pub(crate) fn publish_file_size(&self, size: u64) {
+        self.access.publish_regular_file_size(size);
+    }
+
+    pub(crate) fn writeback_policy(&self) -> rsext4::Ext4Result<WritebackPolicy> {
+        if let Some(policy) = self.access.writeback_policy() {
+            return Ok(policy);
+        }
+        let info = self.metadata()?;
+        Ok(self
+            .access
+            .writeback_policy()
+            .unwrap_or_else(|| writeback_policy(info.flags)))
     }
 
     pub(crate) fn filesystem(&self) -> &Arc<Ext4Filesystem> {
@@ -131,6 +163,19 @@ impl InodeLifetime {
     pub(crate) fn content_access(&self) -> &Arc<AccessGate> {
         &self.access
     }
+}
+
+fn writeback_policy(flags: InodeFlags) -> WritebackPolicy {
+    let mut policy = WritebackPolicy::empty();
+    policy.set(
+        WritebackPolicy::SYNCHRONOUS,
+        flags.contains(InodeFlags::SYNC),
+    );
+    policy.set(
+        WritebackPolicy::DIRECTORY_SYNC,
+        flags.contains(InodeFlags::DIRECTORY_SYNC),
+    );
+    policy
 }
 
 impl Drop for InodeLifetime {

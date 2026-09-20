@@ -2,6 +2,7 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
+use axfs_ng_vfs::NodeOps;
 use rsext4::{FileName, FilePermissions, MutationContext};
 
 use super::*;
@@ -101,5 +102,73 @@ fn dropping_an_inode_lifetime_never_waits_for_mount_state() {
     assert!(
         completed_without_mount_state,
         "inode lifetime drop waited for the ext4 mount-state mutex"
+    );
+}
+
+#[test]
+fn hot_regular_file_metadata_does_not_wait_for_mount_state() {
+    let (filesystem, _) = test_filesystem(false);
+    let filesystem = Arc::new(filesystem);
+    let inode = {
+        let mut state = filesystem.lock();
+        let root = state.ext4.root_inode();
+        let created = state
+            .ext4
+            .create_regular_file(
+                MutationContext::new(0, 0, 0, 0),
+                root,
+                FileName::new(b"hot-metadata").unwrap(),
+                FilePermissions::new(0o600).unwrap(),
+            )
+            .unwrap();
+        Inode::new(state.retain_inode(&filesystem, created.number), None)
+    };
+    let expected_size = inode.metadata().unwrap().size;
+    let expected_policy = inode.writeback_policy().unwrap();
+    filesystem.sync_to_disk().unwrap();
+    {
+        let mut state = filesystem.lock();
+        let root = state.ext4.root_inode();
+        for index in 0..=rsext4::INODE_CACHE_MAX {
+            let name = std::format!("hot-metadata-pressure-{index}");
+            state
+                .ext4
+                .create_regular_file(
+                    MutationContext::new(0, 0, 0, 0),
+                    root,
+                    FileName::new(name.as_bytes()).unwrap(),
+                    FilePermissions::new(0o600).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+    assert!(
+        filesystem
+            .inode_metadata
+            .try_get(InodeNumber::new(inode.inode() as u32).unwrap())
+            .unwrap()
+            .is_none(),
+        "fixture did not evict the authoritative inode-table cache entry"
+    );
+
+    let state = filesystem.lock();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        assert_eq!(inode.len().unwrap(), expected_size);
+        assert_eq!(inode.writeback_policy().unwrap(), expected_policy);
+        completed_tx.send(()).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let completed_without_mount_state = completed_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    drop(state);
+    reader.join().unwrap();
+
+    assert!(
+        completed_without_mount_state,
+        "hot regular-file metadata waited for the ext4 mount-state mutex"
     );
 }

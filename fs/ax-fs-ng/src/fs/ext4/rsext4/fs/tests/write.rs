@@ -85,14 +85,71 @@ fn unlink_during_real_data_write_keeps_zero_links_and_the_open_inode() {
 #[test]
 fn data_write_failure_releases_both_mapping_and_content_ownership() {
     let (filesystem, input) = fixture();
+    let size_before_failure = input.len().unwrap();
     let probe = watch(&filesystem, &input, Interference::IoFailure);
     assert_eq!(input.write_at(b"failed", 4096), Err(VfsError::Io));
     assert_observed();
     drop(probe);
+    assert_eq!(input.len(), Ok(size_before_failure));
     let number = InodeNumber::new(input.inode().try_into().unwrap()).unwrap();
     assert!(filesystem.inode_access(number).try_write().is_some());
     input.set_len(0).unwrap();
     assert_eq!(input.len(), Ok(0));
+}
+
+#[test]
+fn size_changing_operations_publish_the_shared_hot_size() {
+    let (filesystem, _) = test_filesystem(false);
+    let filesystem = Arc::new(filesystem);
+    let input = super::read::create_inode(&filesystem, b"hot-size", b"hello");
+    assert_eq!(input.len(), Ok(5));
+
+    assert_eq!(input.write_at(b"x", 8), Ok(1));
+    assert_eq!(input.len(), Ok(9));
+    assert_eq!(input.write_at(b"", 32), Ok(0));
+    assert_eq!(input.len(), Ok(9));
+    assert_eq!(input.append(b"yz"), Ok((2, 11)));
+    assert_eq!(input.len(), Ok(11));
+
+    input
+        .operate_range(
+            4096,
+            4096,
+            axfs_ng_vfs::FileRangeOperation::Allocate(axfs_ng_vfs::PreallocationMode::ExtendSize),
+        )
+        .unwrap();
+    assert_eq!(input.len(), Ok(8192));
+    input
+        .operate_range(
+            12288,
+            4096,
+            axfs_ng_vfs::FileRangeOperation::Allocate(axfs_ng_vfs::PreallocationMode::KeepSize),
+        )
+        .unwrap();
+    assert_eq!(input.len(), Ok(8192));
+    input
+        .operate_range(4096, 4096, axfs_ng_vfs::FileRangeOperation::PunchHole)
+        .unwrap();
+    assert_eq!(input.len(), Ok(8192));
+    input
+        .operate_range(
+            8192,
+            4096,
+            axfs_ng_vfs::FileRangeOperation::ZeroRange(axfs_ng_vfs::PreallocationMode::ExtendSize),
+        )
+        .unwrap();
+    assert_eq!(input.len(), Ok(12288));
+    input
+        .operate_range(4096, 4096, axfs_ng_vfs::FileRangeOperation::InsertRange)
+        .unwrap();
+    assert_eq!(input.len(), Ok(16384));
+    input
+        .operate_range(4096, 4096, axfs_ng_vfs::FileRangeOperation::CollapseRange)
+        .unwrap();
+    assert_eq!(input.len(), Ok(12288));
+
+    input.set_len(3).unwrap();
+    assert_eq!(input.len(), Ok(3));
 }
 
 #[test]

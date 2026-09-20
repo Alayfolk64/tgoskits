@@ -17,9 +17,14 @@ impl FileNodeOps for Inode {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let _inode = self.content_access().write()?;
+        let old_size = self.lifetime.file_size().map_err(into_vfs_err)?;
+        let end = Self::write_end(offset, buf.len())?;
         // Use inode-number-based write so open-unlinked regular files remain
         // writable after their directory entry has been removed.
         self.write_locked(buf, offset).map_err(into_vfs_err)?;
+        if !buf.is_empty() {
+            self.lifetime.publish_file_size(old_size.max(end));
+        }
         self.finish_metadata_change()?;
         Ok(buf.len())
     }
@@ -28,18 +33,11 @@ impl FileNodeOps for Inode {
         let _inode = self.content_access().write()?;
         // The chosen append offset is stable across log-space waits. Every
         // independently opened handle for this inode shares content-write exclusion.
-        let length = self
-            .fs()
-            .lock()
-            .ext4
-            .inode(self.number())
-            .map_err(into_vfs_err)?
-            .size;
+        let length = self.lifetime.file_size().map_err(into_vfs_err)?;
+        let end = Self::write_end(length, buf.len())?;
         self.write_locked(buf, length).map_err(into_vfs_err)?;
+        self.lifetime.publish_file_size(end);
         self.finish_metadata_change()?;
-        let end = length
-            .checked_add(buf.len() as u64)
-            .ok_or_else(|| into_vfs_err(rsext4::Ext4Error::overflow()))?;
         Ok((buf.len(), end))
     }
 
@@ -50,11 +48,12 @@ impl FileNodeOps for Inode {
         let mut resize = rsext4::InodeResize::new(self.number(), len);
         self.mutate(|ext4| ext4.resize_inode(&mut resize))
             .map_err(into_vfs_err)?;
+        self.lifetime.publish_file_size(len);
         self.finish_metadata_change()
     }
 
     fn operate_range(&self, offset: u64, len: u64, operation: VfsRangeOperation) -> VfsResult<()> {
-        let operation = match operation {
+        let core_operation = match operation {
             VfsRangeOperation::Allocate(mode) => RangeOperation::Allocate(match mode {
                 VfsPreallocationMode::ExtendSize => PreallocationOptions::EXTEND_SIZE,
                 VfsPreallocationMode::KeepSize => PreallocationOptions::KEEP_SIZE,
@@ -68,8 +67,12 @@ impl FileNodeOps for Inode {
             VfsRangeOperation::InsertRange => RangeOperation::Insert,
         };
         let _inode = self.content_access().write()?;
-        self.mutate(|ext4| ext4.operate_inode_range(self.number(), offset, len, operation))
+        let old_size = self.lifetime.file_size().map_err(into_vfs_err)?;
+        self.mutate(|ext4| ext4.operate_inode_range(self.number(), offset, len, core_operation))
             .map_err(into_vfs_err)?;
+        self.lifetime.publish_file_size(Self::successful_range_size(
+            old_size, offset, len, operation,
+        ));
         self.finish_metadata_change()
     }
 
@@ -98,6 +101,38 @@ impl Pollable for Inode {
 }
 
 impl Inode {
+    fn write_end(offset: u64, len: usize) -> VfsResult<u64> {
+        let len = u64::try_from(len).map_err(|_| into_vfs_err(rsext4::Ext4Error::overflow()))?;
+        offset
+            .checked_add(len)
+            .ok_or_else(|| into_vfs_err(rsext4::Ext4Error::file_too_large()))
+    }
+
+    fn successful_range_size(
+        old_size: u64,
+        offset: u64,
+        len: u64,
+        operation: VfsRangeOperation,
+    ) -> u64 {
+        match operation {
+            VfsRangeOperation::Allocate(VfsPreallocationMode::ExtendSize)
+            | VfsRangeOperation::ZeroRange(VfsPreallocationMode::ExtendSize) => old_size.max(
+                offset
+                    .checked_add(len)
+                    .expect("successful extending range operation has a representable end"),
+            ),
+            VfsRangeOperation::Allocate(VfsPreallocationMode::KeepSize)
+            | VfsRangeOperation::ZeroRange(VfsPreallocationMode::KeepSize)
+            | VfsRangeOperation::PunchHole => old_size,
+            VfsRangeOperation::CollapseRange => old_size
+                .checked_sub(len)
+                .expect("successful collapse range fits within the inode size"),
+            VfsRangeOperation::InsertRange => old_size
+                .checked_add(len)
+                .expect("successful insert range has a representable inode size"),
+        }
+    }
+
     fn write_locked(&self, bytes: &[u8], offset: u64) -> rsext4::Ext4Result<()> {
         if self
             .fs()
