@@ -56,7 +56,7 @@ impl TaskSystem {
         // scheduler baton, so the wake path must not probe IRQ context first.
         let _preempt = crate::runtime::lock::PreemptScope::enter();
         let context = WakeTransactionContext::current();
-        let sched = core.sched().lock();
+        let sched = core.sched().lock_for_wake();
         let wake_publication = match source {
             WakeSource::Ordinary => core.publish_wake(),
             WakeSource::RtLockPark { generation } => {
@@ -169,7 +169,7 @@ impl TaskSystem {
         }
         let _preempt = crate::runtime::lock::PreemptScope::enter();
         let context = WakeTransactionContext::current();
-        let sched = core.sched().lock();
+        let sched = core.sched().lock_for_wake();
         if core.ordinary_park_generation() != claim.park_generation() {
             claim.cancel_selected();
             return WaitWakeDelivery::Cancelled;
@@ -205,7 +205,7 @@ impl TaskSystem {
                 // publication-aware path, matching Linux's on_rq revalidation
                 // under p->pi_lock.
                 drop(sched);
-                let sched = core.sched().lock();
+                let sched = core.sched().lock_for_wake();
                 if core.park_generation() != claim.park_generation()
                     || sched.lifecycle.state() != ThreadState::Blocked
                 {

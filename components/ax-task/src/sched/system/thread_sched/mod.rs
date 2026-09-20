@@ -90,6 +90,19 @@ impl ThreadSchedCell {
         }
     }
 
+    /// Locks task state for a Linux-style wake transaction.
+    ///
+    /// Linux executes `smp_mb__after_spinlock()` after taking `p->pi_lock` in
+    /// `try_to_wake_up()`. The full barrier orders the caller's condition
+    /// publication before inspecting the task lifecycle and placement. Keep
+    /// that ordering attached to the wake-specific lock entry so every wake
+    /// source and task-lock retry receives the same contract.
+    pub(super) fn lock_for_wake(&self) -> IrqTicketGuard<'_, ThreadSchedState> {
+        let guard = self.lock();
+        crate::runtime::lock::smp_mb_after_spinlock();
+        guard
+    }
+
     /// Locks scheduler state below the runtime's IRQ-off scheduler baton.
     ///
     /// # Safety

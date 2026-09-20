@@ -13,6 +13,7 @@ features = [
   "rknpu",
   "rk3588-pwm",
   "guest-profile",
+  "selfbuild-watchdog",
   "smp",
 ]
 log = "Warn"

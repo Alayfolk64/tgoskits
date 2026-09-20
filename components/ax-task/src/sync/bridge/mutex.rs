@@ -60,7 +60,7 @@ pub struct MutexAcquireRequest<'lock> {
 pub fn mutex_acquire(request: MutexAcquireRequest<'_>) {
     let lockdep = prepare_lockdep(&request, false);
     let algorithm = PiMutexAlgorithm::new(request.storage.core(), request.next_waiter_sequence);
-    algorithm.lock_pi();
+    algorithm.lock_pi(request.caller);
     finish_lockdep(lockdep, true);
 }
 

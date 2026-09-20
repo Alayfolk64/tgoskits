@@ -1,6 +1,9 @@
 //! Priority-inheritance sleeping mutex.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    panic::Location,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 mod entry;
 #[cfg(feature = "lockdep")]
@@ -158,7 +161,7 @@ impl<'lock> PiMutexAlgorithm<'lock> {
         .into()
     }
 
-    pub(in crate::sync) fn lock_pi(&self) {
+    pub(in crate::sync) fn lock_pi(&self, caller: &'static Location<'static>) {
         if !self.rt_lock {
             task_result(
                 crate::thread::current::validate_sleeping_lock_context(),
@@ -179,13 +182,14 @@ impl<'lock> PiMutexAlgorithm<'lock> {
                 // The uncontended path neither publishes a waiter nor
                 // schedules and must remain usable during single-threaded
                 // boot.
-                task_result(
+                task_result_at(
                     if self.rt_lock {
                         crate::thread::current::validate_rt_lock_context()
                     } else {
                         crate::thread::current::validate_blocking_context()
                     },
                     "validate PI mutex blocking context",
+                    caller,
                 );
             },
         ) {
@@ -204,6 +208,7 @@ impl<'lock> PiMutexAlgorithm<'lock> {
     fn lock_pi_interruptible(
         &self,
         mut should_interrupt: impl FnMut() -> bool,
+        caller: &'static Location<'static>,
     ) -> Result<(), PiMutexLockInterrupted> {
         task_result(
             crate::thread::current::validate_sleeping_lock_context(),
@@ -218,9 +223,10 @@ impl<'lock> PiMutexAlgorithm<'lock> {
             },
             |current| self.try_or_observe_current_token(current.id().into()),
             || {
-                task_result(
+                task_result_at(
                     crate::thread::current::validate_blocking_context(),
                     "validate PI mutex blocking context",
+                    caller,
                 );
             },
         ) {
@@ -465,15 +471,18 @@ impl<'lock> PiMutexAlgorithm<'lock> {
 }
 
 impl RawMutex {
+    #[track_caller]
     fn lock_pi(&self) {
-        self.algorithm().lock_pi();
+        self.algorithm().lock_pi(Location::caller());
     }
 
+    #[track_caller]
     fn lock_pi_interruptible(
         &self,
         should_interrupt: impl FnMut() -> bool,
     ) -> Result<(), PiMutexLockInterrupted> {
-        self.algorithm().lock_pi_interruptible(should_interrupt)
+        self.algorithm()
+            .lock_pi_interruptible(should_interrupt, Location::caller())
     }
 
     fn try_lock_pi(&self) -> bool {
@@ -584,6 +593,17 @@ where
     E: core::fmt::Display,
 {
     result.unwrap_or_else(|error| panic!("{operation} failed: {error}"))
+}
+
+fn task_result_at<T, E>(
+    result: Result<T, E>,
+    operation: &'static str,
+    caller: &'static Location<'static>,
+) -> T
+where
+    E: core::fmt::Display,
+{
+    result.unwrap_or_else(|error| panic!("{operation} at {caller} failed: {error}"))
 }
 
 /// A safe PI mutex using [`RawMutex`].

@@ -61,7 +61,7 @@ enum FilePageEntry {
     },
     Published {
         file_epoch: u64,
-        page: Weak<PageObject>,
+        page: Arc<PageObject>,
     },
 }
 
@@ -72,34 +72,34 @@ impl FilePageEntry {
         }
     }
 
-    fn page(&self) -> Option<Arc<PageObject>> {
+    fn page(&self) -> Arc<PageObject> {
         match self {
-            Self::Publishing { page, .. } => Some(page.clone()),
-            Self::Published { page, .. } => page.upgrade(),
+            Self::Publishing { page, .. } | Self::Published { page, .. } => page.clone(),
         }
     }
 }
 
+/// VM metadata for the pages owned by one file-cache identity.
+///
+/// Like Linux's `address_space::i_pages`, a published entry owns its page until
+/// cache eviction or truncate reports the exact page through
+/// [`CacheMappingEvent::Evict`]. Lookups therefore remain point operations and
+/// never sweep unrelated entries to discover expired weak references.
 #[derive(Default)]
 struct FilePageIndex {
     pages: BTreeMap<u32, FilePageEntry>,
 }
 
 impl FilePageIndex {
-    fn prune_stale(&mut self) {
-        self.pages.retain(|_, entry| entry.page().is_some());
-    }
-
     fn reserve_publication(
         &mut self,
         file_epoch: u64,
         page_number: u32,
         pin: CachedPagePin,
     ) -> StarryResult<Arc<PageObject>> {
-        self.prune_stale();
         let paddr = PhysAddr::from_usize(pin.paddr());
         if let Some(entry) = self.pages.get_mut(&page_number) {
-            let page = entry.page().ok_or(StarryError::BadState)?;
+            let page = entry.page();
             if entry.file_epoch() > file_epoch {
                 return Err(StarryError::ResourceBusy);
             }
@@ -167,11 +167,10 @@ impl FilePageIndex {
         page_number: u32,
         paddr: PhysAddr,
     ) -> StarryResult<Option<Arc<PageObject>>> {
-        self.prune_stale();
         let Some(entry) = self.pages.get(&page_number) else {
             return Ok(None);
         };
-        let page = entry.page().ok_or(StarryError::BadState)?;
+        let page = entry.page();
         if entry.file_epoch() > file_epoch || page.frame().paddr() != paddr {
             return Err(StarryError::BadState);
         }
@@ -204,7 +203,7 @@ impl FilePageIndex {
         if pins.is_empty() {
             *entry = FilePageEntry::Published {
                 file_epoch,
-                page: Arc::downgrade(page),
+                page: page.clone(),
             };
         }
         Ok(pin)
@@ -236,7 +235,7 @@ impl FilePageIndex {
             } else {
                 *entry = FilePageEntry::Published {
                     file_epoch: *file_epoch,
-                    page: Arc::downgrade(page),
+                    page: page.clone(),
                 };
             }
         }
@@ -249,9 +248,8 @@ impl FilePageIndex {
         page_number: u32,
         page: &Arc<PageObject>,
     ) -> StarryResult {
-        self.prune_stale();
         if let Some(entry) = self.pages.get_mut(&page_number) {
-            let current = entry.page().ok_or(StarryError::BadState)?;
+            let current = entry.page();
             if !Arc::ptr_eq(&current, page) || entry.file_epoch() > file_epoch {
                 return Err(StarryError::BadState);
             }
@@ -271,7 +269,7 @@ impl FilePageIndex {
             page_number,
             FilePageEntry::Published {
                 file_epoch,
-                page: Arc::downgrade(page),
+                page: page.clone(),
             },
         );
         Ok(())
@@ -281,10 +279,7 @@ impl FilePageIndex {
         let Some(entry) = self.pages.get(&page_number) else {
             return true;
         };
-        let Some(current) = entry.page() else {
-            self.pages.remove(&page_number);
-            return true;
-        };
+        let current = entry.page();
         if !Arc::ptr_eq(&current, page) || matches!(entry, FilePageEntry::Publishing { .. }) {
             return false;
         }
@@ -366,7 +361,7 @@ impl FilePageDomain {
             .lock()
             .pages
             .get(&page_number)
-            .and_then(FilePageEntry::page)
+            .map(FilePageEntry::page)
             .is_some_and(|current| Arc::ptr_eq(&current, page))
     }
 
@@ -1310,6 +1305,40 @@ fn evicting_file_page_rejects_publication_as_retry_for_test() -> bool {
     retry
 }
 
+#[cfg(all(axtest, test))]
+fn published_file_page_lives_until_exact_retirement_for_test() -> bool {
+    let Some(frame) = FrameLease::borrowed(
+        PhysAddr::from_usize(0x80_0000),
+        PAGE_SIZE_4K,
+        None,
+    ) else {
+        return false;
+    };
+    let page = PageObject::new_present(PageId::new(0x105), frame);
+    let observer = Arc::downgrade(&page);
+    let mut index = FilePageIndex::default();
+    if index.ensure_identity(1, 7, &page).is_err() {
+        return false;
+    }
+
+    drop(page);
+    let Some(retained) = observer.upgrade() else {
+        return false;
+    };
+    let Ok(eviction) = retained.eviction_lease() else {
+        return false;
+    };
+    if eviction.retire().is_err() {
+        return false;
+    }
+    if !index.remove_retired(7, &retained) {
+        return false;
+    }
+    drop(retained);
+
+    index.pages.is_empty() && observer.upgrade().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(test, axtest))]
@@ -1322,5 +1351,11 @@ mod tests {
     #[axtest::axtest]
     fn evicting_file_page_rejects_publication_as_retry() {
         assert!(super::evicting_file_page_rejects_publication_as_retry_for_test());
+    }
+
+    #[cfg(all(test, axtest))]
+    #[axtest::axtest]
+    fn published_file_page_lives_until_exact_retirement() {
+        assert!(super::published_file_page_lives_until_exact_retirement_for_test());
     }
 }

@@ -549,7 +549,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(ioc_memory[0x4044 / 4], 0xf000_0000);
-        assert_eq!(gpio_memory[2][0x00 / 4], 0xffff_0080);
+        assert_eq!(gpio_memory[2][0], 0xffff_0080);
         assert_eq!(gpio_memory[2][0x08 / 4], 0xffff_0080);
     }
 }

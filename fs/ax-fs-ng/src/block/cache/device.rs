@@ -28,6 +28,7 @@ use crate::{BlockError, BlockResult, block::FsBlockDevice, os::sync::SleepMutex}
 /// elects exactly one last wrapper to perform drop-time writeback.
 pub(crate) struct BlockCacheShared {
     device_key: usize,
+    geometry: FolioGeometry,
     consumers: AtomicUsize,
     // Allocator reclaim may retain this data without retaining the device
     // endpoint, whose final drop can wait for IO or scheduler work.
@@ -43,6 +44,7 @@ impl BlockCacheShared {
     ) -> Self {
         Self {
             device_key,
+            geometry,
             consumers: AtomicUsize::new(0),
             state: Arc::new(SleepMutex::new(BlockAddressSpace::new(geometry))),
             endpoint: SleepMutex::new(endpoint),
@@ -52,7 +54,7 @@ impl BlockCacheShared {
     /// Whether the tree was built for `block_size`; a registry hit with a
     /// different size means the device key collides across geometries.
     pub(crate) fn matches_block_size(&self, block_size: usize) -> bool {
-        self.state.lock().geometry().block_size() == block_size
+        self.geometry.block_size() == block_size
     }
 
     fn acquire_consumer(&self) -> BlockResult<()> {
@@ -152,7 +154,7 @@ impl<T: FsBlockDevice> BufferedBlockDevice<T> {
     /// Splits a request into `(first_block, block_count)`, validating the
     /// buffer geometry against the device block size.
     fn split_request(&self, block_id: u64, buf_len: usize) -> BlockResult<(u64, u64)> {
-        let block_size = self.shared.state.lock().geometry().block_size();
+        let block_size = self.shared.geometry.block_size();
         if block_size == 0 || buf_len == 0 || !buf_len.is_multiple_of(block_size) {
             return Err(BlockError::InvalidRequest);
         }
@@ -172,6 +174,20 @@ impl<T: FsBlockDevice> BufferedBlockDevice<T> {
             self.shared.device_key,
             Arc::as_ptr(&self.shared),
         );
+    }
+
+    #[cfg(test)]
+    pub(super) fn cache_state_for_test(&self) -> Arc<SleepMutex<BlockAddressSpace>> {
+        Arc::clone(&self.shared.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn split_request_for_test(
+        &self,
+        block_id: u64,
+        buf_len: usize,
+    ) -> BlockResult<(u64, u64)> {
+        self.split_request(block_id, buf_len)
     }
 }
 

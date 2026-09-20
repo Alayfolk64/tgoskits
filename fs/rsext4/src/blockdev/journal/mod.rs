@@ -33,7 +33,7 @@ struct ActiveJournalHandle {
     revoke_credits_requested: usize,
     revoke_credits_remaining: usize,
     transaction_credits_at_start: usize,
-    touched_metadata_blocks: Vec<AbsoluteBN>,
+    newly_attached_metadata_blocks: Vec<AbsoluteBN>,
     queue_snapshot: Vec<Jbd2Update>,
     revoke_snapshot: Vec<AbsoluteBN>,
 }

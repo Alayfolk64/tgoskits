@@ -349,13 +349,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
         let revoke_records_per_block = self.journal_revoke_records_per_block()?;
         let reserved_buffer_credits = self.reserved_buffer_credits()?;
 
-        if let Some(handle) = self.active_handle.as_mut() {
-            if !handle.touched_metadata_blocks.contains(&update.0) {
-                if handle.touched_metadata_blocks.len() >= handle.metadata_credits {
-                    return Err(Ext4Error::no_space().with_operation("jbd2:handle_credits"));
-                }
-                handle.touched_metadata_blocks.push(update.0);
-            }
+        if self.active_handle.is_some() {
             let system = self.system.as_mut().ok_or_else(|| {
                 Ext4Error::journal_aborted().with_operation("jbd2:write_without_state")
             })?;
@@ -369,8 +363,19 @@ impl<B: BlockIo> Jbd2Dev<B> {
                 .iter_mut()
                 .find(|queued| queued.0 == update.0)
             {
+                // Linux charges a handle only when a buffer first becomes
+                // modified in the running transaction. A later handle that
+                // updates the same buffer reuses the transaction's ownership
+                // instead of consuming another credit.
                 *existing = update;
             } else {
+                let handle = self.active_handle.as_mut().ok_or_else(|| {
+                    Ext4Error::corrupted().with_operation("jbd2:missing_active_handle")
+                })?;
+                if handle.newly_attached_metadata_blocks.len() >= handle.metadata_credits {
+                    return Err(Ext4Error::no_space().with_operation("jbd2:handle_credits"));
+                }
+                handle.newly_attached_metadata_blocks.push(update.0);
                 system.running_transaction.updates.push(update);
             }
             return Ok(());

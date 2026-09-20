@@ -379,6 +379,10 @@ impl Cru {
     ///
     /// 返回时钟频率 (Hz)，如果不支持该时钟则返回错误
     pub fn clk_get_rate(&self, id: crate::clock::ClkId) -> ClockResult<u64> {
+        if let Some(rate) = fixed_parent_clock_rate(id) {
+            return Ok(rate);
+        }
+
         // 1. PLL 时钟
         if is_pll_clk(id) {
             let pll_id = PllId::try_from(id).map_err(|_| ClockError::unsupported(id))?;
@@ -592,6 +596,13 @@ impl Cru {
     }
 }
 
+fn fixed_parent_clock_rate(id: ClkId) -> Option<u64> {
+    match id {
+        TCLK_WDT0 => Some(OSC_HZ),
+        _ => None,
+    }
+}
+
 /// 验证 PLL 频率
 ///
 /// 对比实际读取的 PLL 频率与 u-boot 配置的预期频率
@@ -647,6 +658,11 @@ mod tests {
         assert_eq!(ACLK_TOP_S200_SEL_MASK, 0x3 << 6);
     }
 
+    #[test]
+    fn test_watchdog_timer_clock_uses_xin24m() {
+        assert_eq!(fixed_parent_clock_rate(TCLK_WDT0), Some(OSC_HZ));
+        assert_eq!(fixed_parent_clock_rate(PCLK_WDT0), None);
+    }
     /// 测试 PLL 模式掩码和常量
     #[test]
     fn test_pll_mode_constants() {
@@ -678,7 +694,7 @@ mod tests {
     #[test]
     fn test_find_pll_params_from_table() {
         // 测试 GPLL 1188MHz (在频率表中)
-        let result = find_pll_params(PllId::GPLL, GPLL_HZ as u64);
+        let result = find_pll_params(PllId::GPLL, GPLL_HZ);
         assert!(result.is_ok(), "GPLL 1188MHz should be found in rate table");
         let (p, m, s, k) = result.unwrap();
         assert_eq!(
@@ -688,7 +704,7 @@ mod tests {
         );
 
         // 测试 CPLL 1500MHz (在频率表中)
-        let result = find_pll_params(PllId::CPLL, CPLL_HZ as u64);
+        let result = find_pll_params(PllId::CPLL, CPLL_HZ);
         assert!(result.is_ok(), "CPLL 1500MHz should be found in rate table");
         let (p, m, s, k) = result.unwrap();
         assert_eq!(
@@ -702,11 +718,11 @@ mod tests {
     #[test]
     fn test_find_pll_params_out_of_range() {
         // 测试过低频率 (超出 VCO 范围)
-        let result = find_pll_params(PllId::GPLL, 10 * MHZ as u64);
+        let result = find_pll_params(PllId::GPLL, 10 * MHZ);
         assert!(result.is_err(), "10MHz should be out of VCO range");
 
         // 测试过高频率
-        let result = find_pll_params(PllId::GPLL, 5000 * MHZ as u64);
+        let result = find_pll_params(PllId::GPLL, 5000 * MHZ);
         assert!(result.is_err(), "5000MHz should be out of VCO range");
     }
 
@@ -718,14 +734,14 @@ mod tests {
 
         // GPLL: p=2, m=198, s=1, k=0 => 1188MHz
         let rate = calc_pll_rate(fin, 2, 198, 1, 0);
-        assert_eq!(rate, GPLL_HZ as u64, "GPLL calculation mismatch");
+        assert_eq!(rate, GPLL_HZ, "GPLL calculation mismatch");
 
         // CPLL: p=2, m=250, s=1, k=0 => 1500MHz
         let rate = calc_pll_rate(fin, 2, 250, 1, 0);
-        assert_eq!(rate, CPLL_HZ as u64, "CPLL calculation mismatch");
+        assert_eq!(rate, CPLL_HZ, "CPLL calculation mismatch");
 
         // NPLL: p=3, m=425, s=2, k=0 => 850MHz
         let rate = calc_pll_rate(fin, 3, 425, 2, 0);
-        assert_eq!(rate, NPLL_HZ as u64, "NPLL calculation mismatch");
+        assert_eq!(rate, NPLL_HZ, "NPLL calculation mismatch");
     }
 }

@@ -33,7 +33,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
             .active_handle
             .as_ref()
             .ok_or_else(|| Ext4Error::corrupted().with_operation("jbd2:missing_active_handle"))?;
-        let touched_metadata_snapshot = active_handle.touched_metadata_blocks.clone();
+        let newly_attached_metadata_snapshot = active_handle.newly_attached_metadata_blocks.clone();
         let revoke_credits_remaining_snapshot = active_handle.revoke_credits_remaining;
 
         match operation(self) {
@@ -47,7 +47,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
                 let handle = self.active_handle.as_mut().ok_or_else(|| {
                     Ext4Error::corrupted().with_operation("jbd2:missing_active_handle")
                 })?;
-                handle.touched_metadata_blocks = touched_metadata_snapshot;
+                handle.newly_attached_metadata_blocks = newly_attached_metadata_snapshot;
                 handle.revoke_credits_remaining = revoke_credits_remaining_snapshot;
                 // A nested filesystem owner restores its cache snapshot after
                 // this return. Drop device-cache aliases dirtied by the failed
@@ -84,7 +84,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
             revoke_credits_requested: 0,
             revoke_credits_remaining: 0,
             transaction_credits_at_start,
-            touched_metadata_blocks: Vec::with_capacity(credits.metadata_blocks),
+            newly_attached_metadata_blocks: Vec::with_capacity(credits.metadata_blocks),
             queue_snapshot,
             revoke_snapshot,
         });

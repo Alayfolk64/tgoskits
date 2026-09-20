@@ -8,7 +8,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
+    time::Duration,
 };
 
 use super::{
@@ -265,6 +268,60 @@ fn buffered(key: usize, device: RecordingDevice) -> BufferedBlockDevice<Recordin
     let endpoint = device.clone();
     BufferedBlockDevice::with_device_key(key, Box::new(endpoint), device)
         .expect("recording device geometry is valid")
+}
+
+#[test]
+fn request_geometry_does_not_wait_for_cache_state() {
+    let _registry_test = REGISTRY_TEST.lock().unwrap();
+    let (device, _state) = RecordingDevice::new(64, 512);
+    let cached = buffered(KEY_A + 35, device);
+    let cache_state = cached.cache_state_for_test();
+    let cache_guard = cache_state.lock();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = cached.split_request_for_test(4, 512);
+        done_tx.send(result).unwrap();
+        cached
+    });
+    started_rx.recv().unwrap();
+    let completed_without_state = done_rx.recv_timeout(Duration::from_secs(1));
+    drop(cache_guard);
+    let cached = worker.join().unwrap();
+    drop(cached);
+
+    assert_eq!(completed_without_state.unwrap(), Ok((4, 1)));
+}
+
+#[test]
+fn atomic_read_does_not_wait_for_contended_cache_state() {
+    let _registry_test = REGISTRY_TEST.lock().unwrap();
+    crate::os::task::install_test_runtime_ops();
+    let (device, _state) = RecordingDevice::new(64, 512);
+    let cached = buffered(KEY_A + 36, device);
+    let cache_state = cached.cache_state_for_test();
+    let cache_guard = cache_state.lock();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = thread::spawn(move || {
+        let _cannot_block = crate::os::task::test_can_block(false);
+        let mut cached = cached;
+        let mut buf = [0u8; 512];
+        started_tx.send(()).unwrap();
+        let result = cached.read_block(4, &mut buf);
+        done_tx.send(result).unwrap();
+        cached
+    });
+    started_rx.recv().unwrap();
+    let completed_without_wait = done_rx.recv_timeout(Duration::from_secs(1));
+    drop(cache_guard);
+    let cached = worker.join().unwrap();
+    drop(cached);
+
+    assert_eq!(completed_without_wait.unwrap(), Err(BlockError::WouldBlock));
 }
 
 #[test]

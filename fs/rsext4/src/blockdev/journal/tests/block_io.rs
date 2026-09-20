@@ -3,6 +3,39 @@
 use super::*;
 
 #[test]
+fn running_transaction_metadata_does_not_consume_a_new_handle_credit() {
+    let mut dev = Jbd2Dev::initial_jbd2dev(0, MemBlockDev::new(256), true);
+    dev.set_journal_superblock(small_journal_superblock(), AbsoluteBN::new(128))
+        .expect("install small journal");
+
+    let shared = AbsoluteBN::new(10);
+    let private = AbsoluteBN::new(11);
+    dev.with_transaction_handle(1, |device| {
+        device.write_blocks(&vec![0x11; BLOCK_SIZE], shared, 1, true)
+    })
+    .expect("publish shared metadata in the running transaction");
+
+    dev.with_transaction_handle(1, |device| {
+        device.write_blocks(&vec![0x22; BLOCK_SIZE], shared, 1, true)?;
+        device.write_blocks(&vec![0x33; BLOCK_SIZE], private, 1, true)
+    })
+    .expect("only newly attached metadata should consume the handle credit");
+
+    let system = dev.system.as_ref().expect("journal state");
+    assert_eq!(system.running_transaction.updates.len(), 2);
+    assert_eq!(
+        system
+            .running_transaction
+            .updates
+            .iter()
+            .find(|update| update.0 == shared)
+            .expect("shared update")
+            .1[0],
+        0x22
+    );
+}
+
+#[test]
 fn auto_commit_invalidates_stale_block_cache() {
     let mut dev = Jbd2Dev::initial_jbd2dev(0, MemBlockDev::new(256), true);
     dev.set_journal_superblock(small_journal_superblock(), AbsoluteBN::new(128))
