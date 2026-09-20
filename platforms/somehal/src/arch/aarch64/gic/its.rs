@@ -20,6 +20,7 @@ use rdif_msi::{
 use rdrive::{DeviceId, module_driver, probe::OnProbeError, register::ProbeFdt};
 use someboot::DCacheOp;
 
+use super::lpi_layout::pending_table_stride;
 use crate::common::ioremap;
 
 pub(super) const LPI_INTID_BASE: u32 = 8192;
@@ -186,7 +187,7 @@ impl GicItsProvider {
         property_table.clean();
 
         let use_physical_collection_target = its.uses_physical_collection_target();
-        let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, 4096);
+        let pending_stride = pending_table_stride(LPI_PENDING_BYTES_PER_RD);
         let rd_count = with_gic(|gic| Ok(gic.redistributor_count().max(1)))?;
         let pending_tables = AlignedMemory::new(pending_stride * rd_count, 65536)
             .ok_or_else(|| OnProbeError::other("failed to allocate LPI pending tables"))?;
@@ -628,8 +629,4 @@ fn program_baser_table(
     Err(OnProbeError::Unsupported(
         "required ITS BASER table is not implemented",
     ))
-}
-
-const fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
 }

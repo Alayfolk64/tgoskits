@@ -10,6 +10,7 @@ use irq_framework::IrqId;
 use kernutil::StaticCell;
 use rdrive::{module_driver, probe::OnProbeError, register::ProbeFdt};
 
+use super::completion::completion_plan;
 use crate::common::ioremap;
 
 static CPU_IF_INIT: StaticCell<CpuInterfaceInit> = StaticCell::uninit();
@@ -114,6 +115,7 @@ pub struct ActiveIrq {
     ack: IntId,
     priority_drop_pending: bool,
     two_step_eoi: bool,
+    deactivate_after_dispatch: bool,
 }
 
 impl ActiveIrq {
@@ -138,7 +140,7 @@ impl ActiveIrq {
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
         self.drop_priority();
-        if self.two_step_eoi {
+        if self.deactivate_after_dispatch {
             dir(self.ack);
         }
     }
@@ -150,12 +152,23 @@ pub fn begin_irq() -> Option<ActiveIrq> {
         return None;
     }
 
-    Some(ActiveIrq {
+    let two_step_eoi = eoi_mode();
+    let plan = completion_plan(two_step_eoi, ack.to_u32() >= super::its::LPI_INTID_BASE);
+    let mut active = ActiveIrq {
         irq: (ack.to_u32() as usize).into(),
         ack,
         priority_drop_pending: true,
-        two_step_eoi: eoi_mode(),
-    })
+        two_step_eoi,
+        deactivate_after_dispatch: plan.deactivate_after_dispatch,
+    };
+    // In split-EOI mode the priority drop is the acknowledge-completion
+    // boundary. Complete it before the handler can touch device state, as
+    // Linux's GICv3 `gic_complete_ack()` does. LPIs have no active state to
+    // deactivate later, while SGIs, PPIs, and SPIs retain their final DIR.
+    if plan.drop_priority_before_dispatch {
+        active.drop_priority();
+    }
+    Some(active)
 }
 
 pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqError> {
@@ -178,7 +191,7 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqErr
 pub fn irq_set_trigger(irq: IrqId, trigger: Trigger) -> Result<(), crate::irq::IrqError> {
     super::trigger::dispatch_trigger_configuration(
         irq.hwirq.0,
-        Some(super::its::LPI_INTID_BASE as u32),
+        Some(super::its::LPI_INTID_BASE),
         |raw| {
             let intid = checked_private_intid(raw)?;
             current_cpu_interface().set_cfg(intid, trigger);

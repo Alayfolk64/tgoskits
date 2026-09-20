@@ -3,7 +3,9 @@ use irq_framework::{IrqDomainId, IrqId};
 use rdif_intc::{Intc, Interface};
 use rdrive::Device;
 
+mod completion;
 mod its;
+mod lpi_layout;
 mod trigger;
 mod v2;
 mod v3;

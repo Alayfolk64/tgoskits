@@ -1086,15 +1086,18 @@ impl CpuInterface {
 
     pub fn eoi0(&self, ack: IntId) {
         ICC_EOIR0_EL1.write(ICC_EOIR0_EL1::INTID.val(ack.to_u32() as _));
+        arch::isb();
     }
 
     pub fn eoi1(&self, ack: IntId) {
         ICC_EOIR1_EL1.write(ICC_EOIR1_EL1::INTID.val(ack.to_u32() as _));
+        arch::isb();
     }
 
     /// Deactivate an interrupt
     pub fn dir(&self, ack: IntId) {
         ICC_DIR_EL1.write(ICC_DIR_EL1::INTID.val(ack.to_u32() as _));
+        arch::isb();
     }
 
     /// Set the priority mask (interrupts with priority >= mask will be masked)
@@ -1241,15 +1244,18 @@ pub fn ack1() -> IntId {
 
 pub fn eoi0(ack: IntId) {
     ICC_EOIR0_EL1.write(ICC_EOIR0_EL1::INTID.val(ack.to_u32() as _));
+    arch::isb();
 }
 
 pub fn eoi1(ack: IntId) {
     ICC_EOIR1_EL1.write(ICC_EOIR1_EL1::INTID.val(ack.to_u32() as _));
+    arch::isb();
 }
 
 /// Deactivate an interrupt
 pub fn dir(ack: IntId) {
     ICC_DIR_EL1.write(ICC_DIR_EL1::INTID.val(ack.to_u32() as _));
+    arch::isb();
 }
 
 /// Send a Software Generated Interrupt (SGI) to target CPUs.
