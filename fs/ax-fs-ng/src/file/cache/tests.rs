@@ -452,7 +452,7 @@ fn invalidate_clean_pages_detaches_disk_cache_copy() {
 }
 
 #[test]
-fn mmap_faults_grow_bounded_readahead_without_pinning_neighbors() {
+fn mmap_faults_read_a_bounded_window_without_pinning_neighbors() {
     with_test_page_provider(true, |_| {
         let backing = Arc::new(CacheTestFile::new(vec![0x5a; 64 * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
@@ -461,12 +461,47 @@ fn mmap_faults_grow_bounded_readahead_without_pinning_neighbors() {
             drop(cached.pin_page_for_mapping(page).unwrap());
         }
 
+        assert_eq!(backing.read_requests(), vec![(0, 32 * PAGE_SIZE)]);
+        assert!((0..32).all(|page| cached.is_page_cached(page)));
+        assert!(!cached.is_page_cached(32));
+    });
+}
+
+#[test]
+fn random_mmap_fault_reads_around_the_fault_page() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; 64 * PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+
+        drop(cached.pin_page_for_mapping(40).unwrap());
+
         assert_eq!(
             backing.read_requests(),
-            vec![(0, 4 * PAGE_SIZE), (4 * PAGE_SIZE as u64, 32 * PAGE_SIZE)]
+            vec![(24 * PAGE_SIZE as u64, 32 * PAGE_SIZE)]
         );
-        assert!((0..36).all(|page| cached.is_page_cached(page)));
-        assert!(!cached.is_page_cached(36));
+        assert!((24..56).all(|page| cached.is_page_cached(page)));
+        assert!(!cached.is_page_cached(23));
+        assert!(!cached.is_page_cached(56));
+    });
+}
+
+#[test]
+fn mmap_read_around_trims_a_resident_prefix_without_omitting_the_fault() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; 64 * PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+        drop(cached.pin_page_or_insert(24).unwrap());
+
+        drop(cached.pin_page_for_mapping(40).unwrap());
+
+        assert_eq!(
+            backing.read_requests(),
+            vec![
+                (24 * PAGE_SIZE as u64, PAGE_SIZE),
+                (25 * PAGE_SIZE as u64, 31 * PAGE_SIZE),
+            ]
+        );
+        assert!((24..56).all(|page| cached.is_page_cached(page)));
     });
 }
 

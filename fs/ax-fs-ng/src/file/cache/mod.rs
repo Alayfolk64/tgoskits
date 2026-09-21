@@ -951,20 +951,29 @@ impl CachedFile {
         Ok(result)
     }
 
-    /// Loads one bounded contiguous cache window beginning at `pn`.
+    /// Loads one bounded contiguous cache window containing `required_pn`.
     ///
-    /// A window publishes one [`PageLoad`] for every page it covers before
-    /// entering the backing filesystem. A fault for the same page sleeps on
-    /// that load, while faults for unrelated pages can submit independent I/O.
+    /// The planned window may begin before the required page for mmap
+    /// read-around. A resident or in-flight prefix is trimmed without omitting
+    /// the required page. The selected run publishes one [`PageLoad`] for every
+    /// page it covers before entering the backing filesystem. A fault for the
+    /// same page sleeps on that load, while faults for unrelated pages can
+    /// submit independent I/O.
     /// Each prepared page is published under its cache-index shard after
     /// rechecking the mapping epoch. A concurrent mapping update either sees
     /// and invalidates that page or makes this publication retry, matching
     /// Linux's per-folio publication under the address-space invalidate
     /// boundary without a whole-file fault lock.
-    fn populate_page_window(&self, file: &FileNode, pn: u32, window_pages: usize) -> VfsResult<()> {
+    fn populate_page_window(
+        &self,
+        file: &FileNode,
+        start_pn: u32,
+        required_pn: u32,
+        window_pages: usize,
+    ) -> VfsResult<()> {
         if self.in_memory {
             let _io = self.shared.io_lock.lock();
-            self.with_page_or_insert(file, pn, false, |_, _| {})?;
+            self.with_page_or_insert(file, required_pn, false, |_, _| {})?;
             return Ok(());
         }
 
@@ -981,23 +990,32 @@ impl CachedFile {
         // publication retry instead of installing data under stale offsets.
         let load_epoch = self.shared.mapping_epoch.load(Ordering::Acquire);
         let file_len = self.shared.len();
-        let first_page = u64::from(pn);
+        let planned_start = u64::from(start_pn);
+        let required_page = u64::from(required_pn);
         let file_pages = file_len.div_ceil(PAGE_SIZE as u64);
-        if first_page >= file_pages {
+        if planned_start > required_page || required_page >= file_pages {
             return Err(VfsError::InvalidInput);
         }
 
         let max_pages = window_pages.max(1);
-        let candidate_end = first_page
+        let candidate_end = planned_start
             .saturating_add(max_pages as u64)
             .min(file_pages)
             .min(u64::from(u32::MAX) + 1);
-        if self.shared.page_cache.lock_page(pn).contains(&pn) {
+        if required_page >= candidate_end {
+            return Err(VfsError::InvalidInput);
+        }
+        if self
+            .shared
+            .page_cache
+            .lock_page(required_pn)
+            .contains(&required_pn)
+        {
             return Ok(());
         }
         let active_load = {
             let loads = self.shared.page_loads.lock();
-            loads.get(&pn).cloned()
+            loads.get(&required_pn).cloned()
         };
         if let Some(load) = active_load {
             return load.wait();
@@ -1007,20 +1025,49 @@ impl CachedFile {
         // Acquire before publication. Any contender that finds this load must
         // block until this owner stores `Complete` below.
         let mut load_state = load.state.lock();
-        let run_pages = {
+        let (first_page, run_pages) = {
             let mut loads = self.shared.page_loads.lock();
-            if let Some(existing) = loads.get(&pn).cloned() {
+            if let Some(existing) = loads.get(&required_pn).cloned() {
                 drop(loads);
                 drop(load_state);
                 return existing.wait();
             }
 
-            if self.shared.page_cache.lock_page(pn).contains(&pn) {
+            if self
+                .shared
+                .page_cache
+                .lock_page(required_pn)
+                .contains(&required_pn)
+            {
                 return Ok(());
             }
-            let mut page = first_page;
-            while page < candidate_end {
+
+            // Read-around must always include the fault page. Trim a resident
+            // or in-flight prefix, but never stop at a cached page before the
+            // required page: a concurrent fault may have filled only part of
+            // this window after the plan was made.
+            let mut first_page = planned_start;
+            let mut page = planned_start;
+            while page <= required_page {
                 let page_number = u32::try_from(page).map_err(|_| VfsError::InvalidInput)?;
+                if self
+                    .shared
+                    .page_cache
+                    .lock_page(page_number)
+                    .contains(&page_number)
+                    || loads.contains_key(&page_number)
+                {
+                    first_page = page + 1;
+                }
+                page += 1;
+            }
+            if first_page > required_page {
+                return Ok(());
+            }
+
+            let mut end_page = required_page + 1;
+            while end_page < candidate_end {
+                let page_number = u32::try_from(end_page).map_err(|_| VfsError::InvalidInput)?;
                 if self
                     .shared
                     .page_cache
@@ -1030,23 +1077,21 @@ impl CachedFile {
                 {
                     break;
                 }
-                page += 1;
+                end_page += 1;
             }
             let run_pages =
-                usize::try_from(page - first_page).map_err(|_| VfsError::InvalidInput)?;
+                usize::try_from(end_page - first_page).map_err(|_| VfsError::InvalidInput)?;
             for index in 0..run_pages {
-                let page_number = pn
+                let page_number = u32::try_from(first_page)
+                    .map_err(|_| VfsError::InvalidInput)?
                     .checked_add(
                         u32::try_from(index).expect("bounded page-load window index fits in u32"),
                     )
                     .expect("bounded page-load window stays within u32 page space");
                 loads.insert(page_number, load.clone());
             }
-            run_pages
+            (first_page, run_pages)
         };
-        if run_pages == 0 {
-            return Ok(());
-        }
 
         let result = (|| {
             let run_len = run_pages
@@ -1068,8 +1113,10 @@ impl CachedFile {
             prepared
                 .try_reserve_exact(run_pages)
                 .map_err(|_| VfsError::NoMemory)?;
+            let first_page_number =
+                u32::try_from(first_page).map_err(|_| VfsError::InvalidInput)?;
             for index in 0..run_pages {
-                let page_number = pn
+                let page_number = first_page_number
                     .checked_add(u32::try_from(index).map_err(|_| VfsError::InvalidInput)?)
                     .ok_or(VfsError::InvalidInput)?;
                 let start = index * PAGE_SIZE;
@@ -1109,7 +1156,8 @@ impl CachedFile {
         {
             let mut loads = self.shared.page_loads.lock();
             for index in 0..run_pages {
-                let page_number = pn
+                let page_number = u32::try_from(first_page)
+                    .expect("bounded page-load window start fits in u32")
                     .checked_add(
                         u32::try_from(index).expect("bounded page-load window index fits in u32"),
                     )
@@ -1166,22 +1214,17 @@ impl CachedFile {
         {
             return Err(VfsError::ResourceBusy);
         }
-        let window_pages = if self.in_memory || !use_readahead {
-            1
+        let (start_pn, window_pages) = if self.in_memory || !use_readahead {
+            (pn, 1)
+        } else if let Some(pin) = self.pin_cached_page_for_mapping_if_present(pn)? {
+            self.readahead.lock().record_mmap_hit();
+            return Ok(pin);
         } else {
-            let offset = u64::from(pn)
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or(VfsError::InvalidInput)?;
-            let end = offset
-                .checked_add(PAGE_SIZE as u64)
-                .ok_or(VfsError::InvalidInput)?
-                .min(self.shared.len());
-            if end <= offset {
-                return Err(VfsError::InvalidInput);
-            }
-            self.readahead.lock().plan(offset, end).window_pages
+            let file_pages = self.shared.len().div_ceil(PAGE_SIZE as u64);
+            let plan = self.readahead.lock().plan_mmap_fault(pn, file_pages);
+            (plan.start_page, plan.window_pages)
         };
-        self.populate_page_window(self.inner.entry().as_file()?, pn, window_pages)?;
+        self.populate_page_window(self.inner.entry().as_file()?, start_pn, pn, window_pages)?;
 
         self.pin_cached_page_for_mapping_if_present(pn)?
             .ok_or(VfsError::ResourceBusy)
@@ -1294,7 +1337,7 @@ impl CachedFile {
             let page_start = u64::from(pn) * PAGE_SIZE as u64;
             let page_offset = (current - page_start) as usize;
             let chunk_len = loop {
-                match self.populate_page_window(file, pn, window_pages) {
+                match self.populate_page_window(file, pn, pn, window_pages) {
                     Ok(()) => {}
                     Err(VfsError::ResourceBusy) => {
                         // A truncate or range mutation owns the exclusive
