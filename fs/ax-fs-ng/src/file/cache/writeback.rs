@@ -2,7 +2,9 @@ use alloc::{boxed::Box, vec::Vec};
 
 use axfs_ng_vfs::{FileNodeOps, VfsError, VfsResult};
 
-use super::{CacheMappingEvent, CacheMappingResult, CachedFileShared, PAGE_SIZE};
+use super::{
+    CacheMappingEvent, CacheMappingResult, CachedFileShared, PAGE_CACHE_SHARD_COUNT, PAGE_SIZE,
+};
 
 /// Upper bound for one detached writeback snapshot batch.
 ///
@@ -74,13 +76,18 @@ impl CachedFileShared {
 
     #[cfg(feature = "vfs")]
     pub(super) fn has_dirty_pages(&self) -> bool {
-        self.page_cache.lock().iter().any(|(_, page)| page.dirty)
+        (0..PAGE_CACHE_SHARD_COUNT).any(|index| {
+            self.page_cache
+                .lock_shard(index)
+                .iter()
+                .any(|(_, page)| page.dirty)
+        })
     }
 
     pub(super) fn protect_dirty_pages_before_writeback(&self, pns: &[u32]) -> VfsResult<()> {
         for pn in pns {
             let Some(paddr) = ({
-                let mut cache = self.page_cache.lock();
+                let mut cache = self.page_cache.lock_page(*pn);
                 cache.get_mut(pn).map(|page| page.paddr()).transpose()?
             }) else {
                 continue;
@@ -126,34 +133,36 @@ impl CachedFileShared {
         let mut dirty_keys = Vec::new();
         loop {
             dirty_keys.clear();
-            let required = self.page_cache.lock().len();
+            let required = self.page_cache.len();
             if dirty_keys.capacity() < required {
                 dirty_keys
                     .try_reserve_exact(required)
                     .map_err(|_| VfsError::NoMemory)?;
             }
 
-            let mut guard = self.page_cache.lock();
-            if guard.len() > dirty_keys.capacity() {
+            if self.page_cache.len() > dirty_keys.capacity() {
                 continue;
             }
-            for (&pn, page) in guard.iter_mut() {
-                if !page.dirty {
-                    continue;
+            for index in 0..PAGE_CACHE_SHARD_COUNT {
+                let mut guard = self.page_cache.lock_shard(index);
+                for (&pn, page) in guard.iter_mut() {
+                    if !page.dirty {
+                        continue;
+                    }
+                    if let Some(requested) = requested_pns.as_ref()
+                        && requested.binary_search(&pn).is_err()
+                    {
+                        continue;
+                    }
+                    let page_start = pn as u64 * PAGE_SIZE as u64;
+                    let len = file_len.saturating_sub(page_start).min(PAGE_SIZE as u64);
+                    if len == 0 {
+                        continue;
+                    }
+                    page.writeback_protecting = true;
+                    page.dirty_during_writeback = false;
+                    dirty_keys.push(pn);
                 }
-                if let Some(requested) = requested_pns.as_ref()
-                    && requested.binary_search(&pn).is_err()
-                {
-                    continue;
-                }
-                let page_start = pn as u64 * PAGE_SIZE as u64;
-                let len = file_len.saturating_sub(page_start).min(PAGE_SIZE as u64);
-                if len == 0 {
-                    continue;
-                }
-                page.writeback_protecting = true;
-                page.dirty_during_writeback = false;
-                dirty_keys.push(pn);
             }
             break;
         }
@@ -186,8 +195,8 @@ impl CachedFileShared {
             first = end;
         }
 
-        let mut guard = self.page_cache.lock();
         for page in snapshots {
+            let mut guard = self.page_cache.lock_page(page.pn);
             if let Some(current) = guard.get_mut(&page.pn)
                 && current.dirty
                 && current.dirty_generation == page.generation
@@ -255,7 +264,7 @@ impl CachedFileShared {
             data.try_reserve_exact(len)
                 .map_err(|_| VfsError::NoMemory)?;
             let generation = {
-                let mut guard = self.page_cache.lock();
+                let mut guard = self.page_cache.lock_page(*pn);
                 let Some(page) = guard.get_mut(pn) else {
                     continue;
                 };
@@ -284,8 +293,8 @@ impl CachedFileShared {
     }
 
     fn finish_writeback_tracking(&self, pns: &[u32]) {
-        let mut guard = self.page_cache.lock();
         for pn in pns {
+            let mut guard = self.page_cache.lock_page(*pn);
             if let Some(page) = guard.get_mut(pn) {
                 page.writeback_protecting = false;
                 page.dirty_during_writeback = false;

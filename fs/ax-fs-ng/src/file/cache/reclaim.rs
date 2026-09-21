@@ -12,7 +12,7 @@ use core::{
 use axfs_ng_vfs::VfsResult;
 use heapless::Vec as InlineVec;
 
-use super::{CachedFileShared, PageCache};
+use super::{CachedFileShared, PAGE_CACHE_SHARD_COUNT, PageCache};
 
 const MAX_RECLAIM_BATCH: usize = 256;
 const REGISTER_PRUNE_INTERVAL: usize = 64;
@@ -321,28 +321,33 @@ impl CachedFileShared {
 
         let limit = max.min(MAX_RECLAIM_BATCH);
         let mut pending: InlineVec<PageCache, MAX_RECLAIM_BATCH> = InlineVec::new();
-        let Some(mut cache) = self.page_cache.try_lock() else {
-            return 0;
-        };
         let mut to_pop = [0u32; MAX_RECLAIM_BATCH];
-        let mut count = 0;
-        for (&pn, page) in cache.iter().rev() {
-            if !page.dirty && page.pins == 0 && count < limit {
-                to_pop[count] = pn;
-                count += 1;
+        for index in 0..PAGE_CACHE_SHARD_COUNT {
+            if pending.len() >= limit {
+                break;
             }
-        }
-        for &pn in &to_pop[..count] {
-            if let Some(page) = cache.pop(&pn) {
-                // There is one push per selected key and count <= capacity.
-                if pending.push(page).is_err() {
-                    unreachable!("reclaim batch exceeds its selected victim count");
+            let Some(mut cache) = self.page_cache.try_lock_shard(index) else {
+                continue;
+            };
+            let shard_limit = limit - pending.len();
+            let mut count = 0;
+            for (&pn, page) in cache.iter().rev() {
+                if !page.dirty && page.pins == 0 && count < shard_limit {
+                    to_pop[count] = pn;
+                    count += 1;
+                }
+            }
+            for &pn in &to_pop[..count] {
+                if let Some(page) = cache.pop(&pn) {
+                    // There is one push per selected key and count <= capacity.
+                    if pending.push(page).is_err() {
+                        unreachable!("reclaim batch exceeds its selected victim count");
+                    }
                 }
             }
         }
 
         let evicted = pending.len();
-        drop(cache);
         drop(installed);
         drop(pending);
         evicted
@@ -371,7 +376,7 @@ fn pressure_reclaim_is_allocation_free_and_skips_live_mappings_for_test() -> boo
     ));
     for page_number in 0..RECLAIM_PAGES as u32 {
         file.page_cache
-            .lock()
+            .lock_page(page_number)
             .put(page_number, PageCache::detached_for_test());
     }
 
@@ -382,7 +387,7 @@ fn pressure_reclaim_is_allocation_free_and_skips_live_mappings_for_test() -> boo
     *file.mapping_endpoint.lock() = Some(Arc::downgrade(&endpoint));
 
     let protected = file.try_evict_clean_pages(RECLAIM_PAGES);
-    let protected_pages = file.page_cache.lock().len();
+    let protected_pages = file.page_cache.len();
     drop(endpoint);
     let reclaimed = file.try_evict_clean_pages(RECLAIM_PAGES);
     protected == 0
@@ -432,7 +437,7 @@ mod tests {
     fn pressure_reclaim_endpoint_race_never_reallocates_cache_nodes() {
         let file = CachedFileShared::new_unbounded(4096);
         file.page_cache
-            .lock()
+            .lock_page(0)
             .put(0, PageCache::detached_for_test());
         let endpoint: Arc<dyn super::super::CacheMappingEndpoint> = Arc::new(ReclaimTestEndpoint {
             invoked: Arc::new(AtomicBool::new(false)),
@@ -455,7 +460,7 @@ mod tests {
             "endpoint publication must be excluded until detachment is complete"
         );
         assert_eq!(reclaimed, 1);
-        assert!(file.page_cache.lock().is_empty());
+        assert_eq!(file.page_cache.len(), 0);
     }
 
     #[test]

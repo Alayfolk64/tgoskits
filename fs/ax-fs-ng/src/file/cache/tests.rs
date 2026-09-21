@@ -424,6 +424,17 @@ fn page_cache_paddr_reports_bad_state_when_translation_is_missing() {
 }
 
 #[test]
+fn unrelated_page_cache_pages_do_not_share_index_exclusion() {
+    let shared = CachedFileShared::new_unbounded((2 * PAGE_SIZE) as u64);
+    let _first_page = shared.page_cache_guard_for_page_for_test(0);
+
+    assert!(
+        shared.page_cache_lock_for_page_is_free_for_test(1),
+        "an unrelated page-cache lookup serialized behind page 0"
+    );
+}
+
+#[test]
 fn invalidate_clean_pages_detaches_disk_cache_copy() {
     with_test_page_provider(true, |_| {
         let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE]));
@@ -533,7 +544,10 @@ fn invalidate_clean_pages_preserves_tmpfs_backing_object() {
 fn writeback_protect_endpoint_runs_without_cached_io_lock() {
     with_test_page_provider(true, |_| {
         let shared = Arc::new(CachedFileShared::new_unbounded(PAGE_SIZE as u64));
-        shared.page_cache.lock().put(0, PageCache::new().unwrap());
+        shared
+            .page_cache
+            .lock_page(0)
+            .put(0, PageCache::new().unwrap());
         let observed_unlocked = Arc::new(AtomicBool::new(false));
         let observed = observed_unlocked.clone();
         let endpoint_shared = shared.clone();
@@ -645,7 +659,10 @@ fn cached_read_releases_layout_before_faultable_destination_copy() {
 fn writeback_protect_endpoint_runs_without_endpoint_lock() {
     with_test_page_provider(true, |_| {
         let shared = Arc::new(CachedFileShared::new_unbounded(PAGE_SIZE as u64));
-        shared.page_cache.lock().put(0, PageCache::new().unwrap());
+        shared
+            .page_cache
+            .lock_page(0)
+            .put(0, PageCache::new().unwrap());
         let observed_unlocked = Arc::new(AtomicBool::new(false));
         let observed = observed_unlocked.clone();
         let endpoint_shared = shared.clone();
@@ -975,7 +992,7 @@ fn successful_truncate_retires_dirty_tail_as_invalidated() {
         cached
             .shared
             .page_cache
-            .lock()
+            .lock_page(1)
             .get_mut(&1)
             .expect("the dirty tail page must remain indexed")
             .observe_dirty_drop(dirty_drop_observer);

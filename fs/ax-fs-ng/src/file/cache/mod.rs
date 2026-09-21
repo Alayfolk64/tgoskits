@@ -9,7 +9,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{
+    array,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use ax_io::prelude::*;
 use axfs_ng_vfs::{CachedWriteGuard, FileNode, FilesystemOps, Location, VfsError, VfsResult};
@@ -26,6 +29,52 @@ use crate::os::{
 
 type CachedFileKey = (usize, u64);
 type InodeCacheIndex = BTreeMap<CachedFileKey, Weak<CachedFileShared>>;
+type PageCacheShard = LruCache<u32, PageCache>;
+
+/// Per-inode cache-index partitions selected by page number.
+///
+/// Linux separates the address-space index from folio ownership so unrelated
+/// faults do not serialize on one mutable LRU lookup. Our cache pages are still
+/// value-owned, so use bounded index sharding as the capability boundary until
+/// page objects gain independent lifetime and lock state. Callers must never
+/// hold two shard guards simultaneously; operations requiring a coherent
+/// whole-file view use `io_lock` or the mapping-layout boundary above them.
+const PAGE_CACHE_SHARD_COUNT: usize = 16;
+
+struct PageCacheIndex {
+    shards: [Mutex<PageCacheShard>; PAGE_CACHE_SHARD_COUNT],
+}
+
+impl PageCacheIndex {
+    fn new() -> Self {
+        Self {
+            shards: array::from_fn(|_| Mutex::new(LruCache::unbounded())),
+        }
+    }
+
+    const fn shard_index(page_number: u32) -> usize {
+        page_number as usize % PAGE_CACHE_SHARD_COUNT
+    }
+
+    fn lock_page(&self, page_number: u32) -> SleepMutexGuard<'_, PageCacheShard> {
+        self.shards[Self::shard_index(page_number)].lock()
+    }
+
+    fn lock_shard(&self, index: usize) -> SleepMutexGuard<'_, PageCacheShard> {
+        self.shards[index].lock()
+    }
+
+    #[cfg(feature = "vfs")]
+    fn try_lock_shard(&self, index: usize) -> Option<SleepMutexGuard<'_, PageCacheShard>> {
+        self.shards[index].try_lock()
+    }
+
+    fn len(&self) -> usize {
+        (0..PAGE_CACHE_SHARD_COUNT)
+            .map(|index| self.lock_shard(index).len())
+            .sum()
+    }
+}
 
 static CACHED_FILE_BY_INODE: ax_lazyinit::LazyLock<Mutex<InodeCacheIndex>> =
     ax_lazyinit::LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -228,7 +277,7 @@ impl CachedPagePin {
 
 impl Drop for CachedPagePin {
     fn drop(&mut self) {
-        let mut cache = self.shared.page_cache.lock();
+        let mut cache = self.shared.page_cache.lock_page(self.page_number);
         let Some(page) = cache.get_mut(&self.page_number) else {
             // Reclaim/truncate must reject pinned entries, so disappearance is
             // an ownership protocol violation.  The underlying frame cannot be
@@ -302,7 +351,7 @@ impl PageLoad {
 
 struct CachedFileShared {
     identity: CachedFileIdentity,
-    page_cache: Mutex<LruCache<u32, PageCache>>,
+    page_cache: PageCacheIndex,
     /// Active backing reads indexed by every page covered by their window.
     ///
     /// Never wait on a [`PageLoad`] while holding this index lock. The load
@@ -332,7 +381,7 @@ impl CachedFileShared {
             // with a small per-inode ceiling. Disk-backed owners are registered
             // with the global reclaimer below, which evicts clean pages while
             // filesystem writeback turns dirty pages into reclaim candidates.
-            page_cache: Mutex::new(LruCache::unbounded()),
+            page_cache: PageCacheIndex::new(),
             page_loads: Mutex::new(BTreeMap::new()),
             mapping_layout_lock: Mutex::new(()),
             io_lock: Mutex::new(()),
@@ -350,7 +399,7 @@ impl CachedFileShared {
     pub fn new_unbounded(len: u64) -> Self {
         Self {
             identity: CachedFileIdentity::allocate(),
-            page_cache: Mutex::new(LruCache::unbounded()),
+            page_cache: PageCacheIndex::new(),
             page_loads: Mutex::new(BTreeMap::new()),
             mapping_layout_lock: Mutex::new(()),
             io_lock: Mutex::new(()),
@@ -464,7 +513,22 @@ impl CachedFileShared {
 
     #[cfg(test)]
     fn page_cache_lock_is_free_for_test(&self) -> bool {
-        self.page_cache.try_lock().is_some()
+        (0..PAGE_CACHE_SHARD_COUNT).all(|index| self.page_cache.shards[index].try_lock().is_some())
+    }
+
+    #[cfg(test)]
+    fn page_cache_guard_for_page_for_test(
+        &self,
+        page_number: u32,
+    ) -> SleepMutexGuard<'_, LruCache<u32, PageCache>> {
+        self.page_cache.lock_page(page_number)
+    }
+
+    #[cfg(test)]
+    fn page_cache_lock_for_page_is_free_for_test(&self, page_number: u32) -> bool {
+        self.page_cache.shards[PageCacheIndex::shard_index(page_number)]
+            .try_lock()
+            .is_some()
     }
 }
 
@@ -473,8 +537,10 @@ impl Drop for CachedFileShared {
         if !self.unlinked.load(Ordering::Acquire) {
             return;
         }
-        for (_, page) in self.page_cache.lock().iter_mut() {
-            page.dirty = false;
+        for index in 0..PAGE_CACHE_SHARD_COUNT {
+            for (_, page) in self.page_cache.lock_shard(index).iter_mut() {
+                page.dirty = false;
+            }
         }
     }
 }
@@ -614,7 +680,10 @@ impl CachedFile {
     /// This is a snapshot query for `mincore`; it does not update LRU order,
     /// perform I/O, or manufacture a cache entry.
     pub fn is_page_cached(&self, page_number: u32) -> bool {
-        self.shared.page_cache.lock().contains(&page_number)
+        self.shared
+            .page_cache
+            .lock_page(page_number)
+            .contains(&page_number)
     }
 
     /// Returns whether the current cached file length is zero.
@@ -717,18 +786,16 @@ impl CachedFile {
             .try_reserve_exact(candidates.len())
             .map_err(|_| VfsError::NoMemory)?;
         let mut busy = false;
-        {
-            let mut cache = self.shared.page_cache.lock();
-            for pn in candidates {
-                let Some(page) = cache.get_mut(&pn) else {
-                    continue;
-                };
-                if page.dirty || page.pins != 0 {
-                    busy = true;
-                } else {
-                    let page = cache.pop(&pn).ok_or(VfsError::BadState)?;
-                    pending.push((pn, page));
-                }
+        for pn in candidates {
+            let mut cache = self.shared.page_cache.lock_page(pn);
+            let Some(page) = cache.get_mut(&pn) else {
+                continue;
+            };
+            if page.dirty || page.pins != 0 {
+                busy = true;
+            } else {
+                let page = cache.pop(&pn).ok_or(VfsError::BadState)?;
+                pending.push((pn, page));
             }
         }
 
@@ -748,12 +815,12 @@ impl CachedFile {
                 CacheMappingResult::Retired => invalidated += 1,
                 CacheMappingResult::Busy | CacheMappingResult::Quarantined => {
                     busy = true;
-                    let replaced = self.shared.page_cache.lock().put(pn, page);
+                    let replaced = self.shared.page_cache.lock_page(pn).put(pn, page);
                     drop(replaced);
                 }
                 CacheMappingResult::Protected | CacheMappingResult::Failed => {
                     first_error.get_or_insert(VfsError::BadState);
-                    let replaced = self.shared.page_cache.lock().put(pn, page);
+                    let replaced = self.shared.page_cache.lock_page(pn).put(pn, page);
                     drop(replaced);
                 }
             }
@@ -860,7 +927,7 @@ impl CachedFile {
     ) -> VfsResult<R> {
         let mut update = Some(update);
         {
-            let mut cache = self.shared.page_cache.lock();
+            let mut cache = self.shared.page_cache.lock_page(pn);
             if cache.contains(&pn) {
                 let page = cache.get_mut(&pn).ok_or(VfsError::BadState)?;
                 return Ok(update.take().ok_or(VfsError::BadState)?(page, false));
@@ -869,7 +936,7 @@ impl CachedFile {
 
         let mut prepared = self.prepare_cache_page(file, pn, read_backing)?;
         let (result, retired) = {
-            let mut cache = self.shared.page_cache.lock();
+            let mut cache = self.shared.page_cache.lock_page(pn);
             if cache.contains(&pn) {
                 let page = cache.get_mut(&pn).ok_or(VfsError::BadState)?;
                 let result = update.take().ok_or(VfsError::BadState)?(page, false);
@@ -922,7 +989,7 @@ impl CachedFile {
             .saturating_add(max_pages as u64)
             .min(file_pages)
             .min(u64::from(u32::MAX) + 1);
-        if self.shared.page_cache.lock().contains(&pn) {
+        if self.shared.page_cache.lock_page(pn).contains(&pn) {
             return Ok(());
         }
         let active_load = {
@@ -945,21 +1012,25 @@ impl CachedFile {
                 return existing.wait();
             }
 
-            let cache = self.shared.page_cache.lock();
-            if cache.contains(&pn) {
+            if self.shared.page_cache.lock_page(pn).contains(&pn) {
                 return Ok(());
             }
             let mut page = first_page;
             while page < candidate_end {
                 let page_number = u32::try_from(page).map_err(|_| VfsError::InvalidInput)?;
-                if cache.contains(&page_number) || loads.contains_key(&page_number) {
+                if self
+                    .shared
+                    .page_cache
+                    .lock_page(page_number)
+                    .contains(&page_number)
+                    || loads.contains_key(&page_number)
+                {
                     break;
                 }
                 page += 1;
             }
             let run_pages =
                 usize::try_from(page - first_page).map_err(|_| VfsError::InvalidInput)?;
-            drop(cache);
             for index in 0..run_pages {
                 let page_number = pn
                     .checked_add(
@@ -1018,8 +1089,8 @@ impl CachedFile {
                 {
                     return Err(VfsError::ResourceBusy);
                 }
-                let mut cache = self.shared.page_cache.lock();
                 for (page_number, page) in prepared {
+                    let mut cache = self.shared.page_cache.lock_page(page_number);
                     if cache.contains(&page_number) {
                         unused.push(page);
                     } else if let Some((_, retired)) = cache.push(page_number, page) {
@@ -1073,7 +1144,7 @@ impl CachedFile {
         {
             return Err(VfsError::ResourceBusy);
         }
-        let mut guard = self.shared.page_cache.lock();
+        let mut guard = self.shared.page_cache.lock_page(pn);
         guard.get_mut(&pn).ok_or(VfsError::BadState)?.mark_dirty();
         Ok(())
     }
@@ -1162,7 +1233,7 @@ impl CachedFile {
     /// receipt is acknowledged.  A missing entry is an ownership mismatch,
     /// not a request to fault the page back in while holding MM metadata.
     pub fn pin_cached_page(&self, pn: u32) -> VfsResult<CachedPagePin> {
-        let mut cache = self.shared.page_cache.lock();
+        let mut cache = self.shared.page_cache.lock_page(pn);
         let page = cache.get_mut(&pn).ok_or(VfsError::BadState)?;
         let paddr = page.paddr()?;
         page.pins = page.pins.checked_add(1).ok_or(VfsError::ValueOverflow)?;
@@ -1174,7 +1245,7 @@ impl CachedFile {
     }
 
     fn pin_cached_page_if_present(&self, pn: u32) -> VfsResult<Option<CachedPagePin>> {
-        let mut cache = self.shared.page_cache.lock();
+        let mut cache = self.shared.page_cache.lock_page(pn);
         let Some(page) = cache.get_mut(&pn) else {
             return Ok(None);
         };
@@ -1240,7 +1311,7 @@ impl CachedFile {
                 let chunk_len =
                     (visible_end - page_start).min(PAGE_SIZE as u64) as usize - page_offset;
                 let _io = self.shared.io_lock.lock();
-                let mut guard = self.shared.page_cache.lock();
+                let mut guard = self.shared.page_cache.lock_page(pn);
                 let Some(page) = guard.get_mut(&pn) else {
                     // Reclaim may retire a clean page after its load completed
                     // but before this short cache snapshot. Retry the load
@@ -1360,15 +1431,20 @@ impl CachedFile {
     ) -> VfsResult<alloc::vec::Vec<u32>> {
         let _io = self.shared.io_lock.lock();
         let mut pages = self.cached_pages_in(u64::from(start_pn), u64::from(end_pn))?;
-        let mut guard = self.shared.page_cache.lock();
-        pages.retain(|pn| guard.get_mut(pn).is_some_and(|page| page.dirty));
+        pages.retain(|pn| {
+            self.shared
+                .page_cache
+                .lock_page(*pn)
+                .get_mut(pn)
+                .is_some_and(|page| page.dirty)
+        });
         Ok(pages)
     }
 
     pub fn clear_dirty_pages(&self, pns: &[u32]) {
         let _io = self.shared.io_lock.lock();
-        let mut guard = self.shared.page_cache.lock();
         for pn in pns {
+            let mut guard = self.shared.page_cache.lock_page(*pn);
             if let Some(page) = guard.get_mut(pn) {
                 page.dirty = false;
                 page.dirty_generation = page.dirty_generation.wrapping_add(1);

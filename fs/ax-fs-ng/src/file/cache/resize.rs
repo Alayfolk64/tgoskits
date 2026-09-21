@@ -4,7 +4,9 @@ use axfs_ng_vfs::{
     CachedWriteGuard, FileNode, FileRangeOperation, PreallocationMode, VfsError, VfsResult,
 };
 
-use super::{CacheMappingEvent, CacheMappingResult, CachedFile, PAGE_SIZE, PageCache};
+use super::{
+    CacheMappingEvent, CacheMappingResult, CachedFile, PAGE_CACHE_SHARD_COUNT, PAGE_SIZE, PageCache,
+};
 
 struct PreparedPageWrite {
     page_number: u32,
@@ -58,18 +60,26 @@ impl DetachedPageBatch {
     }
 
     fn restore(mut self, cached: &CachedFile) {
-        let mut guard = cached.shared.page_cache.lock();
         while let Some((page_number, page)) = self.pages.pop() {
-            if let Some(page) = guard.put(page_number, page) {
+            if let Some(page) = cached
+                .shared
+                .page_cache
+                .lock_page(page_number)
+                .put(page_number, page)
+            {
                 self.replaced.push(page);
             }
         }
         while let Some((page_number, page)) = self.retired.pop() {
-            if let Some(page) = guard.put(page_number, page) {
+            if let Some(page) = cached
+                .shared
+                .page_cache
+                .lock_page(page_number)
+                .put(page_number, page)
+            {
                 self.replaced.push(page);
             }
         }
-        drop(guard);
         // A replaced cache owner may release its frame. Keep all final owner
         // drops outside the cache-index lock.
         drop(self.replaced);
@@ -92,13 +102,16 @@ impl DetachedPageBatch {
 
 impl RetiredPageBatch {
     fn restore(mut self, cached: &CachedFile) {
-        let mut guard = cached.shared.page_cache.lock();
         while let Some((page_number, page)) = self.pages.pop() {
-            if let Some(page) = guard.put(page_number, page) {
+            if let Some(page) = cached
+                .shared
+                .page_cache
+                .lock_page(page_number)
+                .put(page_number, page)
+            {
                 self.replaced.push(page);
             }
         }
-        drop(guard);
         drop(self.replaced);
     }
 
@@ -188,20 +201,22 @@ impl CachedFile {
                 // second snapshot as an invariant check before backing change.
                 continue;
             }
-            if !self.in_memory {
-                let mut guard = self.shared.page_cache.lock();
-                if affected_pages
-                    .iter()
-                    .any(|page_number| guard.get(page_number).is_some_and(|page| page.dirty))
-                {
-                    continue;
-                }
+            if !self.in_memory
+                && affected_pages.iter().any(|page_number| {
+                    self.shared
+                        .page_cache
+                        .lock_page(*page_number)
+                        .get(page_number)
+                        .is_some_and(|page| page.dirty)
+                })
+            {
+                continue;
             }
 
             let next_epoch = self.shared.prepare_mapping_epoch()?;
             file.operate_range(offset, len, operation)?;
-            let mut guard = self.shared.page_cache.lock();
             for page_number in affected_pages {
+                let mut guard = self.shared.page_cache.lock_page(page_number);
                 let Some(page) = guard.get_mut(&page_number) else {
                     continue;
                 };
@@ -215,7 +230,6 @@ impl CachedFile {
                     page.dirty_generation = page.dirty_generation.wrapping_add(1);
                 }
             }
-            drop(guard);
             if operation == FileRangeOperation::ZeroRange(PreallocationMode::ExtendSize) {
                 self.shared.update_len_max(end);
             }
@@ -280,9 +294,10 @@ impl CachedFile {
                 continue;
             }
             let cache_busy = {
-                let mut guard = self.shared.page_cache.lock();
                 affected_pages.iter().any(|page_number| {
-                    guard
+                    self.shared
+                        .page_cache
+                        .lock_page(*page_number)
                         .get(page_number)
                         .is_some_and(|page| page.pins != 0 || (!self.in_memory && page.dirty))
                 })
@@ -290,12 +305,14 @@ impl CachedFile {
             if cache_busy {
                 return Err(VfsError::ResourceBusy);
             }
-            {
-                let mut guard = self.shared.page_cache.lock();
-                for page_number in affected_pages {
-                    if let Some(page) = guard.pop(&page_number) {
-                        discarded.pages.push((page_number, page));
-                    }
+            for page_number in affected_pages {
+                if let Some(page) = self
+                    .shared
+                    .page_cache
+                    .lock_page(page_number)
+                    .pop(&page_number)
+                {
+                    discarded.pages.push((page_number, page));
                 }
             }
             drop(io);
@@ -342,11 +359,17 @@ impl CachedFile {
         loop {
             pages.clear();
             let required = {
-                let guard = self.shared.page_cache.lock();
-                guard
-                    .iter()
-                    .filter(|(page_number, _)| contains(**page_number))
-                    .count()
+                let mut required = 0;
+                for index in 0..PAGE_CACHE_SHARD_COUNT {
+                    required += self
+                        .shared
+                        .page_cache
+                        .lock_shard(index)
+                        .iter()
+                        .filter(|(page_number, _)| contains(**page_number))
+                        .count();
+                }
+                required
             };
             if pages.capacity() < required {
                 pages
@@ -354,19 +377,23 @@ impl CachedFile {
                     .map_err(|_| VfsError::NoMemory)?;
             }
 
-            let guard = self.shared.page_cache.lock();
             let mut overflowed = false;
-            for (&page_number, _) in guard.iter() {
-                if !contains(page_number) {
-                    continue;
+            for index in 0..PAGE_CACHE_SHARD_COUNT {
+                let guard = self.shared.page_cache.lock_shard(index);
+                for (&page_number, _) in guard.iter() {
+                    if !contains(page_number) {
+                        continue;
+                    }
+                    if pages.len() == pages.capacity() {
+                        overflowed = true;
+                        break;
+                    }
+                    pages.push(page_number);
                 }
-                if pages.len() == pages.capacity() {
-                    overflowed = true;
+                if overflowed {
                     break;
                 }
-                pages.push(page_number);
             }
-            drop(guard);
             if overflowed {
                 continue;
             }
@@ -379,16 +406,18 @@ impl CachedFile {
     /// mapping-layout guard and `io_lock`; mmap faults are excluded by the
     /// mapping-update publication barrier.
     fn cached_page_set_matches(&self, start_page: u64, end_page: u64, expected: &[u32]) -> bool {
-        let guard = self.shared.page_cache.lock();
         let mut actual_len = 0;
-        for (&page_number, _) in guard.iter() {
-            let page = u64::from(page_number);
-            if page < start_page || page >= end_page {
-                continue;
-            }
-            actual_len += 1;
-            if expected.binary_search(&page_number).is_err() {
-                return false;
+        for index in 0..PAGE_CACHE_SHARD_COUNT {
+            let guard = self.shared.page_cache.lock_shard(index);
+            for (&page_number, _) in guard.iter() {
+                let page = u64::from(page_number);
+                if page < start_page || page >= end_page {
+                    continue;
+                }
+                actual_len += 1;
+                if expected.binary_search(&page_number).is_err() {
+                    return false;
+                }
             }
         }
         actual_len == expected.len()
@@ -479,7 +508,7 @@ impl CachedFile {
         if self.in_memory || prepared.was_dirty {
             return;
         }
-        let mut guard = self.shared.page_cache.lock();
+        let mut guard = self.shared.page_cache.lock_page(prepared.page_number);
         if let Some(page) = guard.get_mut(&prepared.page_number)
             && page.dirty
             && page.dirty_generation == prepared.generation
@@ -489,7 +518,7 @@ impl CachedFile {
     }
 
     fn restore_prepared_cache(&self, prepared: &PreparedPageWrite, backing_restored: bool) {
-        let mut guard = self.shared.page_cache.lock();
+        let mut guard = self.shared.page_cache.lock_page(prepared.page_number);
         if let Some(page) = guard.get_mut(&prepared.page_number)
             && page.dirty_generation == prepared.generation
         {
@@ -544,15 +573,22 @@ impl CachedFile {
         let first_discarded_page = len.div_ceil(PAGE_SIZE as u64);
         let keys = self.cached_pages_from(first_discarded_page)?;
         let mut discarded = DetachedPageBatch::prepare(keys.len())?;
-        let mut guard = self.shared.page_cache.lock();
-        if keys
-            .iter()
-            .any(|page_number| guard.get(page_number).is_some_and(|page| page.pins != 0))
-        {
+        if keys.iter().any(|page_number| {
+            self.shared
+                .page_cache
+                .lock_page(*page_number)
+                .get(page_number)
+                .is_some_and(|page| page.pins != 0)
+        }) {
             return Err(VfsError::ResourceBusy);
         }
         for page_number in keys {
-            if let Some(page) = guard.pop(&page_number) {
+            if let Some(page) = self
+                .shared
+                .page_cache
+                .lock_page(page_number)
+                .pop(&page_number)
+            {
                 discarded.pages.push((page_number, page));
             }
         }
