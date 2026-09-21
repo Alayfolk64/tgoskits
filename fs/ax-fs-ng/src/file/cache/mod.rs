@@ -1583,6 +1583,25 @@ pub(crate) fn writeback_filesystem_pages(filesystem: &dyn FilesystemOps) -> VfsR
     first_error.map_or(Ok(()), Err)
 }
 
+/// Starts one best-effort background pass for this filesystem.
+///
+/// Pages whose mapping endpoint reports a transient conflict remain dirty for
+/// the next pass. Unlike an explicit sync, the periodic worker does not retry
+/// that conflict or turn it into a filesystem error.
+#[cfg(feature = "ext4")]
+pub(crate) fn writeback_filesystem_pages_in_background(
+    filesystem: &dyn FilesystemOps,
+) -> VfsResult<()> {
+    let files = filesystem_cached_files(filesystem)?;
+    let mut first_error = None;
+    for file in files {
+        if let Err(error) = file.writeback_dirty_in_background() {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 #[cfg(feature = "ext4")]
 fn filesystem_cached_files(
     filesystem: &dyn FilesystemOps,

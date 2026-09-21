@@ -289,7 +289,7 @@ impl Ext4Filesystem {
     /// writes can request journal progress, so they must run outside `gate`.
     pub(super) fn periodic_writeback(&self) -> VfsResult<()> {
         self.reap_pending_inodes()?;
-        let pages = crate::file::writeback_filesystem_pages(self);
+        let pages = crate::file::writeback_filesystem_pages_in_background(self);
 
         // A failed page write can still have completed a valid prefix. Commit
         // that prefix as well, while returning the original page error first.

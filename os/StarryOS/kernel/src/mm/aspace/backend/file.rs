@@ -567,10 +567,11 @@ impl FilePageDomain {
                     return CacheMappingResult::Busy;
                 }
             };
-            let Some(mut aspace) = pin.try_lock() else {
-                let _ = lease.cancel();
-                return CacheMappingResult::Busy;
-            };
+            // Writeback is a sleepable data-integrity operation. Match
+            // Linux's synchronous rmap walk by waiting for the MM metadata
+            // owner instead of making every transient page fault defer the
+            // entire file. No page-cache or cached-I/O lock is held here.
+            let mut aspace = pin.lock();
             if let Err(error) = aspace.protect_file_mapping_slot(key, &page) {
                 let _ = lease.cancel();
                 return if matches!(

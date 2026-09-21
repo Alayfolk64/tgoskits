@@ -1,10 +1,12 @@
 use alloc::{boxed::Box, vec::Vec};
+use core::time::Duration;
 
 use axfs_ng_vfs::{FileNodeOps, VfsError, VfsResult};
 
 use super::{
     CacheMappingEvent, CacheMappingResult, CachedFileShared, PAGE_CACHE_SHARD_COUNT, PAGE_SIZE,
 };
+use crate::os::runtime_ops;
 
 /// Upper bound for one detached writeback snapshot batch.
 ///
@@ -15,6 +17,13 @@ use super::{
 /// filesystem. This amortizes mapping preparation and lets the block layer see
 /// multi-block writes without retaining unbounded dirty data across I/O.
 const MAX_WRITEBACK_SNAPSHOT_PAGES: usize = 16;
+const MAPPING_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+#[derive(Clone, Copy)]
+enum MappingConflictPolicy {
+    Defer,
+    Wait,
+}
 
 struct DirtyPageSnapshot {
     pn: u32,
@@ -26,7 +35,7 @@ struct DirtyPageSnapshot {
 impl CachedFileShared {
     pub(super) fn writeback(&self) -> VfsResult<Vec<u32>> {
         let dirty_keys = self.begin_writeback_all_dirty()?;
-        self.protect_dirty_pages_before_writeback(&dirty_keys)
+        self.protect_dirty_pages_before_writeback_with(&dirty_keys, MappingConflictPolicy::Wait)
             .inspect_err(|_| self.cancel_writeback_tracking(&dirty_keys))?;
         let _io = self.io_lock.lock();
         let result = self.writeback_page_runs(self.len(), &dirty_keys);
@@ -38,7 +47,7 @@ impl CachedFileShared {
 
     pub(super) fn writeback_pages(&self, pns: &[u32]) -> VfsResult<()> {
         let dirty_keys = self.begin_writeback_pages(pns)?;
-        self.protect_dirty_pages_before_writeback(&dirty_keys)
+        self.protect_dirty_pages_before_writeback_with(&dirty_keys, MappingConflictPolicy::Wait)
             .inspect_err(|_| self.cancel_writeback_tracking(&dirty_keys))?;
         let _io = self.io_lock.lock();
         let result = self.writeback_page_runs(self.len(), &dirty_keys);
@@ -50,7 +59,7 @@ impl CachedFileShared {
 
     pub(super) fn sync(&self, data_only: bool) -> VfsResult<()> {
         let dirty_keys = self.begin_writeback_all_dirty()?;
-        self.protect_dirty_pages_before_writeback(&dirty_keys)
+        self.protect_dirty_pages_before_writeback_with(&dirty_keys, MappingConflictPolicy::Wait)
             .inspect_err(|_| self.cancel_writeback_tracking(&dirty_keys))?;
         let _io = self.io_lock.lock();
         let result = self.writeback_page_runs(self.len(), &dirty_keys);
@@ -62,11 +71,27 @@ impl CachedFileShared {
 
     #[cfg(any(feature = "vfs", feature = "ext4"))]
     pub(super) fn writeback_dirty_for_global_sync(&self) -> VfsResult<()> {
+        self.writeback_dirty_for_global_sync_with(MappingConflictPolicy::Wait)
+    }
+
+    #[cfg(feature = "ext4")]
+    pub(super) fn writeback_dirty_in_background(&self) -> VfsResult<()> {
+        match self.writeback_dirty_for_global_sync_with(MappingConflictPolicy::Defer) {
+            Err(VfsError::ResourceBusy | VfsError::WouldBlock) => Ok(()),
+            result => result,
+        }
+    }
+
+    #[cfg(any(feature = "vfs", feature = "ext4"))]
+    fn writeback_dirty_for_global_sync_with(
+        &self,
+        conflict_policy: MappingConflictPolicy,
+    ) -> VfsResult<()> {
         let dirty_keys = self.begin_writeback_all_dirty()?;
         if dirty_keys.is_empty() {
             return Ok(());
         }
-        self.protect_dirty_pages_before_writeback(&dirty_keys)
+        self.protect_dirty_pages_before_writeback_with(&dirty_keys, conflict_policy)
             .inspect_err(|_| self.cancel_writeback_tracking(&dirty_keys))?;
         let _io = self.io_lock.lock();
         let result = self.writeback_page_runs(self.len(), &dirty_keys);
@@ -85,24 +110,47 @@ impl CachedFileShared {
     }
 
     pub(super) fn protect_dirty_pages_before_writeback(&self, pns: &[u32]) -> VfsResult<()> {
+        self.protect_dirty_pages_before_writeback_with(pns, MappingConflictPolicy::Defer)
+    }
+
+    fn protect_dirty_pages_before_writeback_with(
+        &self,
+        pns: &[u32],
+        conflict_policy: MappingConflictPolicy,
+    ) -> VfsResult<()> {
         for pn in pns {
-            let Some(paddr) = ({
+            while let Some(paddr) = {
                 let mut cache = self.page_cache.lock_page(*pn);
                 cache.get_mut(pn).map(|page| page.paddr()).transpose()?
-            }) else {
-                continue;
-            };
-            let event = CacheMappingEvent::WritebackProtect(self.cache_page_identity(*pn, paddr));
-            match self.publish_mapping_event(event) {
-                CacheMappingResult::Protected => {}
-                CacheMappingResult::Busy | CacheMappingResult::Quarantined => {
-                    return Err(VfsError::ResourceBusy);
-                }
-                CacheMappingResult::Retired | CacheMappingResult::Failed => {
-                    return Err(VfsError::BadState);
+            } {
+                let event =
+                    CacheMappingEvent::WritebackProtect(self.cache_page_identity(*pn, paddr));
+                match self.publish_mapping_event(event) {
+                    CacheMappingResult::Protected => break,
+                    CacheMappingResult::Busy | CacheMappingResult::Quarantined
+                        if matches!(conflict_policy, MappingConflictPolicy::Wait) =>
+                    {
+                        Self::wait_for_mapping_progress()?;
+                    }
+                    CacheMappingResult::Busy | CacheMappingResult::Quarantined => {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    CacheMappingResult::Retired | CacheMappingResult::Failed => {
+                        return Err(VfsError::BadState);
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn wait_for_mapping_progress() -> VfsResult<()> {
+        let runtime = runtime_ops().map_err(|_| VfsError::BadState)?;
+        if !runtime.can_block() {
+            return Err(VfsError::WouldBlock);
+        }
+        let notification = runtime.notification();
+        let _timed_out = notification.wait_timeout(MAPPING_RETRY_INTERVAL);
         Ok(())
     }
 

@@ -364,14 +364,16 @@ fn buffered_write_growth_does_not_run_the_truncate_path() {
 #[cfg(feature = "vfs")]
 #[test]
 fn filesystem_sync_does_not_visit_another_filesystems_busy_mapping() {
+    crate::os::task::install_test_runtime_ops();
     with_test_page_provider(true, |_| {
         let cached = reopen_cached_file(Arc::new(CacheTestFile::new(vec![0; PAGE_SIZE])));
         cached.write_at(&b"dirty"[..], 0).unwrap();
         let visits = Arc::new(AtomicUsize::new(0));
         let observed = visits.clone();
         let endpoint = install_shared_test_endpoint(&cached.shared, move |event| {
-            if matches!(event, CacheMappingEvent::WritebackProtect(_)) {
-                observed.fetch_add(1, Ordering::AcqRel);
+            if matches!(event, CacheMappingEvent::WritebackProtect(_))
+                && observed.fetch_add(1, Ordering::AcqRel) == 0
+            {
                 CacheMappingResult::Busy
             } else {
                 CacheMappingResult::Protected
@@ -386,8 +388,8 @@ fn filesystem_sync_does_not_visit_another_filesystems_busy_mapping() {
 
         assert_eq!(unrelated, Ok(()));
         assert_eq!(unrelated_visits, 0);
-        assert_eq!(own, Err(VfsError::ResourceBusy));
-        assert!(own_visits > 0);
+        assert_eq!(own, Ok(()));
+        assert_eq!(own_visits, 2);
     });
 }
 
@@ -628,6 +630,54 @@ fn writeback_protect_endpoint_runs_without_cached_io_lock() {
         shared.invoke_writeback_protect_for_test(&[0]).unwrap();
 
         assert!(observed_unlocked.load(Ordering::Acquire));
+    });
+}
+
+#[test]
+fn explicit_sync_waits_for_a_transient_mapping_protection_conflict() {
+    crate::os::task::install_test_runtime_ops();
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0; PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+        cached.write_at(&b"dirty"[..], 0).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let _endpoint = install_shared_test_endpoint(&cached.shared, move |event| {
+            assert!(matches!(event, CacheMappingEvent::WritebackProtect(_)));
+            if observed.fetch_add(1, Ordering::AcqRel) == 0 {
+                CacheMappingResult::Busy
+            } else {
+                CacheMappingResult::Protected
+            }
+        });
+
+        cached.sync(false).unwrap();
+
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        let mut contents = [0; 5];
+        backing.read_at(&mut contents, 0).unwrap();
+        assert_eq!(&contents, b"dirty");
+    });
+}
+
+#[cfg(feature = "ext4")]
+#[test]
+fn background_writeback_defers_a_busy_mapping_without_clearing_dirty_state() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0; PAGE_SIZE]));
+        let cached = reopen_cached_file(backing.clone());
+        cached.write_at(&b"dirty"[..], 0).unwrap();
+        let _endpoint = install_shared_test_endpoint(&cached.shared, |event| {
+            assert!(matches!(event, CacheMappingEvent::WritebackProtect(_)));
+            CacheMappingResult::Busy
+        });
+
+        cached.shared.writeback_dirty_in_background().unwrap();
+
+        assert_eq!(cached.dirty_pages_in_range(0, 1).unwrap(), [0]);
+        let mut contents = [0; 5];
+        backing.read_at(&mut contents, 0).unwrap();
+        assert_eq!(&contents, &[0; 5]);
     });
 }
 

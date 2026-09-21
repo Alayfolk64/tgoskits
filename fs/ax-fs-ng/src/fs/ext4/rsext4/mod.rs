@@ -3,6 +3,7 @@ mod inode;
 mod util;
 
 use alloc::boxed::Box;
+use core::time::Duration;
 
 pub use fs::*;
 pub use inode::*;
@@ -15,7 +16,10 @@ use rsext4::{
 use crate::{
     BlockError,
     block::{BlockRegion, FsBlockDevice, RegionBlockDevice},
+    os::runtime_ops,
 };
+
+const BLOCK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 pub(crate) struct Ext4Disk {
     device: RegionBlockDevice<Box<dyn FsBlockDevice>>,
@@ -84,17 +88,48 @@ impl Ext4Disk {
 fn block_error_to_ext4(error: BlockError) -> Ext4Error {
     match error {
         BlockError::InvalidRequest => Ext4Error::invalid_input(),
-        BlockError::WouldBlock | BlockError::ResourceBusy => Ext4Error::busy(),
+        BlockError::WouldBlock => Ext4Error::busy().with_operation("block:would_block"),
+        BlockError::ResourceBusy => Ext4Error::busy().with_operation("block:resource_busy"),
         BlockError::NoMemory => Ext4Error::no_memory(),
         BlockError::Unsupported | BlockError::RuntimeUnavailable => {
             Ext4Error::unsupported_capability("runtime:block_io")
         }
         BlockError::TimedOut => Ext4Error::timeout(),
-        BlockError::InvalidState
-        | BlockError::Io
-        | BlockError::NotFound
-        | BlockError::Irq(_)
-        | BlockError::Device { .. } => Ext4Error::io(),
+        BlockError::InvalidState | BlockError::Io | BlockError::NotFound | BlockError::Irq(_) => {
+            Ext4Error::io()
+        }
+        BlockError::Device { stage, .. } => Ext4Error::io().with_operation(stage),
+    }
+}
+
+fn run_blocking_io<T>(
+    mut operation: impl FnMut() -> crate::BlockResult<T>,
+) -> crate::BlockResult<T> {
+    loop {
+        let error = match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let retryable = matches!(
+            error,
+            BlockError::WouldBlock
+                | BlockError::ResourceBusy
+                | BlockError::Device {
+                    source: rdif_block::BlkError::Retry,
+                    ..
+                }
+        );
+        if !retryable {
+            return Err(error);
+        }
+        let Ok(runtime) = runtime_ops() else {
+            return Err(error);
+        };
+        if !runtime.can_block() {
+            return Err(error);
+        }
+        let notification = runtime.notification();
+        let _timed_out = notification.wait_timeout(BLOCK_RETRY_INTERVAL);
     }
 }
 
@@ -122,9 +157,11 @@ impl BlockIo for Ext4Disk {
         if buffer.len() < required_size {
             return Err(Ext4Error::buffer_too_small(buffer.len(), required_size));
         }
-        self.device
-            .write_block(sector.raw(), &buffer[..required_size])
-            .map_err(block_error_to_ext4)
+        run_blocking_io(|| {
+            self.device
+                .write_block(sector.raw(), &buffer[..required_size])
+        })
+        .map_err(block_error_to_ext4)
     }
 
     fn read(&mut self, buffer: &mut [u8], sector: SectorId, count: u32) -> Ext4Result<()> {
@@ -138,9 +175,11 @@ impl BlockIo for Ext4Disk {
         if buffer.len() < required_size {
             return Err(Ext4Error::buffer_too_small(buffer.len(), required_size));
         }
-        self.device
-            .read_block(sector.raw(), &mut buffer[..required_size])
-            .map_err(block_error_to_ext4)
+        run_blocking_io(|| {
+            self.device
+                .read_block(sector.raw(), &mut buffer[..required_size])
+        })
+        .map_err(block_error_to_ext4)
     }
 
     fn write_with_flags(
@@ -169,9 +208,11 @@ impl BlockIo for Ext4Disk {
         if buffer.len() < required_size {
             return Err(Ext4Error::buffer_too_small(buffer.len(), required_size));
         }
-        self.device
-            .write_block_fua(sector.raw(), &buffer[..required_size])
-            .map_err(block_error_to_ext4)
+        run_blocking_io(|| {
+            self.device
+                .write_block_fua(sector.raw(), &buffer[..required_size])
+        })
+        .map_err(block_error_to_ext4)
     }
 
     fn geometry(&self) -> DeviceGeometry {
@@ -195,7 +236,7 @@ impl BlockIo for Ext4Disk {
         if !self.device.supports_flush() {
             return Err(Ext4Error::unsupported_capability("block_io:flush"));
         }
-        self.device.flush().map_err(block_error_to_ext4)
+        run_blocking_io(|| self.device.flush()).map_err(block_error_to_ext4)
     }
 
     fn barrier(&mut self) -> Ext4Result<()> {
@@ -230,9 +271,12 @@ impl rsext4::ForkBlockIo for Ext4Disk {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::{
+        cell::Cell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use rsext4::Ext4ErrorKind;
+    use rsext4::{ErrorContext, Ext4ErrorKind};
 
     use super::*;
     use crate::BlockResult;
@@ -251,6 +295,38 @@ mod tests {
         for (source, expected) in cases {
             assert_eq!(block_error_to_ext4(source).kind(), expected);
         }
+
+        assert_eq!(
+            block_error_to_ext4(BlockError::WouldBlock).context(),
+            Some(ErrorContext::Operation {
+                op: "block:would_block",
+            })
+        );
+        assert_eq!(
+            block_error_to_ext4(BlockError::ResourceBusy).context(),
+            Some(ErrorContext::Operation {
+                op: "block:resource_busy",
+            })
+        );
+    }
+
+    #[test]
+    fn blocking_ext4_io_retries_a_transient_block_conflict() {
+        crate::os::task::install_test_runtime_ops();
+        let attempts = Cell::new(0);
+
+        let result = run_blocking_io(|| {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                Err(BlockError::WouldBlock)
+            } else {
+                Ok(7)
+            }
+        });
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts.get(), 2);
     }
 
     struct CapabilityDevice {
