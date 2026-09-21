@@ -317,13 +317,14 @@ pub struct MappingPermissions {
     pub maximum: MappingFlags,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct MappingPublication {
     replace: bool,
     huge_page_advice: HugePageAdvice,
     lock_mode: VmaLockMode,
     advice_policy: VmaAdvicePolicy,
     memlock_limit: Option<MemlockLimit>,
+    mapping_group: Option<Arc<MappingGroup>>,
 }
 
 /// Per-syscall view of Linux `RLIMIT_MEMLOCK` and `CAP_IPC_LOCK`.
@@ -387,6 +388,7 @@ impl MappingPublication {
             lock_mode: VmaLockMode::Unlocked,
             advice_policy: VmaAdvicePolicy::DEFAULT,
             memlock_limit: None,
+            mapping_group: None,
         }
     }
 
@@ -401,15 +403,17 @@ impl MappingPublication {
             lock_mode,
             advice_policy: VmaAdvicePolicy::DEFAULT,
             memlock_limit,
+            mapping_group: None,
         }
     }
 
-    const fn mremap(
+    fn mremap(
         replace: bool,
         huge_page_advice: HugePageAdvice,
         lock_mode: VmaLockMode,
         advice_policy: VmaAdvicePolicy,
         memlock_limit: Option<MemlockLimit>,
+        mapping_group: Arc<MappingGroup>,
     ) -> Self {
         Self {
             replace,
@@ -417,6 +421,7 @@ impl MappingPublication {
             lock_mode,
             advice_policy,
             memlock_limit,
+            mapping_group: Some(mapping_group),
         }
     }
 }
@@ -2394,7 +2399,7 @@ impl AddrSpace {
     }
 
     pub(crate) fn max_mapped_end(&self) -> Option<VirtAddr> {
-        self.vma_root.iter().last().map(|vma| vma.range.end)
+        self.vma_root.last_end()
     }
 
     pub(crate) fn next_advice_fragment(
@@ -2403,8 +2408,8 @@ impl AddrSpace {
         end: VirtAddr,
     ) -> Option<VmaAdviceFragment> {
         self.vma_root
-            .iter_entries()
-            .find(|entry| entry.end() > cursor && entry.start() < end)
+            .entry_ending_after(cursor)
+            .filter(|entry| entry.start() < end)
             .and_then(|entry| entry.advice_fragment(cursor, end))
     }
 
@@ -2490,6 +2495,7 @@ impl AddrSpace {
             huge_page_advice,
             source.lock_mode(),
             source.advice_policy(),
+            source.mapping_group(),
             dontunmap,
             replace_target,
             memlock_limit,
@@ -2526,6 +2532,7 @@ impl AddrSpace {
                 source.lock_mode(),
                 source.advice_policy(),
                 memlock_limit,
+                source.mapping_group(),
             ),
         )
     }
@@ -3216,24 +3223,25 @@ impl AddrSpace {
         require_full_coverage: bool,
     ) -> StarryResult<Vec<(VirtAddrRange, MappingOperation)>> {
         let mut fragments = Vec::new();
-        fragments
-            .try_reserve(self.vma_root.len())
-            .map_err(|_| StarryError::NoMemory)?;
         let mut covered = range.start;
-        for entry in self.vma_root.iter_entries() {
-            if entry.start() >= range.end {
-                break;
-            }
-            if entry.end() <= range.start {
-                continue;
-            }
+        let mut error = None;
+        self.vma_root.for_each_overlapping_entry(range, |entry| {
             let fragment =
                 VirtAddrRange::new(entry.start().max(range.start), entry.end().min(range.end));
             if require_full_coverage && fragment.start > covered {
-                return Err(StarryError::NoMemory);
+                error = Some(StarryError::NoMemory);
+                return false;
             }
             covered = covered.max(fragment.end);
+            if fragments.try_reserve(1).is_err() {
+                error = Some(StarryError::NoMemory);
+                return false;
+            }
             fragments.push((fragment, entry.operation_clone()));
+            true
+        });
+        if let Some(error) = error {
+            return Err(error);
         }
         if require_full_coverage && covered < range.end {
             return Err(StarryError::NoMemory);
@@ -3303,6 +3311,7 @@ impl AddrSpace {
         huge_page_advice: HugePageAdvice,
         lock_mode: VmaLockMode,
         advice_policy: VmaAdvicePolicy,
+        mapping_group: Option<Arc<MappingGroup>>,
         replace: bool,
     ) -> StarryResult<VmaMap> {
         let entry = self
@@ -3315,6 +3324,7 @@ impl AddrSpace {
                 huge_page_advice,
                 lock_mode,
                 advice_policy,
+                mapping_group,
                 operation.clone(),
             )
             .ok_or(StarryError::BadState)?;
@@ -3376,6 +3386,7 @@ impl AddrSpace {
         huge_page_advice: HugePageAdvice,
         lock_mode: VmaLockMode,
         advice_policy: VmaAdvicePolicy,
+        mapping_group: Option<Arc<MappingGroup>>,
         memlock_limit: Option<MemlockLimit>,
         replace: bool,
     ) -> StarryResult<PteMaterialization> {
@@ -3386,6 +3397,7 @@ impl AddrSpace {
             huge_page_advice,
             lock_mode,
             advice_policy,
+            mapping_group,
             replace,
         )?;
         self.validate_memlock_successor(&successor, memlock_limit)?;
@@ -3523,6 +3535,7 @@ impl AddrSpace {
             HugePageAdvice::Default,
             VmaLockMode::Unlocked,
             VmaAdvicePolicy::default(),
+            None,
             None,
             false,
         ) {
@@ -3729,6 +3742,7 @@ impl AddrSpace {
             lock_mode,
             advice_policy,
             memlock_limit,
+            mapping_group,
         } = publication;
         self.validate_region(start, size)?;
         if !permissions.maximum.contains(permissions.current) {
@@ -3751,16 +3765,8 @@ impl AddrSpace {
         // metadata only and therefore cannot make a failed map visible.
         let removed_pages = if replace {
             self.vma_root
-                .iter_entries()
-                .filter(|entry| entry.start() < range.end && entry.end() > range.start)
-                .try_fold(0u64, |pages, entry| {
-                    let lo = entry.start().max(range.start);
-                    let hi = entry.end().min(range.end);
-                    let fragment = hi.checked_sub_addr(lo).ok_or(StarryError::InvalidInput)?;
-                    pages
-                        .checked_add((fragment / PAGE_SIZE_4K) as u64)
-                        .ok_or(StarryError::InvalidInput)
-                })?
+                .mapped_pages_in_range(range)
+                .ok_or(StarryError::InvalidInput)?
         } else {
             0
         };
@@ -3792,6 +3798,7 @@ impl AddrSpace {
             huge_page_advice,
             lock_mode,
             advice_policy,
+            mapping_group,
             memlock_limit,
             replace,
         ) {
@@ -4046,35 +4053,12 @@ impl AddrSpace {
     pub fn discard_range(&mut self, start: VirtAddr, size: usize) -> StarryResult {
         self.validate_region(start, size)?;
         let retired_range = VirtAddrRange::from_start_size(start, size);
-        let end = start.checked_add(size).ok_or(StarryError::InvalidInput)?;
-
-        let mut frags: alloc::vec::Vec<(VirtAddrRange, MappingOperation)> = alloc::vec::Vec::new();
-        frags
-            .try_reserve(self.vma_root.len())
-            .map_err(|_| StarryError::NoMemory)?;
-        let mut covered = start;
-        for entry in self.vma_root.iter_entries() {
-            if entry.start() >= end {
-                break;
-            }
-            if entry.end() <= start {
-                continue;
-            }
-            let frag_start = entry.start().max(start);
-            let frag_end = entry.end().min(end);
-            if frag_start > covered {
-                return Err(StarryError::NoMemory);
-            }
-            let backend = entry.operation_clone();
+        let frags = self.mapping_operation_fragments(retired_range, true)?;
+        for (range, backend) in &frags {
             // Device/linear mappings cannot reconstruct a discarded PTE.
             // External huge-page providers reject a partial-page carve before
             // any split or PTE mutation is published.
-            backend.validate_discard_fragment(VirtAddrRange::new(frag_start, frag_end))?;
-            frags.push((VirtAddrRange::new(frag_start, frag_end), backend));
-            covered = frag_end;
-        }
-        if covered < end {
-            return Err(StarryError::NoMemory);
+            backend.validate_discard_fragment(*range)?;
         }
 
         let mut mutation = self.prepare_mutation_range(start, size);
@@ -4206,29 +4190,15 @@ impl AddrSpace {
     /// process's shared PageObject reclaimable.
     pub fn mark_lazy_free(&mut self, start: VirtAddr, size: usize) -> StarryResult {
         self.validate_region(start, size)?;
-        let end = start.checked_add(size).ok_or(StarryError::InvalidInput)?;
-        let mut covered = start;
-        for entry in self.vma_root.iter_entries() {
-            if entry.start() >= end {
-                break;
-            }
-            if entry.end() <= start {
-                continue;
-            }
-            let fragment_start = entry.start().max(start);
-            if fragment_start > covered {
-                return Err(StarryError::NoMemory);
-            }
-            if !entry.operation().is_private_anonymous() {
-                return Err(StarryError::InvalidInput);
-            }
-            covered = entry.end().min(end);
-        }
-        if covered < end {
-            return Err(StarryError::NoMemory);
+        let range = VirtAddrRange::from_start_size(start, size);
+        let fragments = self.mapping_operation_fragments(range, true)?;
+        if fragments
+            .iter()
+            .any(|(_, operation)| !operation.is_private_anonymous())
+        {
+            return Err(StarryError::InvalidInput);
         }
 
-        let range = VirtAddrRange::from_start_size(start, size);
         let mut candidates = Vec::new();
         candidates
             .try_reserve(self.mapping_slots_overlapping(range).count())
@@ -4479,17 +4449,10 @@ impl AddrSpace {
         };
 
         // Compute the actual mapped bytes being removed (unmap is already O(n)).
-        let end = start.checked_add(size).ok_or(StarryError::InvalidInput)?;
-        let removed_pages: u64 = self
+        let removed_pages = self
             .vma_root
-            .iter_entries()
-            .filter(|entry| entry.start() < end && entry.end() > start)
-            .map(|entry| {
-                let lo = entry.start().max(start);
-                let hi = entry.end().min(end);
-                ((hi - lo) / PAGE_SIZE_4K) as u64
-            })
-            .sum();
+            .mapped_pages_in_range(range)
+            .ok_or(StarryError::BadState)?;
 
         let deferred_tlb = DeferredTlbRetireGuard::enter();
         if let Err(error) = self.apply_unmap_unpublished(range) {
@@ -4873,6 +4836,7 @@ impl AddrSpace {
         huge_page_advice: HugePageAdvice,
         lock_mode: VmaLockMode,
         advice_policy: VmaAdvicePolicy,
+        mapping_group: Arc<MappingGroup>,
         dontunmap: bool,
         replace_target: bool,
         memlock_limit: Option<MemlockLimit>,
@@ -4916,18 +4880,8 @@ impl AddrSpace {
 
         let target_removed_pages = if replace_target {
             self.vma_root
-                .iter_entries()
-                .filter(|entry| {
-                    entry.start() < target_range.end && entry.end() > target_range.start
-                })
-                .try_fold(0u64, |pages, entry| {
-                    let lo = entry.start().max(target_range.start);
-                    let hi = entry.end().min(target_range.end);
-                    let bytes = hi.checked_sub_addr(lo).ok_or(StarryError::BadState)?;
-                    pages
-                        .checked_add((bytes / PAGE_SIZE_4K) as u64)
-                        .ok_or(StarryError::InvalidInput)
-                })?
+                .mapped_pages_in_range(target_range)
+                .ok_or(StarryError::InvalidInput)?
         } else {
             0
         };
@@ -4941,6 +4895,7 @@ impl AddrSpace {
             huge_page_advice,
             lock_mode,
             advice_policy,
+            Some(mapping_group),
             replace_target,
         )?;
         let mut final_successor = target_successor.clone();
@@ -4961,6 +4916,7 @@ impl AddrSpace {
                     // successful MREMAP_DONTUNMAP move.
                     VmaLockMode::Unlocked,
                     advice_policy,
+                    None,
                     replacement.clone(),
                 )
                 .ok_or(StarryError::BadState)?;
@@ -6581,6 +6537,7 @@ impl AddrSpace {
                         entry.snapshot().huge_page_advice,
                         VmaLockMode::Unlocked,
                         entry.snapshot().advice_policy,
+                        Some(entry.snapshot().group.clone()),
                         new_backend.clone(),
                     )
                     .ok_or(StarryError::BadState)?;
