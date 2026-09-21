@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::array;
 
 use ax_fs_ng::{
     file::{
@@ -32,7 +33,11 @@ use super::{
     PopulateRequest, PreparedPteOwner, ProviderPublication, PteMaterialization, RssKind,
     occupied_leaf_ranges, pages_in,
 };
-use crate::{StarryError, StarryResult, mm::flush_tlb_range_sync, sync::Mutex};
+use crate::{
+    StarryError, StarryResult,
+    mm::flush_tlb_range_sync,
+    sync::{Mutex, MutexGuard},
+};
 
 #[doc(hidden)]
 pub struct FileBackendInner {
@@ -288,9 +293,44 @@ impl FilePageIndex {
     }
 }
 
+/// File-cache ownership metadata partitioned by page number.
+///
+/// Linux keeps lookup identity in `address_space::i_pages` while folios own
+/// their mutable mapping state independently. StarryOS still stores that state
+/// in the index entry, so bounded partitioning prevents faults on unrelated
+/// file pages from queueing behind one PI mutex. Every operation in this domain
+/// names exactly one page and therefore acquires exactly one partition.
+const FILE_PAGE_INDEX_PARTITIONS: usize = 16;
+
+struct FilePageIndexPartitions {
+    partitions: [Mutex<FilePageIndex>; FILE_PAGE_INDEX_PARTITIONS],
+}
+
+impl Default for FilePageIndexPartitions {
+    fn default() -> Self {
+        Self {
+            partitions: array::from_fn(|_| Mutex::new(FilePageIndex::default())),
+        }
+    }
+}
+
+impl FilePageIndexPartitions {
+    const fn partition_index(page_number: u32) -> usize {
+        page_number as usize % FILE_PAGE_INDEX_PARTITIONS
+    }
+
+    fn lock_page(&self, page_number: u32) -> MutexGuard<'_, FilePageIndex> {
+        self.partition_for_page(page_number).lock()
+    }
+
+    const fn partition_for_page(&self, page_number: u32) -> &Mutex<FilePageIndex> {
+        &self.partitions[Self::partition_index(page_number)]
+    }
+}
+
 pub(super) struct FilePageDomain {
     identity: CachedFileIdentity,
-    pages: Mutex<FilePageIndex>,
+    pages: FilePageIndexPartitions,
 }
 
 type FilePageDomains = BTreeMap<CachedFileIdentity, Weak<FilePageDomain>>;
@@ -309,7 +349,7 @@ impl FilePageDomain {
             } else {
                 let domain = Arc::new(Self {
                     identity,
-                    pages: Mutex::new(FilePageIndex::default()),
+                    pages: FilePageIndexPartitions::default(),
                 });
                 domains.insert(identity, Arc::downgrade(&domain));
                 domain
@@ -327,7 +367,7 @@ impl FilePageDomain {
         pin: CachedPagePin,
     ) -> StarryResult<Arc<PageObject>> {
         self.pages
-            .lock()
+            .lock_page(page_number)
             .reserve_publication(file_epoch, page_number, pin)
     }
 
@@ -337,7 +377,9 @@ impl FilePageDomain {
         page_number: u32,
         paddr: PhysAddr,
     ) -> StarryResult<Option<Arc<PageObject>>> {
-        self.pages.lock().resolve(file_epoch, page_number, paddr)
+        self.pages
+            .lock_page(page_number)
+            .resolve(file_epoch, page_number, paddr)
     }
 
     pub(super) fn page_if_matches(
@@ -350,7 +392,7 @@ impl FilePageDomain {
         // anonymous COW page. Treat an identity mismatch as "not cache-owned"
         // so the caller can continue with its anonymous-page index.
         self.pages
-            .lock()
+            .lock_page(page_number)
             .resolve(file_epoch, page_number, paddr)
             .ok()
             .flatten()
@@ -358,7 +400,7 @@ impl FilePageDomain {
 
     pub(super) fn owns_page(&self, page_number: u32, page: &Arc<PageObject>) -> bool {
         self.pages
-            .lock()
+            .lock_page(page_number)
             .pages
             .get(&page_number)
             .map(FilePageEntry::page)
@@ -373,7 +415,7 @@ impl FilePageDomain {
     ) -> StarryResult {
         let pin = self
             .pages
-            .lock()
+            .lock_page(page_number)
             .finish_publication(file_epoch, page_number, page)?;
         drop(pin);
         Ok(())
@@ -384,7 +426,10 @@ impl FilePageDomain {
         page_number: u32,
         page: &Arc<PageObject>,
     ) -> StarryResult {
-        let pin = self.pages.lock().cancel_publication(page_number, page)?;
+        let pin = self
+            .pages
+            .lock_page(page_number)
+            .cancel_publication(page_number, page)?;
         drop(pin);
         Ok(())
     }
@@ -396,7 +441,7 @@ impl FilePageDomain {
         page: &Arc<PageObject>,
     ) -> StarryResult {
         self.pages
-            .lock()
+            .lock_page(page_number)
             .ensure_identity(file_epoch, page_number, page)
     }
 
@@ -420,7 +465,7 @@ impl FilePageDomain {
         if page.state() == PageState::Retired && page.mapping_refs() == 0 {
             return if self
                 .pages
-                .lock()
+                .lock_page(identity.page_number())
                 .remove_retired(identity.page_number(), &page)
             {
                 CacheMappingResult::Retired
@@ -482,7 +527,7 @@ impl FilePageDomain {
             Ok(()) => {
                 if self
                     .pages
-                    .lock()
+                    .lock_page(identity.page_number())
                     .remove_retired(identity.page_number(), &page)
                 {
                     CacheMappingResult::Retired
@@ -1341,6 +1386,19 @@ fn published_file_page_lives_until_exact_retirement_for_test() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unrelated_file_pages_do_not_share_domain_exclusion() {
+        let pages = super::FilePageIndexPartitions::default();
+
+        assert!(
+            !core::ptr::eq(
+                pages.partition_for_page(0),
+                pages.partition_for_page(1)
+            ),
+            "an unrelated file page serialized behind page 0 ownership metadata"
+        );
+    }
+
     #[cfg(all(test, axtest))]
     #[axtest::axtest]
     fn independent_file_backends_share_page_object() {
