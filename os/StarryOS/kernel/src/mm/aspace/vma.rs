@@ -1260,6 +1260,9 @@ impl VmaMap {
     ) {
         let mut visited = 0;
         Self::visit_overlapping(&self.root, range, &mut visited, &mut visit);
+        #[cfg(test)]
+        self.iteration_visits
+            .fetch_add(visited, Ordering::Relaxed);
     }
 
     fn overlapping_entries(&self, range: VirtAddrRange) -> Option<Vec<Arc<VmaEntry>>> {
@@ -1895,6 +1898,19 @@ impl VmaMap {
         iter
     }
 
+    pub(super) fn for_each_shared_file_overlapping(
+        &self,
+        range: VirtAddrRange,
+        mut visit: impl FnMut(SharedFileVmaRecord),
+    ) {
+        self.for_each_overlapping_entry(range, |entry| {
+            if let Some(record) = entry.shared_file_record() {
+                visit(record);
+            }
+            true
+        });
+    }
+
     fn iter_entries_from(
         &self,
         start: VirtAddr,
@@ -1997,6 +2013,25 @@ mod tests {
         assert!(
             visited <= 24,
             "a one-VMA lookup walked {visited} nodes of a 256-VMA tree",
+        );
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn shared_file_range_lookup_does_not_scan_unrelated_vmas() {
+        let map = map_of(256);
+        let target = 0x1000 + 128 * 0x2000;
+        let range = VirtAddrRange::from_start_size(VirtAddr::from_usize(target), 0x1000);
+        map.iteration_visits.store(0, Ordering::Relaxed);
+
+        let mut found = 0;
+        map.for_each_shared_file_overlapping(range, |_| found += 1);
+
+        assert_eq!(found, 0);
+        let visited = map.iteration_visits.load(Ordering::Relaxed);
+        assert!(
+            visited <= 24,
+            "a one-VMA shared-file lookup walked {visited} nodes of a 256-VMA tree",
         );
     }
 

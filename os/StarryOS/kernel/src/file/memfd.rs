@@ -382,14 +382,11 @@ pub(crate) fn prepare_aspace_unmap_deltas(
         return Vec::new();
     };
     let mut deltas = Vec::new();
-    for area in aspace.shared_file_vmas() {
+    aspace.for_each_shared_file_vma_in_range(ustart, ulen, |area| {
         let a0 = area.range.start;
         let a1 = area.range.end;
-        if a1 <= ustart || a0 >= uend {
-            continue;
-        }
         let Some(memfd) = memfd_from_shared_writable_area(&area) else {
-            continue;
+            return;
         };
         if ustart <= a0 && uend >= a1 {
             deltas.push(SharedWritableDelta {
@@ -405,7 +402,7 @@ pub(crate) fn prepare_aspace_unmap_deltas(
                 delta: 1,
             });
         }
-    }
+    });
     deltas
 }
 
@@ -418,17 +415,15 @@ pub(crate) fn collect_metas_touching_mprotect_range(
         return Vec::new();
     };
     let mut memfds = Vec::new();
-    for area in aspace.shared_file_vmas() {
-        if area.range.end <= ustart || area.range.start >= uend {
-            continue;
-        }
+    aspace.for_each_shared_file_vma_in_range(ustart, ulen, |area| {
+        debug_assert!(area.range.end > ustart && area.range.start < uend);
         let Some(memfd) = memfd_from_shared_file(&area.file) else {
-            continue;
+            return;
         };
         if !memfds.iter().any(|x: &Arc<Memfd>| Arc::ptr_eq(x, &memfd)) {
             memfds.push(memfd);
         }
-    }
+    });
     memfds
 }
 
@@ -469,10 +464,8 @@ pub(crate) fn prepare_aspace_replace_deltas(
     let Some(uend) = ustart.checked_add(ulen) else {
         return deltas;
     };
-    for old in aspace.shared_file_vmas() {
-        if old.range.end <= ustart || old.range.start >= uend {
-            continue;
-        }
+    aspace.for_each_shared_file_vma_in_range(ustart, ulen, |old| {
+        debug_assert!(old.range.end > ustart && old.range.start < uend);
         if let Some(memfd) = memfd_from_shared_file(&old.file)
             && old.rights.contains(MappingFlags::WRITE)
         {
@@ -482,7 +475,7 @@ pub(crate) fn prepare_aspace_replace_deltas(
                 delta: -1,
             });
         }
-    }
+    });
     if let Some(memfd) = memfd_from_file_backend(new_backend)
         && new_flags.contains(MappingFlags::WRITE)
     {

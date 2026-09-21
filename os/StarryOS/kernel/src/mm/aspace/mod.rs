@@ -2459,6 +2459,23 @@ impl AddrSpace {
             .and_then(|entry| entry.shared_file_record())
     }
 
+    /// Visits only shared-file VMAs intersecting the requested range. The VMA
+    /// interval tree prunes unrelated subtrees, so side-band mapping metadata
+    /// updates remain proportional to the mutation rather than the process's
+    /// total VMA count.
+    pub(crate) fn for_each_shared_file_vma_in_range(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        visit: impl FnMut(SharedFileVmaRecord),
+    ) {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return;
+        };
+        self.vma_root
+            .for_each_shared_file_overlapping(range, visit);
+    }
+
     pub(crate) fn shared_file_vmas(&self) -> Vec<SharedFileVmaRecord> {
         self.vma_root
             .iter_entries()
