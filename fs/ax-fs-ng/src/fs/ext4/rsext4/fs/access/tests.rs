@@ -20,6 +20,15 @@ fn unlinked_last_lifetime_release_requests_orphan_reap() {
 }
 
 #[test]
+#[should_panic(expected = "cannot retain an unlinked inode lifetime")]
+fn zero_link_publication_closes_new_lifetime_admission() {
+    let gate = AccessGate::new();
+    gate.publish_zero_link();
+
+    gate.retain_lifetime();
+}
+
+#[test]
 fn hot_metadata_initialization_does_not_overwrite_writer_publication() {
     let gate = AccessGate::new();
     gate.initialize_regular_file_size(5);

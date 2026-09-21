@@ -61,11 +61,19 @@ impl AccessGate {
 
     /// Retains one allocated-inode owner without taking mount state.
     pub(crate) fn retain_lifetime(&self) {
-        self.lifetime_state
+        let result = self
+            .lifetime_state
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                ((state & LIFETIME_REFS) != LIFETIME_REFS).then_some(state + 1)
-            })
-            .expect("inode lifetime reference count overflow");
+                (state & ZERO_LINK == 0 && state & LIFETIME_REFS != LIFETIME_REFS)
+                    .then_some(state + 1)
+            });
+        match result {
+            Ok(_) => {}
+            Err(state) if state & ZERO_LINK != 0 => {
+                panic!("cannot retain an unlinked inode lifetime");
+            }
+            Err(_) => panic!("inode lifetime reference count overflow"),
+        }
     }
 
     /// Releases one allocated-inode owner and reports whether an unlinked
@@ -89,18 +97,6 @@ impl AccessGate {
     /// if it follows, the release observes `ZERO_LINK` and wakes the worker.
     pub(crate) fn publish_zero_link(&self) {
         self.lifetime_state.fetch_or(ZERO_LINK, Ordering::AcqRel);
-    }
-
-    /// Clears publication only after successful reap, before this gate can be
-    /// reused for a newly allocated inode with the same number.
-    pub(crate) fn clear_zero_link(&self) {
-        let previous = self
-            .lifetime_state
-            .fetch_and(LIFETIME_REFS, Ordering::AcqRel);
-        assert_eq!(
-            previous, ZERO_LINK,
-            "successful inode reap must have zero lifetime references"
-        );
     }
 
     /// Initializes a regular inode's hot size without overwriting a value

@@ -70,15 +70,13 @@ impl InodeLifetimeTracker {
         self.claim_if_ready(inode)
     }
 
-    fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) {
+    fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) -> Option<Arc<AccessGate>> {
         self.reaping.remove(&claim.0);
-        if succeeded {
-            let access = self
-                .zero_link
+        succeeded.then(|| {
+            self.zero_link
                 .remove(&claim.0)
-                .expect("successful inode reap must retain its access gate");
-            access.clear_zero_link();
-        }
+                .expect("successful inode reap must retain its access gate")
+        })
     }
 
     fn claim_pending_reap(&mut self) -> Option<ReapClaim> {
@@ -117,8 +115,8 @@ impl Ext4State {
         self.lifetimes.publish_zero_link(ino, access)
     }
 
-    fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) {
-        self.lifetimes.finish_reap(claim, succeeded);
+    fn finish_reap(&mut self, claim: ReapClaim, succeeded: bool) -> Option<Arc<AccessGate>> {
+        self.lifetimes.finish_reap(claim, succeeded)
     }
 
     fn has_pending_reaps(&self) -> bool {
@@ -284,6 +282,22 @@ impl Ext4Filesystem {
         lock
     }
 
+    /// Retires one completed inode generation while mount state still excludes
+    /// allocation of the same inode number. The old gate remains permanently
+    /// closed, matching Linux's `I_FREEING`/`I_CLEAR` generation boundary.
+    fn retire_inode_access(&self, inode: InodeNumber, retired: &Arc<AccessGate>) {
+        let mut locks = self.inode_access.lock();
+        let current = locks
+            .get(&inode)
+            .and_then(Weak::upgrade)
+            .expect("reaped inode must retain its registered access gate");
+        assert!(
+            Arc::ptr_eq(&current, retired),
+            "reaped inode access generation changed before retirement"
+        );
+        locks.remove(&inode);
+    }
+
     pub(crate) fn reap(&self, claim: ReapClaim) -> VfsResult<()> {
         let _operation = match self.admission.enter() {
             Ok(operation) => operation,
@@ -291,7 +305,8 @@ impl Ext4Filesystem {
                 // A final inode drop can race shutdown after normal writers
                 // have drained. Return its claim to the shutdown owner rather
                 // than modifying metadata behind the closed admission gate.
-                self.lock().finish_reap(claim, false);
+                let retired = self.lock().finish_reap(claim, false);
+                debug_assert!(retired.is_none());
                 return Err(into_vfs_err(error));
             }
         };
@@ -317,36 +332,37 @@ impl Ext4Filesystem {
     fn reap_admitted(&self, claim: ReapClaim) -> VfsResult<()> {
         // Reap continues across pressure after unlink has already published
         // the orphan. The lifetime claim excludes a second reaper.
-        let result = loop {
-            let result = {
-                let mut state = self.lock();
-                state.dirty = true;
-                if state.staging {
-                    None
-                } else {
-                    // The lifetime claim proves that no FileNode (including
-                    // cached backing owners) still references this inode.
-                    // Remove its weak key before allocation may reuse it.
-                    crate::file::forget_cached_file_key(self, claim.0.as_u64());
-                    Some(state.ext4.reap_unlinked_inode(claim.0))
-                }
-            };
-            match result {
-                None => {
-                    if let Err(error) = self.sync_core_for_reap() {
-                        break Err(error);
+        loop {
+            let mut state = self.lock();
+            state.dirty = true;
+            if !state.staging {
+                // The lifetime claim proves that no FileNode (including
+                // cached backing owners) still references this inode.
+                // Remove its weak key before allocation may reuse it.
+                crate::file::forget_cached_file_key(self, claim.0.as_u64());
+                let result = state.ext4.reap_unlinked_inode(claim.0);
+                if !result
+                    .as_ref()
+                    .is_err_and(|error| error.requires_journal_progress())
+                {
+                    // Core deallocation and generation retirement share this
+                    // mount-state critical section. A concurrent creator can
+                    // therefore never retain the completed old generation.
+                    let retired = state.finish_reap(claim, result.is_ok());
+                    if let Some(retired) = retired {
+                        self.retire_inode_access(claim.0, &retired);
                     }
+                    return result.map_err(into_vfs_err);
                 }
-                Some(Err(error)) if error.requires_journal_progress() => {
-                    if let Err(error) = self.sync_core_for_reap() {
-                        break Err(error);
-                    }
-                }
-                Some(result) => break result,
             }
-        };
-        self.lock().finish_reap(claim, result.is_ok());
-        result.map_err(into_vfs_err)
+            drop(state);
+
+            if let Err(error) = self.sync_core_for_reap() {
+                let retired = self.lock().finish_reap(claim, false);
+                debug_assert!(retired.is_none());
+                return Err(into_vfs_err(error));
+            }
+        }
     }
 
     fn shutdown_filesystem(&self) -> VfsResult<()> {

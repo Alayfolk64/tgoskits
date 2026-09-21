@@ -219,8 +219,13 @@ fn zero_link_reap_claim_is_unique_and_retryable() {
     let retry = tracker
         .claim_pending_reap()
         .expect("failed reap must remain retryable");
-    tracker.finish_reap(retry, true);
-    assert!(!access.is_zero_link());
+    assert!(Arc::ptr_eq(
+        &tracker
+            .finish_reap(retry, true)
+            .expect("successful reap must retire its access gate"),
+        &access
+    ));
+    assert!(access.is_zero_link());
     assert!(!tracker.has_pending_reaps());
 }
 
@@ -237,8 +242,13 @@ fn zero_link_publish_claims_reap_if_the_last_owner_won_the_race() {
         .expect("zero-link publication must observe the released owner");
     assert!(access.is_zero_link());
 
-    tracker.finish_reap(claim, true);
-    assert!(!access.is_zero_link());
+    assert!(Arc::ptr_eq(
+        &tracker
+            .finish_reap(claim, true)
+            .expect("successful reap must retire its access gate"),
+        &access
+    ));
+    assert!(access.is_zero_link());
     assert!(!tracker.has_pending_reaps());
 }
 
