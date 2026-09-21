@@ -956,8 +956,11 @@ impl CachedFile {
     /// A window publishes one [`PageLoad`] for every page it covers before
     /// entering the backing filesystem. A fault for the same page sleeps on
     /// that load, while faults for unrelated pages can submit independent I/O.
-    /// The broad per-file `io_lock` is acquired only for cache publication, so
-    /// it never covers an IRQ-driven block-device wait.
+    /// Each prepared page is published under its cache-index shard after
+    /// rechecking the mapping epoch. A concurrent mapping update either sees
+    /// and invalidates that page or makes this publication retry, matching
+    /// Linux's per-folio publication under the address-space invalidate
+    /// boundary without a whole-file fault lock.
     fn populate_page_window(&self, file: &FileNode, pn: u32, window_pages: usize) -> VfsResult<()> {
         if self.in_memory {
             let _io = self.shared.io_lock.lock();
@@ -1079,27 +1082,27 @@ impl CachedFile {
             unused
                 .try_reserve_exact(run_pages)
                 .map_err(|_| VfsError::NoMemory)?;
-            {
-                let _io = self.shared.io_lock.lock();
+            let mut publication_error = None;
+            for (page_number, page) in prepared {
+                let mut cache = self.shared.page_cache.lock_page(page_number);
                 if self
                     .shared
                     .mapping_update_in_progress
                     .load(Ordering::Acquire)
                     || self.shared.mapping_epoch.load(Ordering::Acquire) != load_epoch
                 {
-                    return Err(VfsError::ResourceBusy);
+                    unused.push(page);
+                    publication_error = Some(VfsError::ResourceBusy);
+                    break;
                 }
-                for (page_number, page) in prepared {
-                    let mut cache = self.shared.page_cache.lock_page(page_number);
-                    if cache.contains(&page_number) {
-                        unused.push(page);
-                    } else if let Some((_, retired)) = cache.push(page_number, page) {
-                        unused.push(retired);
-                    }
+                if cache.contains(&page_number) {
+                    unused.push(page);
+                } else if let Some((_, retired)) = cache.push(page_number, page) {
+                    unused.push(retired);
                 }
             }
             drop(unused);
-            Ok(())
+            publication_error.map_or(Ok(()), Err)
         })();
 
         *load_state = PageLoadState::Complete(result);
@@ -1180,18 +1183,7 @@ impl CachedFile {
         };
         self.populate_page_window(self.inner.entry().as_file()?, pn, window_pages)?;
 
-        // Serialize only the final ownership publication against writers and
-        // mapping changes. The backing I/O above intentionally runs without
-        // this broad per-file lock.
-        let _io = self.shared.io_lock.lock();
-        if self
-            .shared
-            .mapping_update_in_progress
-            .load(Ordering::Acquire)
-        {
-            return Err(VfsError::ResourceBusy);
-        }
-        self.pin_cached_page_if_present(pn)?
+        self.pin_cached_page_for_mapping_if_present(pn)?
             .ok_or(VfsError::ResourceBusy)
     }
 
@@ -1246,6 +1238,26 @@ impl CachedFile {
 
     fn pin_cached_page_if_present(&self, pn: u32) -> VfsResult<Option<CachedPagePin>> {
         let mut cache = self.shared.page_cache.lock_page(pn);
+        self.pin_cached_page_in(pn, &mut cache)
+    }
+
+    fn pin_cached_page_for_mapping_if_present(&self, pn: u32) -> VfsResult<Option<CachedPagePin>> {
+        let mut cache = self.shared.page_cache.lock_page(pn);
+        if self
+            .shared
+            .mapping_update_in_progress
+            .load(Ordering::Acquire)
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+        self.pin_cached_page_in(pn, &mut cache)
+    }
+
+    fn pin_cached_page_in(
+        &self,
+        pn: u32,
+        cache: &mut PageCacheShard,
+    ) -> VfsResult<Option<CachedPagePin>> {
         let Some(page) = cache.get_mut(&pn) else {
             return Ok(None);
         };

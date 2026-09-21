@@ -471,6 +471,36 @@ fn mmap_faults_grow_bounded_readahead_without_pinning_neighbors() {
 }
 
 #[test]
+fn resident_mmap_fault_does_not_wait_for_unrelated_cached_io() {
+    with_test_page_provider(true, |_| {
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE]));
+        let cached = Arc::new(reopen_cached_file(backing));
+        drop(cached.pin_page_or_insert(0).unwrap());
+
+        let cached_io = cached.shared.io_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let fault_file = cached.clone();
+        let fault = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = fault_file.pin_page_for_mapping(0).map(drop);
+            completed_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let completed_without_cached_io = completed_rx.recv_timeout(Duration::from_secs(1));
+        drop(cached_io);
+        fault.join().unwrap();
+
+        assert!(
+            completed_without_cached_io.is_ok(),
+            "a resident mmap fault serialized behind unrelated per-file cached I/O"
+        );
+        assert_eq!(completed_without_cached_io.unwrap(), Ok(()));
+    });
+}
+
+#[test]
 fn independent_page_loads_run_concurrently_and_same_page_faults_coalesce() {
     with_test_page_provider(true, |_| {
         let backing = Arc::new(CacheTestFile::new(vec![0x5a; 2 * PAGE_SIZE]));
