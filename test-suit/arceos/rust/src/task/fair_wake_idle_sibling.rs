@@ -16,6 +16,7 @@ use ax_std::os::arceos::{
     modules::ax_hal::percpu::this_cpu_id,
     task::{
         sched::{CpuSet, FairMode, Nice, SchedulePolicy},
+        sync::WaitQueue,
         thread::{
             ThreadState,
             current::{current_thread_id, set_current_thread_affinity},
@@ -27,7 +28,7 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 const HRTICK_PROGRESS_TIMEOUT: Duration = Duration::from_millis(250);
 const TEST_STACK_SIZE: usize = 256 * 1024;
 
-static WAKEE_WAIT: AxWaitQueueHandle = AxWaitQueueHandle::new();
+static WAKEE_WAIT: WaitQueue = WaitQueue::new();
 static READY: AtomicBool = AtomicBool::new(false);
 static GO: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -46,13 +47,6 @@ fn pin_current_to_cpu(cpu: usize) {
     wait_until(
         || this_cpu_id() == cpu,
         "test thread did not settle on its requested CPU",
-    );
-}
-
-fn select_waiter() {
-    wait_until(
-        || api::ax_wait_queue_wake(&WAKEE_WAIT, 1) == 1,
-        "the Fair wakee did not enter the public wait queue",
     );
 }
 
@@ -223,27 +217,39 @@ pub fn run() -> crate::TestResult {
         cpu_count >= 4,
         "task-fair-wake-idle-sibling requires SMP >= 4, got {cpu_count}"
     );
-    READY.store(false, Ordering::Release);
-    GO.store(false, Ordering::Release);
-    DONE.store(false, Ordering::Release);
-    WAKE_CPU.store(usize::MAX, Ordering::Release);
-
     pin_current_to_cpu(1);
     sched_batch_wake_uses_fair_hrtick();
 
     pin_current_to_cpu(1);
     sched_idle_makes_progress_against_normal_current();
 
+    for synchronous in [false, true] {
+        fair_wake_placement(cpu_count, synchronous);
+    }
+    set_current_thread_affinity(CpuSet::all(cpu_count))
+        .expect("test owner must restore full affinity");
+    Ok(())
+}
+
+fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
+    READY.store(false, Ordering::Release);
+    GO.store(false, Ordering::Release);
+    DONE.store(false, Ordering::Release);
+    WAKE_CPU.store(usize::MAX, Ordering::Release);
+
     pin_current_to_cpu(1);
-    let wakee = thread::spawn(move || {
-        pin_current_to_cpu(0);
-        set_current_thread_affinity(CpuSet::all(cpu_count))
-            .expect("the Fair wakee must become migratable");
-        READY.store(true, Ordering::Release);
-        api::ax_wait_queue_wait_until(&WAKEE_WAIT, || GO.load(Ordering::Acquire), None);
-        WAKE_CPU.store(this_cpu_id(), Ordering::Release);
-        DONE.store(true, Ordering::Release);
-    });
+    let wakee = ax_std::os::arceos::thread::builder(String::from("fair-placement-wakee"))
+        .stack_size(TEST_STACK_SIZE)
+        .spawn(move || {
+            pin_current_to_cpu(0);
+            set_current_thread_affinity(CpuSet::all(cpu_count))
+                .expect("the Fair wakee must become migratable");
+            READY.store(true, Ordering::Release);
+            WAKEE_WAIT.wait_until(|| GO.load(Ordering::Acquire));
+            WAKE_CPU.store(this_cpu_id(), Ordering::Release);
+            DONE.store(true, Ordering::Release);
+        })
+        .expect("the Fair wakee must spawn");
     wait_until(
         || READY.load(Ordering::Acquire),
         "the Fair wakee did not publish readiness",
@@ -267,28 +273,40 @@ pub fn run() -> crate::TestResult {
         "the wakee's previous CPU did not become busy",
     );
 
-    // A first wake with a false predicate proves that the scenario reached a
-    // real wait-queue claim instead of winning a wake-before-park race.
-    select_waiter();
+    // Observe the committed park without a probe wake that could itself
+    // migrate the wakee away from its previous CPU.
+    wait_until(
+        || wakee.state() == ThreadState::Blocked,
+        "the Fair wakee did not park on its previous CPU",
+    );
     GO.store(true, Ordering::Release);
-    api::ax_wait_queue_wake(&WAKEE_WAIT, 1);
+    let delivered = if synchronous {
+        WAKEE_WAIT.notify_one_sync()
+    } else {
+        WAKEE_WAIT.notify_one()
+    };
+    assert!(delivered, "the Fair wake must claim the parked waiter");
     wait_until(
         || DONE.load(Ordering::Acquire),
         "the Fair wakee did not make bounded progress",
     );
 
     let wake_cpu = WAKE_CPU.load(Ordering::Acquire);
-    assert!(
-        (2..cpu_count).contains(&wake_cpu),
-        "Fair wake selected busy CPU{wake_cpu} instead of an idle sibling"
-    );
+    if synchronous {
+        assert!(
+            (2..cpu_count).contains(&wake_cpu),
+            "synchronous Fair wake selected busy CPU{wake_cpu} instead of an idle sibling"
+        );
+    } else {
+        assert_eq!(
+            wake_cpu, 0,
+            "ordinary Fair wake must retain its previous CPU"
+        );
+    }
 
     wakee.join().expect("the Fair wakee must exit normally");
     stop_occupier.store(true, Ordering::Release);
     occupier
         .join()
         .expect("the CPU0 occupier must exit normally");
-    set_current_thread_affinity(CpuSet::all(cpu_count))
-        .expect("test owner must restore full affinity");
-    Ok(())
 }
