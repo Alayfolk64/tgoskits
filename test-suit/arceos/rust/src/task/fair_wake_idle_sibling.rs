@@ -6,6 +6,7 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+    vec::Vec,
 };
 
 use ax_std::os::arceos::{
@@ -15,7 +16,7 @@ use ax_std::os::arceos::{
     },
     modules::ax_hal::percpu::this_cpu_id,
     task::{
-        sched::{CpuSet, FairMode, Nice, SchedulePolicy},
+        sched::{CpuId, CpuSet, FairMode, Nice, SchedulePolicy},
         sync::WaitQueue,
         thread::{
             ThreadState,
@@ -242,8 +243,17 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
         .stack_size(TEST_STACK_SIZE)
         .spawn(move || {
             pin_current_to_cpu(0);
-            set_current_thread_affinity(CpuSet::all(cpu_count))
-                .expect("the Fair wakee must become migratable");
+            let affinity = if synchronous {
+                CpuSet::all(cpu_count)
+            } else {
+                // Both eligible CPUs stay runnable, so idle-pull cannot
+                // obscure the ordinary wake-placement decision.
+                let mut affinity = CpuSet::empty(cpu_count);
+                assert!(affinity.insert(CpuId::new(0)));
+                assert!(affinity.insert(CpuId::new(1)));
+                affinity
+            };
+            set_current_thread_affinity(affinity).expect("the Fair wakee must become migratable");
             READY.store(true, Ordering::Release);
             WAKEE_WAIT.wait_until(|| GO.load(Ordering::Acquire));
             WAKE_CPU.store(this_cpu_id(), Ordering::Release);
@@ -256,20 +266,22 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
     );
 
     let stop_occupier = Arc::new(AtomicBool::new(false));
-    let occupier_ready = Arc::new(AtomicBool::new(false));
-    let occupier = {
+    let occupier_ready = Arc::new(AtomicUsize::new(0));
+    let occupier_count = if synchronous { 1 } else { 3 };
+    let mut occupiers = Vec::new();
+    for _ in 0..occupier_count {
         let stop = Arc::clone(&stop_occupier);
         let ready = Arc::clone(&occupier_ready);
-        thread::spawn(move || {
+        occupiers.push(thread::spawn(move || {
             pin_current_to_cpu(0);
-            ready.store(true, Ordering::Release);
+            ready.fetch_add(1, Ordering::Release);
             while !stop.load(Ordering::Acquire) {
                 core::hint::spin_loop();
             }
-        })
-    };
+        }));
+    }
     wait_until(
-        || occupier_ready.load(Ordering::Acquire),
+        || occupier_ready.load(Ordering::Acquire) == occupier_count,
         "the wakee's previous CPU did not become busy",
     );
 
@@ -278,6 +290,11 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
     wait_until(
         || wakee.state() == ThreadState::Blocked,
         "the Fair wakee did not park on its previous CPU",
+    );
+    assert_eq!(
+        wakee.assigned_cpu().map(|cpu| cpu.as_usize()),
+        Some(0),
+        "the Fair wakee must sleep on CPU0 before the placement test"
     );
     GO.store(true, Ordering::Release);
     let delivered = if synchronous {
@@ -306,7 +323,9 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
 
     wakee.join().expect("the Fair wakee must exit normally");
     stop_occupier.store(true, Ordering::Release);
-    occupier
-        .join()
-        .expect("the CPU0 occupier must exit normally");
+    for occupier in occupiers {
+        occupier
+            .join()
+            .expect("the CPU0 occupier must exit normally");
+    }
 }
