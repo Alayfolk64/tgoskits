@@ -48,7 +48,7 @@ case "$build_config" in
 esac
 [ -f "$build_config" ] || { echo "build config is missing: $build_config" >&2; exit 2; }
 
-for command in cargo cmp dumpimage fdtget mkimage rsync sha256sum ssh; do
+for command in cargo cmp dumpimage fdtget mkimage rsync sha256sum ssh stat truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "$command not found" >&2
         exit 1
@@ -80,6 +80,17 @@ if [ -n "${BOARD_SSH_HOST_KEY_ALIAS:-}" ]; then
 fi
 rsync_ssh="ssh ${ssh_args[*]}"
 ssh "${ssh_args[@]}" "$remote" true
+ssh "${ssh_args[@]}" "$remote" sudo -n cat /boot/boot.scr \
+    > "$stage_dir/linux-boot.scr"
+[ -s "$stage_dir/linux-boot.scr" ] || {
+    echo "/boot/boot.scr is empty" >&2
+    exit 1
+}
+if "$app_dir/boot_script_is_starry.sh" "$stage_dir/linux-boot.scr"; then
+    echo "/boot/boot.scr is not the verified Linux default" >&2
+    exit 1
+fi
+linux_boot_bytes=$(stat -c %s "$stage_dir/linux-boot.scr")
 
 cp "$kernel" "$stage_dir/starryos.bin"
 cp "$app_dir/orangepi5plus-selfbuild.its" "$stage_dir/image.its"
@@ -100,6 +111,14 @@ esac
         -n 'TGOSKits StarryOS one-time eMMC boot' \
         -d boot.cmd boot-starryos-emmc.scr
 )
+# U-Boot does not replay ext4's journal. Keep the Linux boot slot's geometry
+# so Starry can restore its bytes without truncating or reallocating extents.
+starry_boot_bytes=$(stat -c %s "$stage_dir/boot-starryos-emmc.scr")
+[ "$starry_boot_bytes" -le "$linux_boot_bytes" ] || {
+    echo "StarryOS boot script does not fit the Linux boot slot" >&2
+    exit 1
+}
+truncate -s "$linux_boot_bytes" "$stage_dir/boot-starryos-emmc.scr"
 dumpimage -T flat_dt -p 0 -o "$stage_dir/fit-kernel.bin" "$stage_dir/image.fit"
 dumpimage -T flat_dt -p 1 -o "$stage_dir/fit-board.dtb" "$stage_dir/image.fit"
 cmp -s "$stage_dir/starryos.bin" "$stage_dir/fit-kernel.bin" || {
@@ -136,16 +155,6 @@ fdt_sha=$(sha256sum "$stage_dir/board.dtb")
 fdt_sha=${fdt_sha%% *}
 
 ssh "${ssh_args[@]}" "$remote" sudo -n install -d -m 0755 "$remote_app/incoming"
-ssh "${ssh_args[@]}" "$remote" sudo -n cat /boot/boot.scr \
-    > "$stage_dir/linux-boot.scr"
-[ -s "$stage_dir/linux-boot.scr" ] || {
-    echo "/boot/boot.scr is empty" >&2
-    exit 1
-}
-if "$app_dir/boot_script_is_starry.sh" "$stage_dir/linux-boot.scr"; then
-    echo "/boot/boot.scr is not the verified Linux default" >&2
-    exit 1
-fi
 rsync -a -e "$rsync_ssh" \
     "$stage_dir/image.fit" \
     "$stage_dir/boot-starryos-emmc.scr" \

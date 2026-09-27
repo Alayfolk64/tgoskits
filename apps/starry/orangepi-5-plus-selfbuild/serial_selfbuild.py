@@ -15,6 +15,7 @@ import serial
 
 MARKER = "STARRY-ORANGEPI5PLUS-SELFBUILD"
 SHELL_PROMPT = b"root@starry:/root #"
+SHELL_PROMPT_PATTERN = re.compile(rb"root@starry:(?:/root #|~# )")
 GUEST_COMMAND = b"sh /opt/starry-orangepi5plus-selfbuild/init.sh\r"
 
 
@@ -89,9 +90,10 @@ def main() -> int:
                     return 1
 
                 prompt_input = prompt_carry + data
-                new_prompts = prompt_input.count(SHELL_PROMPT)
-                prompt_carry = prompt_input[-(len(SHELL_PROMPT) - 1) :]
-                for _ in range(new_prompts):
+                prompts = list(SHELL_PROMPT_PATTERN.finditer(prompt_input))
+                unconsumed = prompt_input[prompts[-1].end() :] if prompts else prompt_input
+                prompt_carry = unconsumed[-(len(SHELL_PROMPT) - 1) :]
+                for _ in prompts:
                     if args.kernel_only and prompt_generation:
                         print(
                             f"serial_selfbuild_incomplete={args.run_id}",

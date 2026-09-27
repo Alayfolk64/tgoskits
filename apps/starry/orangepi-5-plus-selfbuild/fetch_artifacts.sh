@@ -91,11 +91,13 @@ fi
 [ -s "$artifact_dir/starryos.elf" ] || { echo "self-built ELF is missing" >&2; exit 1; }
 [ -s "$artifact_dir/starryos.bin" ] || { echo "self-built binary is missing" >&2; exit 1; }
 if command -v file >/dev/null 2>&1; then
-    file "$artifact_dir/starryos.elf" | grep -q 'ELF 64-bit.*ARM aarch64' \
+    elf_description="$(file "$artifact_dir/starryos.elf")"
+    grep -q 'ELF 64-bit.*ARM aarch64' <<< "$elf_description" \
         || { echo "self-built ELF is not AArch64" >&2; exit 1; }
 fi
 if command -v readelf >/dev/null 2>&1; then
-    readelf -h "$artifact_dir/starryos.elf" | grep -q 'Machine:.*AArch64' \
+    elf_header="$(readelf -h "$artifact_dir/starryos.elf")"
+    grep -q 'Machine:.*AArch64' <<< "$elf_header" \
         || { echo "self-built ELF header is not AArch64" >&2; exit 1; }
 fi
 

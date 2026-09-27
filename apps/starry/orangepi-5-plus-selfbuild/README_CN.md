@@ -28,6 +28,13 @@ Starry 脚本且存在经过内容检查的 `boot.scr.tgoskits-backup`，准备�
 `/image.fit`、`/boot/boot-starryos-emmc.scr` 和 `/boot/starryEnv.txt`；该阶段不修改
 `/boot/boot.scr`。完整入口在串口监控就绪后才临时替换 `/boot/boot.scr` 并重启，
 StarryOS shell 出现后执行的第一步是恢复并校验 Linux 备份，然后才开始编译。
+`stage_starry_boot.sh` 将 Starry 脚本补零到 Linux 脚本的文件长度；镜像头中的
+有效负载长度和校验保持不变。`restore_linux_boot.sh` 核对已知脚本与相同长度，
+再用 `dd conv=notrunc` 覆盖原文件、逐字节比较并同步，保留已有 inode 尺寸和
+extent 映射。U-Boot 不重放 ext4 日志，因此恢复不能依赖截断、扩展或目录改名
+产生的日志内元数据。验收须包含无编译写入的短运行，并实际重启回 Linux；
+Starry 中两个 SHA-256 相同只证明当前可见内容一致。
+
 一次性环境使用 Linux 根分区的 GPT `PARTUUID` 作为 StarryOS 的 `root=`；不能
 复用 Linux 的 `/dev/mmcblkN` 编号，因为本板上 Linux、StarryOS 与 U-Boot 的
 MMC 枚举顺序不同。OrangePi 5 Plus 的 eMMC 在当前 U-Boot 中实测为 `mmc 1`。
@@ -159,6 +166,38 @@ apps/starry/orangepi-5-plus-selfbuild/fetch_artifacts.sh \
 
 取回目录为 `target/starry-orangepi5plus-selfbuild/artifacts/<run-id>/`，包含
 `starryos.elf`、`starryos.bin`、`SHA256SUMS`、源码元数据、耗时和完整日志。
+
+## 内核冷编译与限时采样
+
+只计量 `starryos` 编译时，`init-kernel-selfbuild.sh` 先恢复 Linux 启动入口，
+再进入已有 glibc chroot；`guest-kernel-selfbuild.sh` 调用已经准备好的
+`/usr/local/bin/tg-xtask`。入口要求源码目录没有 `target`，并在计时前验证
+匹配工具链的 `llvm-objcopy`。源码快照、Rust 工具链和任务工具散列都记录在
+日志中；成功必须同时产出 ELF 和 BIN，不能以 Cargo 的 `Finished` 代替闭环。
+已有编译产物应先在 Linux 中改名保留，每轮使用不同的 `run-id`。
+
+在 StarryOS 的外层 shell 执行一次入口，参数用于区分本轮日志和产物：
+
+```sh
+sh /opt/starry-orangepi5plus-selfbuild/init-kernel-selfbuild.sh kernel-cold-01
+```
+
+诊断内核使用 `profile-aarch64-unknown-none-softfloat.toml`，启用
+`guest-profile`、Info 日志和 `BACKTRACE=1` 帧指针。主机保留匹配的 ELF
+符号表，用于还原 `/proc/starry_profile` 中的内核地址；诊断 BIN 不嵌入
+DWARF。在板载 Linux 准备本轮时，在 chroot 的
+`etc/starry-selfbuild/run.conf` 中设置 `kernel_profile=on`，保留已有
+`build_epoch` 等字段；字段缺省或设为 `off` 时不采样。
+
+`guest-kernel-selfbuild.sh` 在构建前重置并启动采样，后台记录进程在约 300 秒后
+停止采样并保存 `kernel-profile.raw`，完整编译继续；提前结束时随构建停止采样。
+记录进程继续每分钟输出编译进程的 `/proc/<pid>/stat` 状态、CPU 时间 tick、
+线程数和 RSS 页数；进程退出造成的读取竞争被明确处理，其他错误使采样失败。
+`profile-build.rc` 记录编译退出状态并通知记录进程结束。构建结束后检查记录进程
+状态，并把快照加入 `SHA256SUMS`。快照包含 CPU 栈、锁、文件系统与调度等待
+事件，以及丢弃计数；等待时间存在包含关系，不能直接相加作为墙钟耗时。
+采样开销和 Info 日志会影响运行，诊断轮用于定位热点，速度验收使用普通
+构建配置与 `kernel_profile=off`。
 
 ## 验证 watchdog 复位
 

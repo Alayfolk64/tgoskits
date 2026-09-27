@@ -96,6 +96,13 @@ shell command restores and syncs the Linux backup before mounts or compiler
 work begin. The expected recovery condition is an SSH-reachable Linux system
 plus a completed filesystem check/sync path.
 
+`stage_starry_boot.sh` 把 Starry Legacy Image 补零到 Linux 脚本的文件长度，
+`restore_linux_boot.sh` 校验相同长度后用 `dd conv=notrunc` 原位覆盖并同步。
+这样恢复只改变已有磁盘块的内容，不依赖 U-Boot 重放 ext4 日志中的 inode
+尺寸或 extent 变更。[U-Boot v2017.09 的 `image_check_dcrc()`](https://github.com/u-boot/u-boot/blob/v2017.09/common/image.c)
+按镜像头的有效负载长度校验；尾部补零不改变脚本负载。短运行后立即重启回
+Linux 的实板证据验证恢复，不以 Starry 缓存内的散列相等代替。
+
 Linux, StarryOS, and U-Boot enumerate the eMMC and SD card independently. The
 one-time environment therefore selects the Linux root GPT partition by
 `PARTUUID` instead of copying `/dev/mmcblkN`, and the OrangePi-specific U-Boot
@@ -119,6 +126,18 @@ session.
 The same chroot is used for the Linux baseline and mounted as the StarryOS
 rootfs. The guest build runs offline and validates the output with `file`, ELF
 headers, and SHA-256 before printing PASS.
+
+`init-kernel-selfbuild.sh` 从 `run.conf` 读取可选的 `kernel_profile`，只接受
+`off` 或 `on`，缺省为关闭。诊断配置
+`profile-aarch64-unknown-none-softfloat.toml` 复用已有 `guest-profile`，
+通过 `BACKTRACE=1` 保留帧指针；主机 ELF 负责地址符号化，不在启动 BIN 中
+嵌入 DWARF。`guest-kernel-selfbuild.sh` 独占本轮采样控制：构建前 reset/start，
+约 300 秒后 stop 并保存 `/proc/starry_profile` 快照，完整编译不被截断；构建
+提前结束时提前保存。后台进程每分钟输出编译进程的 proc stat 字段，收到
+`profile-build.rc` 后退出；收尾等待记录进程并校验快照散列。后台进程由外层
+`timeout` 的进程组覆盖，错误使本轮
+失败，已写入的日志和编译产物保留。该轮不是速度验收数据，关闭采样后重新
+冷编译才能确认优化效果。
 
 ## Validation and evidence
 

@@ -24,8 +24,8 @@ CONNECT_SERIAL = Path(__file__).resolve().parents[1] / "connect_serial.sh"
 class SelfbuildDriverTests(unittest.TestCase):
     def test_kernel_build_command_is_sent_once_and_terminal_status_is_preserved(self):
         class SerialInput:
-            def __init__(self, ending):
-                self.chunks = [serial_selfbuild.SHELL_PROMPT, ending]
+            def __init__(self, prompt, ending):
+                self.chunks = [prompt[:10], prompt[10:], ending]
                 self.commands = []
 
             def __enter__(self):
@@ -50,16 +50,21 @@ class SelfbuildDriverTests(unittest.TestCase):
         root = CONNECT_SERIAL.parents[3]
         temporary_root = root / "tmp"
         temporary_root.mkdir(exist_ok=True)
-        for ending, expected_status in [
-            (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=cold elapsed=900===\r\n", 0),
-            (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-FAIL rc=1===\r\n", 1),
-            (b"", 1),
-        ]:
+        cases = [
+            (prompt, ending, expected_status)
+            for prompt in [b"root@starry:/root #", b"root@starry:~# "]
+            for ending, expected_status in [
+                (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=cold elapsed=900===\r\n", 0),
+                (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-FAIL rc=1===\r\n", 1),
+                (b"", 1),
+            ]
+        ]
+        for prompt, ending, expected_status in cases:
             with (
-                self.subTest(ending=ending),
+                self.subTest(prompt=prompt, ending=ending),
                 tempfile.TemporaryDirectory(dir=temporary_root) as temporary,
             ):
-                uart = SerialInput(ending + serial_selfbuild.SHELL_PROMPT)
+                uart = SerialInput(prompt, ending + prompt)
                 directory = Path(temporary)
                 arguments = [
                     "serial_selfbuild.py", "--serial", "fake-uart", "--log",

@@ -44,9 +44,8 @@ fi
 "$app_root/ensure_linux_fsck.sh" /boot/armbianEnv.txt \
     || fail "cannot arm the forced Linux filesystem check"
 
-printf '%s  %s\n' "$expected_fit_sha" /image.fit | sha256sum -c - >/dev/null
-printf '%s  %s\n' "$expected_boot_sha" /boot/boot-starryos-emmc.scr \
-    | sha256sum -c - >/dev/null
+sha256sum -c - <<< "$expected_fit_sha  /image.fit"
+sha256sum -c - <<< "$expected_boot_sha  /boot/boot-starryos-emmc.scr"
 grep -qx 'starry_fit=/image.fit' /boot/starryEnv.txt \
     || fail "starryEnv.txt has an unexpected FIT path"
 grep -qx "starry_root=PARTUUID=$expected_root_partuuid" /boot/starryEnv.txt \
@@ -56,8 +55,11 @@ root_device=$(findmnt -n -o SOURCE /)
 root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
 [ "$root_partuuid" = "$expected_root_partuuid" ] \
     || fail "Linux root PARTUUID changed: $root_partuuid"
-findmnt -n -o OPTIONS / | tr ',' '\n' | grep -qx rw \
-    || fail "Linux root filesystem is not writable"
+root_options=$(findmnt -n -o OPTIONS /)
+case ",$root_options," in
+    *,rw,*) ;;
+    *) fail "Linux root filesystem is not writable" ;;
+esac
 
 install -m 0644 /boot/boot-starryos-emmc.scr /boot/boot.scr.new
 cmp -s /boot/boot.scr.new /boot/boot-starryos-emmc.scr \

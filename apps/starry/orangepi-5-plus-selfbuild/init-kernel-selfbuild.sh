@@ -12,6 +12,12 @@ sha256sum /boot/boot.scr /boot/boot.scr.tgoskits-backup
 [ -x "$rootfs/usr/local/bin/tg-xtask" ]
 [ -x "$rootfs/usr/bin/timeout" ]
 build_epoch=$(sed -n 's/^build_epoch=//p' "$rootfs/etc/starry-selfbuild/run.conf")
+kernel_profile=$(sed -n 's/^kernel_profile=//p' "$rootfs/etc/starry-selfbuild/run.conf")
+kernel_profile=${kernel_profile:-off}
+case "$kernel_profile" in
+    off|on) ;;
+    *) exit 2 ;;
+esac
 case "$build_epoch" in
     ''|*[!0-9]*) exit 2 ;;
 esac
@@ -26,4 +32,5 @@ for directory in proc dev sys; do
     fi
 done
 chroot "$rootfs" /usr/bin/timeout --signal=TERM --kill-after=60 21600 \
+    /usr/bin/env STARRY_KERNEL_PROFILE="$kernel_profile" \
     /bin/bash /guest-kernel-selfbuild.sh "$run_id"

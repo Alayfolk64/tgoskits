@@ -3,7 +3,7 @@ set -euo pipefail
 
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$app_dir/../../.." && pwd)"
-stage_meta="$repo_root/target/starry-orangepi5plus-selfbuild/staged-boot.meta"
+stage_meta="$repo_root/tmp/starry-orangepi5plus-selfbuild/staged-boot.meta"
 remote_app=/opt/starry-orangepi5plus-selfbuild
 linux_user="${BOARD_LINUX_USER:-orangepi}"
 ssh_port="${BOARD_SSH_PORT:-22}"

@@ -112,14 +112,26 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 
 - **Long OrangePi board workloads without a power relay**: use the direct
   1,500,000-baud UART for runtime evidence, and use board Linux plus SSH/rsync to
-  stage large persistent assets. Do not race a zero-second U-Boot window or send
-  hand-written U-Boot boot sequences while the normal Linux path is available.
+  stage large persistent assets.
+  `stage_starry_boot.sh` 与 `boot_starry_once.sh` 共用
+  `tmp/starry-orangepi5plus-selfbuild/staged-boot.meta`；启动前核对板卡地址、
+  FIT 与脚本散列以及根分区 PARTUUID。`serial_selfbuild.py` 同时识别
+  `/root #` 和 `~#`，已匹配字节不再进入残留提示符缓冲区。
+  Do not race a zero-second U-Boot window or send hand-written U-Boot boot
+  sequences while the normal Linux path is available.
   Verify the Linux `boot.scr` backup, deploy the FIT through a temporary file and
   same-filesystem atomic rename, start the UART monitor, and only then install
   the already verified StarryOS script as `/boot/boot.scr` and reboot. As soon as
   the Starry shell is available, restore the verified Linux script and sync it
-  before starting the workload. Select the Starry root partition by GPT
-  `PARTUUID`, because Linux, StarryOS, and U-Boot MMC indices are not
+  before starting the workload.
+  `stage_starry_boot.sh` 把 Starry 脚本补零到 Linux 脚本长度；Legacy Image
+  的有效负载长度和校验仍由镜像头决定。`restore_linux_boot.sh` 校验已知脚本与
+  相同长度，以 `dd conv=notrunc` 原位覆盖，保留 U-Boot 已看到的 inode 尺寸和
+  extent 映射；逐字节核对后先同步脚本文件再同步全盘。U-Boot 不重放 ext4 日志，
+  因此不能用 Starry 缓存内散列相等证明截断、扩展或目录重命名已对它可见。
+  无编译写入的短运行后实际返回 Linux，才证明恢复闭环。
+  Select the Starry root partition by GPT `PARTUUID`, because Linux, StarryOS,
+  and U-Boot MMC indices are not
   interchangeable. Build the seed kernel through `tg-xtask` with the app-local
   board build configuration; use direct UART only for serial interaction. Use the RK3588
   `snps,dw-wdt` as the kernel deadlock recovery
@@ -138,6 +150,11 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
   prove that the board's storage page cache was cold.
   The kernel-only UART driver sends the build command once. A shell return
   without a terminal marker fails the run rather than retrying a warm target.
+  原生内核采样使用 `profile-aarch64-unknown-none-softfloat.toml`，仅启用
+  `guest-profile`、Info 日志和帧指针，主机保留匹配 ELF。`run.conf` 中
+  `kernel_profile=on` 使 `guest-kernel-selfbuild.sh` 采集前 300 秒的
+  `/proc/starry_profile`，之后只停止采样，完整编译继续；快照加入产物校验。
+  采样轮排除于速度验收，普通配置与 `kernel_profile=off` 的冷编译才用于比较。
 
 ## someboot 必备条件
 
