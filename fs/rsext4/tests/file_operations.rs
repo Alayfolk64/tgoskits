@@ -375,6 +375,40 @@ mod file_functional_tests {
             read_file(&mut jbd2_dev, &mut fs, "/renametest/newname").expect("read_file failed");
         assert_eq!(new_data, test_data.to_vec());
 
+        // Renaming into the same directory can convert its linear block into
+        // an HTree or split an existing leaf, moving the source record.
+        for index in 0..128 {
+            let stem = format!("/renametest/{index:04}-{}", "x".repeat(96));
+            let source = format!("{stem}.pending");
+            let destination = format!("{stem}.data");
+            let contents = format!("rename payload {index}").into_bytes();
+            mkfile(&mut jbd2_dev, &mut fs, &source, Some(&contents), None)
+                .expect("create source before directory growth");
+            rename(
+                &mut jbd2_dev,
+                &mut fs,
+                &source,
+                &destination,
+                RenameOptions::REPLACE,
+            )
+            .expect("rename must survive relocation of its source record");
+            assert_eq!(
+                read_file(&mut jbd2_dev, &mut fs, &source)
+                    .expect_err("source name must disappear after directory growth")
+                    .kind(),
+                Ext4ErrorKind::NotFound,
+            );
+            assert_eq!(
+                read_file(&mut jbd2_dev, &mut fs, &destination)
+                    .expect("read relocated rename destination"),
+                contents,
+            );
+        }
+        let (_, directory) = dir::get_inode_with_num(&mut fs, &mut jbd2_dev, "/renametest")
+            .unwrap()
+            .unwrap();
+        assert_ne!(directory.i_flags & disknode::Ext4Inode::EXT4_INDEX_FL, 0);
+
         umount(fs, &mut jbd2_dev).expect("umount failed");
     }
 
