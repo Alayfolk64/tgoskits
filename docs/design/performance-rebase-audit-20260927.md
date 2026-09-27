@@ -109,7 +109,7 @@
 
 [`FilePageIndex::cancel_publication`](../../os/StarryOS/kernel/src/mm/aspace/backend/file.rs) 在取消最后一个准备 pin 且尚无映射时移除了身份条目。然而取消清理仍可持有原 PageObject 的强引用；此时另一个缺页重试会为同一物理缓存页创建第二个 PageObject，现有 COW 索引拒绝这个仍存活的身份替换。提交 `8e918cc82` 在取消时保留不拥有物理资源的弱身份，直到最后一个强 owner 消失；重试复用同一 PageObject，过期身份仍由 `retain_page` 按访问清理。
 
-增强既有 `private_cache_reads_fork_cow_and_truncate_keep_exact_owners`，通过真实文件缓存、缺页准备、取消及重试确定性保留旧 owner，继续核对同一 PageObject、页字节及 fork/truncate 生命周期。错误实现因 `BadState` 失败，内核入口返回 1；修复后八核 AArch64 QEMU 输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。所选 starry-kernel 标准库测试通过，静态检查 92/92 项通过。日志为 `kernel-axtest-cache-cancel-{red,green}.log`、`std-cache-cancel-fixed.log` 和 `clippy-cache-cancel-fixed.log`。修复后的板上编译尚待验证。
+增强既有 `private_cache_reads_fork_cow_and_truncate_keep_exact_owners`，通过真实文件缓存、缺页准备、取消及重试确定性保留旧 owner，继续核对同一 PageObject、页字节及 fork/truncate 生命周期。错误实现因 `BadState` 失败，内核入口返回 1；修复后八核 AArch64 QEMU 输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。所选 starry-kernel 标准库测试通过，静态检查 92/92 项通过。日志为 `kernel-axtest-cache-cancel-{red,green}.log`、`std-cache-cancel-fixed.log` 和 `clippy-cache-cancel-fixed.log`。修复后的八核 AArch64 直接系统回归 `qemu/system/test-private-cache-backing` 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0，日志为 `system-private-cache-cancel-wake-fixed.log`。修复后的板上编译尚待验证。
 
 ### 1.11 普通唤醒的处理器亲和性
 
