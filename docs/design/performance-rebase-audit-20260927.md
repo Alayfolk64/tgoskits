@@ -8,7 +8,7 @@
 
 旧性能备份为 `snapshot/performance-before-rebase-20260927`，提交 `3e99d0cc28c0aef6d40cca21f1feee513618a290`；其实验基线为 `affddc3fecec02b31df94573063e4840433c9ebe`。当前工作树位于 `/home/wuxun/Projects/tgoskits-performance-dev-20260927`，分支为 `integration/performance-dev-20260927`，已包含本次变基基线 `4e2e62f471e93aba5d4021eb3398b9657d07a5d2`。
 
-2026-09-27 再次执行 `git ls-remote upstream refs/heads/dev` 并获取远端后，`upstream/dev` 为 `212ba669c2385b4a7b5394bedfdb6a40c9a65308`，比本次基线新增一个 `feat(axbuild): support external Starry QEMU runs (#2509)` 提交。当前工作树尚未再次变基到该提交。新增提交发生在已测运行的基线之外，不能用它解释已测耗时。
+2026-09-27 再次获取远端后，`upstream/dev` 为 `212ba669c2385b4a7b5394bedfdb6a40c9a65308`，比原基线新增一个 `feat(axbuild): support external Starry QEMU runs (#2509)` 提交。已将集成分支的十九个提交变基到该提交，迁移提交为 `ed1e26bfd`；`git merge-base --is-ancestor upstream/dev HEAD` 返回 0。唯一冲突是 procfs 的覆盖率导出与 profiling 入口，合并后保留各自条件编译与节点；没有 Cargo.lock 冲突或手工合并锁文件。变基前完整改动保存在 `snapshot/performance-port-before-latest-dev-20260927`，提交 `8d7ee75bc`。新增 dev 内容发生在已测运行基线之外，不能用它解释已测耗时。
 
 对旧实验的全部 616 个变化路径进行了 Git 对象比较：412 个与备份完全一致，50 个与旧实验基线一致，154 个采用不同的当前表示。这是路径与对象分类，包含移动和删除；不能换算成优化迁移百分比。
 
@@ -61,7 +61,7 @@
 
 ### 1.5 验证阶段边界
 
-本次新增测试和修改后的功能测试均尚未运行。当前只完成源码接入、调用链与失败路径核对及格式/差异检查；最新 dev 变基完成后才启动项目 `cargo xtask` 编译、静态检查和必要功能验证。完整冷自编、约十五分钟性能目标、PR 拆分和兼容性结论仍是后续交付项，不能用冻结检查点的成功结果替代。
+截至迁移提交 `ed1e26bfd`，本次新增测试和修改后的功能测试均尚未运行。源码接入、调用链及失败路径核对、格式/差异检查、最新 dev 变基已经完成；本阶段据此完成用户规定的迁移检查点，随后才能启动项目 `cargo xtask` 编译、静态检查和必要功能验证。完整冷自编、约十五分钟性能目标、PR 拆分和兼容性结论仍是后续交付项，不能用冻结检查点的成功结果替代。格式化使用固定 nightly 的 `cargo fmt`，对 `include!("root.rs")` 下的修改文件补充直接 rustfmt；`git diff --check` 及本次设计文档本地链接检查均返回 0。
 
 ## 2. 耗时证据与验收缺口
 
