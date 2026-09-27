@@ -31,7 +31,7 @@
 | P11 目录与元数据缓存 | 当前消费者保留 | [`DirNode` 缓存](../../fs/axfs-ng-vfs/src/node/dir/cache.rs) 保留正缓存及有界负缓存，权威变更推进 generation，查找结果发布前重验证。ext4 [`lookup_entry`](../../fs/ax-fs-ng/src/fs/ext4/rsext4/inode/directory/mod.rs) 使用已选父 inode 的生命周期对象；目录游标仅在用户复制成功后提交。 |
 | P12 批量解除映射 | 当前消费者已接入 | [`unmap_range_deferred`](../../memory/page-table-generic/src/unmap.rs) 复用现有 range walker，一次遍历并转移有界页表 owner，不自行刷新或释放。已发布 COW 解除映射进入该接口，再由 [`MappingMutationContext`](../../os/StarryOS/kernel/src/mm/aspace/backend/mod.rs) 和当前 tagged TLB 回执完成回收；回滚保留原有清理协议。 |
 
-上述状态是消费者级核对结果，不是按 Git 路径估算的迁移比例。P06 保留当前 `dev` 的 16 页/64 KiB 写回上限、后台水位及映射端点协调，不恢复旧 256 页/1 MiB 批次或“所有增长均不自动写回”的策略。P12 保留当前多核确认和隔离所有者，只补充 range walk；没有绕过或并行运行第二套 TLB 协议。
+上述状态是消费者级核对结果，不是按 Git 路径估算的迁移比例。首轮 P06 曾保留当前 `dev` 的 16 页/64 KiB 批次和固定写回水位，这没有完整保留旧优化的性能效果；1.9 节记录后续补齐。P12 保留当前多核确认和隔离所有者，只补充 range walk；没有绕过或并行运行第二套 TLB 协议。
 
 ### 1.3 物理所有权与失败路径
 
@@ -87,11 +87,25 @@
 
 增强既有 `independent_file_backends_share_page_object` 内核用例，使用真实 `CachedFile`、缓存页 pin、`MappingSlot` 发布和 detach，再在查找交接时确定性释放最后一个外部 owner。错误实现的同一用例在 `file.rs:1331:77` 因 `BadState` 失败，项目入口返回 1；修复后仍检查物理页身份和完整页字节内容，AArch64 内核测试输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。红绿日志分别为 `kernel-axtest-cache-lookup-red.log` 与 `kernel-axtest-cache-lookup-green.log`，保存在本轮验证目录。
 
-移除临时诊断输出后的生产修复再次通过 `cargo xtask clippy --package starry-kernel`，共 92/92 项；隔离 target 的 `tg-xtask test --since upstream/dev` 覆盖 68 个软件包并全部通过，包含 axbuild 的 421 项测试。曾尝试 `--since HEAD`，它不包含未提交差异、选择了零个软件包，该次返回 0 不计入通过证据。`tg-xtask starry test qemu --arch aarch64 -c qemu/system/test-private-cache-backing` 的直接系统调用回归在八核 QEMU 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0；完整日志为 `system-private-cache-aarch64-cache-lookup-fixed.log`。修复后的板上完整冷编译仍待取得终态。
+移除临时诊断输出后的生产修复再次通过 `cargo xtask clippy --package starry-kernel`，共 92/92 项；隔离 target 的 `tg-xtask test --since upstream/dev` 覆盖 68 个软件包并全部通过，包含 axbuild 的 421 项测试。曾尝试 `--since HEAD`，它不包含未提交差异、选择了零个软件包，该次返回 0 不计入通过证据。`tg-xtask starry test qemu --arch aarch64 -c qemu/system/test-private-cache-backing` 的直接系统调用回归在八核 QEMU 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0；完整日志为 `system-private-cache-aarch64-cache-lookup-fixed.log`。随后板上冷编译在首个 Cargo 编译单元出现前触发内核页错误，不能记作自编成功。
+
+### 1.8 重命名与目录扩容
+
+八线程创建、重命名并回读同一目录的文件，在 Linux 上完成，在 StarryOS 上曾返回 `EUCLEAN` 或 `ENOENT`。[`rename_replace`](../../fs/rsext4/src/file/rename.rs) 在插入目标目录项之前捕获源目录项的物理位置。同目录插入可能将线性目录转换为 HTree，或分裂、重排已有叶块；后续删除不能继续使用原 inode 映射及源记录位置。提交 `2260f074f` 在同目录且目标原先不存在时重新读取父 inode、按名称定位源项并确认 inode 身份，保持同一次命名空间排他操作和元数据事务。
+
+增强现有 `test_file_rename`，通过 128 个长文件名反复重命名、检查旧名称消失和完整内容不变，并确认目录进入 HTree。错误实现返回 `Corrupted`，操作为 `directory:delete_record`；修复后通过。现有系统用例 [`bugfix-bug-renameat2-noreplace-flags`](../../test-suit/starryos/qemu/system/bugfix-bug-renameat2-noreplace-flags/src/main.c) 同时覆盖 AArch64 的 `renameat`、`renameat2(flags=0)` 和 `RENAME_NOREPLACE`。八核 QEMU 修复前为 44 项通过、3 项失败，返回 1；修复后与同板 Linux 均为 47 项通过、0 项失败，返回 0。最终 rsext4 静态检查 3/3 项通过，所选 14 个标准库软件包全部通过。
+
+修复后的板级 ELF SHA-256 为 `7661e40e45f88d231ffb8a693cf478df4a1f458bdf8d924a1980b5f1bd730d65`，BIN 为 `5bc66c524bd91e101cf85e378023dca15d82401877583af670c91a8804911aa7`，FIT 为 `f2fbe88f5289e468626b002dcf2c0507985bfd0090ef99c6840a500286317a96`。同一八线程板上场景完成 1,024 个文件，全部名称及内容核对通过，耗时 3.520 秒，退出码 0；日志为 `rename-fixed-concurrent-probe.serial.log`。返回 Linux 后 fsck 完成五遍检查、重放日志并优化一棵 extent tree，返回 1，正常启动至 SSH；该轮没有 inode bitmap padding 修复。此结果只证明文件操作及该轮恢复，不能证明前述哈希表页错误已解决。
+
+### 1.9 补齐写入缓存策略
+
+用户明确要求完整迁移已有性能优化，不再设计新的优化方案。重新核对旧快照后确认 [`WritebackBatch`](../../fs/ax-fs-ng/src/file/cache/writeback/batch.rs) 的 256 页/1 MiB 上限没有保留；文件容量虽随长度增长，`balance_dirty_pages` 仍在每次写页后扫描脏页并按固定水位写回，破坏了旧分支的增长缓存策略。提交 `1600ddf0e` 恢复旧批次上限，增长写入在尚未超过实际 retention target 时跳过固定水位扫描和提前写回。已有覆盖写入水位、容量回收、映射端点、周期写回和显式同步协议继续生效。
+
+复用现有缓存容量测试，加入连续增长写入和 append 后的完整内容核对，确认显式同步前没有 backing 写入、同步后内容全部持久化。现有第二批写回失败测试改为跨越原定 256 页边界，并继续检查未写尾部、pin 释放和重试结果。错误实现的这两个测试均失败；修复后 `tg-xtask test --since 2260f074f` 所选 13 个软件包全部通过，日志为 `std-writeback-migration-green.log`。`tg-xtask clippy --package ax-fs-ng` 的 7/7 项组合通过。真实板上冷自编及最终 17 分钟目标尚未取得通过证据。
 
 ## 2. 耗时证据与验收缺口
 
-已测结果证明当前内核可以自编，但尚未达到截图约十五分钟的水平。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
+迁移补齐前的内核曾完成自编；完整迁移后的运行仍有失败，当前没有达到最终 17 分钟目标的通过证据。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
 
 ### 2.1 两种构建工作量
 
@@ -103,6 +117,7 @@
 | 当前源码冷编译 | `81e736bd…`；nightly-2026-09-04 | `fat` | 34m11s / 35m19s | 自编、产物校验、返回 Linux 均完成 |
 | 当前源码诊断运行 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 33m56s / 35m04s | `tg-xtask` 返回 0；随后 Bash 段错误，运行器返回 139，未生成 PASS |
 | 板载 Linux 同工作量冷编译 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 5m12s / 5m18s | `tg-xtask` 返回 0，ELF、BIN 与源码元数据校验通过，输出 PASS |
+| 完整接入后的缺页诊断运行 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 未完成 / 30m07s | 278 个编译单元启动，出现缓存页预留失败和 rustc SIGSEGV，最终构建返回 1 |
 
 当前源码的最终 `starryos` 单元墙钟跨度约 709.87 秒。该跨度包含等待，不能等同于纯 CPU 时间或全部 LTO 时间。源码、依赖、目标配置和工具链也发生变化，不能把两种源码之间约十六分钟的差额全部归因于 LTO 或某个尚未迁移的优化。截图的缓存状态没有独立证据，不能将其直接标作已确认的冷编译基线。
 
@@ -116,4 +131,10 @@ Linux 对照运行 `linux-frozen81-kernel-cold-20260927` 使用相同实体板�
 
 板子已正常返回 Linux，SSH 可用，boot ID 为 `8c6e65c2-66eb-497d-b045-88e84eac0d3c`。启动检查重放日志、优化 extent tree，并修复 inode bitmap 尾部 padding，fsck 返回 1；这些文件系统修改保留在原始记录中。Linux 正常启动不代替最终迁移后的持久性回归。
 
-后续在消费者迁移及最新 dev 变基完成后，先通过必要功能验证，再进行同条件完整性能复测。当前不能声明十五分钟目标达成或 PR 已准备好。
+后续在消费者迁移及最新 dev 变基完成后，先通过必要功能验证，再进行同条件完整性能复测。当前不能声明 17 分钟目标达成或 PR 已准备好。
+
+### 2.3 迁移后原生失败
+
+弱引用修复前的诊断运行出现 16 次缓存页预留失败和 14 份 rustc 回溯，最后 lwprintf 构建助手收到 SIGSEGV，随后报 `limits.h` 不存在。返回 Linux 后两个 Clang 头文件路径均存在，相同头文件的最小编译通过；不能把错误直接归因于 rootfs 缺少软件包。完整日志为 `performance-migrated-cache-fault-diag-20260928.serial.log`，失败 target 保留为 `target-after-cache-fault-diag-20260928`。
+
+弱引用修复后的运行在首个编译单元出现前发生 `Unhandled Page Fault @ 0xffffffff803544a0`，读取地址为 `0xffff000200000018`。使用精确匹配的 ELF `558988c9325ceb8d986383c8edb6553154e682d54e3979370aca8c9b60477e65` 解析，故障 PC 位于 `foldhash::hash_bytes_long`，调用点属于目录缓存 `HashMap` 的重哈希路径。真实原因尚未确认，目录缓存的短时扫描及键长度诊断没有捕获非法键。硬件 watchdog 在 panic 后停止喂狗并约 44 秒复位，这是 panic 恢复，尚未达到 22,200 秒的 feeder lease。Linux 随后正常启动；该轮不能用于性能比较。
