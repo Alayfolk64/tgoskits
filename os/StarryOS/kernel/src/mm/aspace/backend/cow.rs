@@ -1475,7 +1475,7 @@ impl CowBackend {
                 // against kernel buffered writes without taking cache/MM locks.
                 let destination = unsafe {
                     slice::from_raw_parts_mut::<MaybeUninit<u8>>(
-                        phys_to_virt(new_frame).as_mut_ptr(),
+                        phys_to_virt(new_frame).as_mut_ptr().cast(),
                         leaf_size,
                     )
                 };
@@ -1654,7 +1654,7 @@ impl Drop for CowChildCloneTransaction<'_> {
             // speculative walk may have cached the entry. The parent
             // MappingSlot keeps the PageObject alive while this child PTE is
             // cleared and synchronously invalidated.
-            if !self.rollback.rollback_page(vaddr, page_size) {
+            if !self.rollback.rollback_page(vaddr, paddr, page_size) {
                 warn!("could not confirm COW child rollback for frame {paddr:?} at {vaddr:?}");
             }
         }
@@ -1666,19 +1666,24 @@ struct PageTableCowCloneRollback<'a> {
 }
 
 impl PageTableCowCloneRollback<'_> {
-    fn rollback_page(&mut self, vaddr: VirtAddr, expected_size: usize) -> bool {
-        let (_paddr, _, page_size) = match self.page_table.query(vaddr) {
-            Ok(mapping) => mapping,
+    fn rollback_page(
+        &mut self,
+        vaddr: VirtAddr,
+        expected_paddr: PhysAddr,
+        expected_size: usize,
+    ) -> bool {
+        let leaf = match self.page_table.query_occupied_leaf(vaddr) {
+            Ok(leaf) => leaf,
             Err(PagingError::NotMapped) => return true,
             Err(err) => {
                 warn!("failed to query cloned COW page {vaddr:?} during rollback: {err}");
                 return false;
             }
         };
-        if page_size != expected_size {
+        if leaf.vaddr != vaddr || leaf.paddr != expected_paddr || leaf.size != expected_size {
             warn!(
-                "COW rollback encountered page size {page_size} (expected {expected_size}) at \
-                 {vaddr:?}"
+                "COW rollback leaf identity differs from frame {expected_paddr:?}, size \
+                 {expected_size} at {vaddr:?}"
             );
             return false;
         }
@@ -2050,16 +2055,14 @@ impl MappingExecution for CowBackend {
         new_pt: &mut PageTable,
     ) -> StarryResult<(MappingOperation, PteMaterialization)> {
         let cow_flags = flags - MappingFlags::WRITE;
-        let leaves = collect_occupied_leaves(range, old_pt, |vaddr, size, paddr, present| {
-            (vaddr, size, paddr, present)
-        })?;
+        let leaves =
+            collect_occupied_leaves(range, old_pt, |vaddr, size, paddr, _| (vaddr, size, paddr))?;
         let capacity = leaves.len();
         let mut transaction = CowChildCloneTransaction::new(new_pt, capacity)?;
         let mut materialization = PteMaterialization::with_capacity(capacity)?;
-        for (vaddr, page_size, paddr, present) in leaves {
-            if !present {
-                return Err(PagingError::not_mapped().into());
-            }
+        for (vaddr, page_size, paddr) in leaves {
+            // PROT_NONE disables translation while retaining the physical
+            // owner. Fork must preserve that owner and its inaccessible PTE.
             let page = self
                 .page_object_for_frame(paddr)
                 .ok_or(StarryError::BadState)?;
@@ -3898,7 +3901,7 @@ mod tests {
         use alloc::sync::Arc;
 
         use ax_fs_ng::{file::CachedFile, vfs::FileBackend};
-        use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+        use ax_memory_addr::{PAGE_SIZE_4K, VirtAddr};
         use ax_runtime::hal::paging::{MappingFlags, PagingError};
         use axfs_ng_vfs::{Location, Mountpoint, NodePermission};
 

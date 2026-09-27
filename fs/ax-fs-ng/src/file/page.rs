@@ -177,7 +177,12 @@ impl CachedPageBacking {
         let source = self.frame.address() as *const u64;
         let mut snapshot = [0u8; 64];
         for start in (0..PAGE_SIZE).step_by(snapshot.len()) {
-            for (index, word) in snapshot.chunks_exact_mut(size_of::<u64>()).enumerate() {
+            for (index, word) in snapshot
+                .as_chunks_mut::<{ size_of::<u64>() }>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
                 // SAFETY: the retained allocation contains one initialized,
                 // page-aligned page. These aligned word reads remain within
                 // it. The byte lock excludes kernel mutations; MAP_SHARED

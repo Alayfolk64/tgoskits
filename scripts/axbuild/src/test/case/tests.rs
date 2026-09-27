@@ -49,7 +49,7 @@ impl Drop for TempEnvVar {
     }
 }
 
-pub(super) fn fake_config() -> CaseAssetConfig {
+pub(in crate::test) fn fake_config() -> CaseAssetConfig {
     CaseAssetConfig {
         grouped_execution: GroupedCaseExecution::GuestInit(Box::new(GroupedCaseRunnerConfig {
             runner_name: "suite-run-case-tests".to_string(),

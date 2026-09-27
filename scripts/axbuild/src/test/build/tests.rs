@@ -1,8 +1,24 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, ffi::OsStr, fs, path::Path};
 
 use tempfile::tempdir;
 
 use super::{grouped_c::*, toolchain::*, *};
+use crate::test::case::tests::fake_config;
+
+fn command_env(command: &Command, key: &str) -> Option<String> {
+    command.get_envs().find_map(|(name, value)| {
+        (name == OsStr::new(key))
+            .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+            .flatten()
+    })
+}
+
+fn command_args(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
 
 fn fake_case(root: &Path, name: &str) -> TestQemuCase {
     let case_dir = root.join("test-suite/example/default").join(name);

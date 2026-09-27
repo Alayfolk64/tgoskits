@@ -4,9 +4,22 @@ use super::common::*;
 use crate::context::{WorkspaceContext, workspace::workspace_root_path_from};
 
 const CARGO_TARGET_DIR_CHILD: &str = "AXBUILD_TEST_CARGO_TARGET_DIR_CHILD";
+const CARGO_CONFIG_TARGET_DIR_CHILD: &str = "AXBUILD_TEST_CARGO_CONFIG_TARGET_DIR_CHILD";
 
 #[test]
 fn workspace_context_respects_cargo_config_target_directory() {
+    if std::env::var_os(CARGO_CONFIG_TARGET_DIR_CHILD).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("context::tests::workspace::workspace_context_respects_cargo_config_target_directory")
+            .env(CARGO_CONFIG_TARGET_DIR_CHILD, "1")
+            .env_remove("CARGO_TARGET_DIR")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
     let root = tempdir().unwrap();
     let _ = test_app_context(root.path());
     fs::create_dir_all(root.path().join(".cargo")).unwrap();

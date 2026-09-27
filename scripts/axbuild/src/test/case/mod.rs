@@ -27,4 +27,4 @@ pub(crate) use shell::{case_sh_source_dir, prepare_sh_case_assets_sync};
 pub(crate) use types::*;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -938,7 +938,7 @@ impl CachedFile {
             // tail beyond the read length so a partial last page never exposes stale
             // physical memory past EOF — POSIX/Linux require those bytes to read as 0
             // (e.g. an mmap of a 100-byte file must see `[100, PAGE_SIZE)` as zero).
-            let read = file.read_at(&mut *page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            let read = file.read_at(&mut page.data(), pn as u64 * PAGE_SIZE as u64)?;
             page.data()[read..].fill(0);
         }
         Ok(page)

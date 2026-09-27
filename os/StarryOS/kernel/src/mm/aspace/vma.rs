@@ -1873,26 +1873,27 @@ mod tests {
     #[cfg_attr(axtest, axtest::axtest)]
     #[cfg_attr(not(axtest), test)]
     fn free_area_search_preserves_first_fit_across_path_copy_mutations() {
-        let original = map_of(12);
+        let original = insert(&map_of(12), 0x1b000, 0x4000).unwrap();
+        let original = insert(&original, 0x21000, 0x4000).unwrap();
         let removed = original.remove(VirtAddr::from_usize(0x7000)).unwrap().0;
         let carved = removed
             .without_range(VirtAddrRange::new(
-                VirtAddr::from_usize(0x14800),
-                VirtAddr::from_usize(0x17800),
+                VirtAddr::from_usize(0x1c000),
+                VirtAddr::from_usize(0x1d000),
             ))
             .unwrap();
         let split = carved
             .with_permissions(
-                VirtAddrRange::new(VirtAddr::from_usize(0x9800), VirtAddr::from_usize(0xa000)),
-                MappingFlags::READ | MappingFlags::WRITE,
-                MappingFlags::READ,
+                VirtAddrRange::new(VirtAddr::from_usize(0x22000), VirtAddr::from_usize(0x23000)),
+                MappingFlags::empty(),
+                MappingFlags::empty(),
             )
             .unwrap();
-        let limit = VirtAddrRange::new(VirtAddr::from_usize(0x800), VirtAddr::from_usize(0x1b800));
+        let limit = VirtAddrRange::new(VirtAddr::from_usize(0x800), VirtAddr::from_usize(0x27800));
         for map in [&original, &removed, &carved, &split] {
             for align in [0x800, 0x1000, 0x4000] {
                 for size in [align, align * 2, align * 4] {
-                    for hint in (0..0x1d000).step_by(0x800) {
+                    for hint in (0..0x29000).step_by(0x800) {
                         // Exhaust the aligned addresses, independently of the
                         // tree summaries and traversal order under test.
                         let expected = (0..limit.end.as_usize())

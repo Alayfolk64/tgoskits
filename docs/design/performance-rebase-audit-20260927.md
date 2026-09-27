@@ -14,7 +14,7 @@
 
 ### 1.2 按生产消费者核对
 
-下面按原定十二组记录当前生产消费者及保留的新版机制。新增迁移代码尚未执行编译、静态检查或运行测试；本阶段按用户要求先完成接入和变基，再开始验证。旧实验的接口没有机械恢复为第二套所有者。
+下面按原定十二组记录当前生产消费者及保留的新版机制。迁移提交形成时尚未执行编译、静态检查或运行测试；按用户要求先完成接入和变基，再开始验证。后续回归记录在 1.6 节。旧实验的接口没有机械恢复为第二套所有者。
 
 | 组 | 当前状态 | 源码依据与缺口 |
 | --- | --- | --- |
@@ -63,6 +63,22 @@
 
 截至迁移提交 `ed1e26bfd`，本次新增测试和修改后的功能测试均尚未运行。源码接入、调用链及失败路径核对、格式/差异检查、最新 dev 变基已经完成；本阶段据此完成用户规定的迁移检查点，随后才能启动项目 `cargo xtask` 编译、静态检查和必要功能验证。完整冷自编、约十五分钟性能目标、PR 拆分和兼容性结论仍是后续交付项，不能用冻结检查点的成功结果替代。格式化使用固定 nightly 的 `cargo fmt`，对 `include!("root.rs")` 下的修改文件补充直接 rustfmt；`git diff --check` 及本次设计文档本地链接检查均返回 0。
 
+### 1.6 迁移后的本地回归
+
+2026-09-27 的回归使用相同集成工作树与 nightly-2026-09-04。`cargo xtask clippy --package page-table-generic --package ax-fs-ng --package starry-kernel` 的 101 项功能及目标组合全部通过，`cargo xtask clippy --package axbuild` 的一项检查通过。`cargo xtask test --since upstream/dev` 重跑后所选 68 个软件包全部通过，包含 axbuild 的 421 个测试。AArch64 内核测试通过 `cargo xtask ktest qemu --package starry-kernel --test axtest_kernel --arch aarch64 --target-dir target/performance-axtest-aarch64` 实际运行 224 项，输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`。板级脚本 smoke 通过；直接系统调用回归和板上冷自编尚在后续验证阶段。
+
+首轮失败保留在 `tmp/performance-migration-validation-20260927/` 的原始日志。静态检查修复了显式自动解引用、定长分块、未使用导入和 `MaybeUninit` 目的指针类型。`VmaMap` 测试最初使用半页碎片，被 `CowBackend::for_extent` 的基本页对齐要求拒绝；现改为两个多页 VMA 的页对齐挖空和权限拆分，仍对四个持久快照逐地址比较 first-fit。缺页发布测试改用写缺页以验证独占页 RSS，匿名读零页不再产生匿名 RSS。axbuild 的两个迁移用例漏带 `command_args`、`command_env` 和测试配置访问，现已补齐测试辅助代码；这一遗漏不能归因于最新 dev。
+
+固件下载进程曾挂起；核对上游固定提交及全部十个 SHA-256 后，补齐被忽略的固件目录，终止本轮下载进程并重跑项目入口，未修改驱动实现。共享产物目录的一次内核构建被宿主测试的 future-incompatibility 记录污染，现将内核回归隔离到独立 target，保留构建门禁。epoll 的现有测试以 1024 次 yield 作为工作线程完成窗口，曾在本轮提前失败；改为等待工作线程实际发布的原子状态和通知，五秒上限仅负责失败退出。其生产队列未改动，修改后的内核回归全部通过。
+
+直接系统调用用例 `qemu/system/test-private-cache-backing` 暴露了两个实际衔接问题。`CowBackend::clone_map` 拒绝仍有物理所有者的 `PROT_NONE` 叶项，fork 返回 `EINVAL`；克隆、slot 发布校验及未发布克隆回滚现使用 occupied-leaf 身份，访问许可仍由 VMA 与 PTE flags 决定。该修复让用例继续执行到截断，但退出子进程的缓存页 rmap 尚在退休队列中，截断返回 `EBUSY`。诊断分别捕获 `Retired/users=0/pins=0/activations=0` 与 `Retiring/users=0/pins=0/activations=1`，证明不能只等待已经进入 `Retired` 的 MM。
+
+[`pin_mm_for_cache_invalidation`](../../os/StarryOS/kernel/src/mm/aspace/lifecycle.rs) 为失效端点等待退休结果，保留普通 rmap 的非阻塞查找。最后一个内核 pin 已归零时，新 pin 不能在 `Retiring` 状态取得，等待者才可等待 CPU 切换和后台回收；仍有内核 pin 或进入 `NeedsRepair` 时返回冲突，避免等待缺页 continuation。`reclaim_done` 在发布 `Freed` 或 `NeedsRepair`、离开生命周期锁后通知；只有完成回收或确认已注销 MM 的精确 rmap key 消失，端点才跳过旧映射。第一次只处理 `Retired` 的修复仍失败，日志保留；补充 CPU 切换窗口后的同一完整用例已通过 AArch64 八核 QEMU，外层返回 0。同一正式 C 用例在板载 Linux `6.1.115-vendor-rk35xx` 上也输出 `PRIVATE_CACHE_BACKING_PASSED`。
+
+最终生产修复后的内核回归再次输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，增强原有退休测试以确认 `NeedsRepair` 与仍有 kernel pin 的退出 continuation 不被等待。`test-anonymous-zero-backing` 与 `test-getrandom-chroot` 均在板载 Linux 和精确选择的 Starry AArch64 QEMU 入口通过。隔离 target 的标准库重跑首次因 axbuild 配置测试继承 `CARGO_TARGET_DIR` 失败，实际目录优先级符合预期，测试夹具没有隔离环境；现按相邻已有测试使用独立子进程清除该变量，生产配置解析未改。最终 68 个软件包全部通过，axbuild 为 421 项通过。
+
+板级构建与 `cargo xtask clippy` 并行使用同一个 target 时，构建报告含宿主 `bitmaps@3.2.1`，被现有 AArch64 门禁拒绝；另一入口等待报告锁超时，两个非零结果和原报告均保存。顺序重跑板级项目入口后，报告仅包含已批准的 `core@0.0.0` 与 `memchr@2.8.3`，构建返回 0；没有放宽包名单或屏蔽门禁。最终顺序执行的内核静态检查 92/92 项通过，隔离 target 的 axbuild 静态检查 1/1 项通过，两个入口均返回 0。新板级 ELF 为 `0a7f19f29576f46c30aa69ae8918dee2889fa28af28ac0bec46034a6536caa2f`，BIN 为 `a1e88b9cedb8401e70875720cd77813d09f958fb2236ce06e338656624d1cf71`，打包 FIT 为 `7f05911ef465f4da745a6bdbdb9e4fa6290ed7e0a5f1f80098d9ddb8759a8dd6`。部署入口核对 FIT 内嵌 BIN、板载 Linux DTB、远端文件哈希及根 PARTUUID；当前 Linux 启动入口保持不变。
+
 ## 2. 耗时证据与验收缺口
 
 已测结果证明当前内核可以自编，但尚未达到截图约十五分钟的水平。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
@@ -71,13 +87,16 @@
 
 前两轮使用相同的当前正常运行内核；第三轮加入诊断采样。每轮均在构建前移走 `target`，保留旧目录以供追溯；准备好的 `tg-xtask` 不在计时区间内编译。
 
-| 运行 | 被编译源码与工具链 | release LTO | Cargo / 全流程 | 实际终态 |
+| 运行 | 被编译源码与工具链 | release LTO | Cargo / 构建计时 | 实际终态 |
 | --- | --- | --- | --- | --- |
 | 旧冻结源码对照 | `b609e4f8…`；nightly-2026-07-15 | `false` | 19m07s / 19m45s | 自编、产物校验、返回 Linux 均完成 |
 | 当前源码冷编译 | `81e736bd…`；nightly-2026-09-04 | `fat` | 34m11s / 35m19s | 自编、产物校验、返回 Linux 均完成 |
 | 当前源码诊断运行 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 33m56s / 35m04s | `tg-xtask` 返回 0；随后 Bash 段错误，运行器返回 139，未生成 PASS |
+| 板载 Linux 同工作量冷编译 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 5m12s / 5m18s | `tg-xtask` 返回 0，ELF、BIN 与源码元数据校验通过，输出 PASS |
 
-当前源码的最终 `starryos` 单元墙钟跨度约 709.87 秒。该跨度包含等待，不能等同于纯 CPU 时间或全部 LTO 时间。源码、依赖、目标配置和工具链也发生变化；没有同条件 Linux 对照或受控 A/B 时，不能把约十六分钟差额全部归因于 LTO 或某个尚未迁移的优化。截图的缓存状态没有独立证据，不能将其直接标作已确认的冷编译基线。
+当前源码的最终 `starryos` 单元墙钟跨度约 709.87 秒。该跨度包含等待，不能等同于纯 CPU 时间或全部 LTO 时间。源码、依赖、目标配置和工具链也发生变化，不能把两种源码之间约十六分钟的差额全部归因于 LTO 或某个尚未迁移的优化。截图的缓存状态没有独立证据，不能将其直接标作已确认的冷编译基线。
+
+Linux 对照运行 `linux-frozen81-kernel-cold-20260927` 使用相同实体板卡、持久 Debian chroot、准备好的 `tg-xtask`、冻结源码、工具链、离线依赖与构建配置。构建前将旧 target 改名保留，执行 `sync` 与 Linux 页缓存清理，计时排除任务工具编译；由正式 [`guest-kernel-selfbuild.sh`](../../apps/starry/orangepi-5-plus-selfbuild/guest-kernel-selfbuild.sh) 拒绝残留 target 并执行构建和产物校验。Linux governor 为 `ondemand`，频率仍动态变化，不能宣称两个 OS 的频率和页缓存策略完全相同。完整日志和产物回收到 `tmp/performance-migration-validation-20260927/linux-frozen81-kernel-cold/`，本机再次执行 SHA256SUMS 校验全部通过。这个对照表明相同编译工作量存在运行系统差距；迁移后内核的板上性能尚未验证。
 
 ### 2.2 原生采样和运行器失败
 

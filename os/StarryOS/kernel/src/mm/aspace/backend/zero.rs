@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 
-use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
+use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use ax_runtime::hal::mem::virt_to_phys;
 
 use super::super::objects::{FrameLease, PageId, PageObject};

@@ -21,7 +21,7 @@ use axfs_ng_vfs::Location;
 use super::{
     super::{
         EvictMappingOutcome,
-        lifecycle::{RmapMmLookupError, pin_mm_for_rmap},
+        lifecycle::{RmapMmLookupError, pin_mm_for_cache_invalidation},
         objects::{EvictionError, FrameLease, PageId, PageObject, PageState},
         vma::{
             FileSource, MappingId, MappingSource, PageOffset, PageSizePolicy, VmaDescriptor,
@@ -438,8 +438,19 @@ impl FilePageDomain {
             }
         };
         for key in mappings {
-            let pin = match pin_mm_for_rmap(key.space_id) {
-                Ok(pin) => pin,
+            let pin = match pin_mm_for_cache_invalidation(key.space_id) {
+                Ok(Some(pin)) => pin,
+                Ok(None) => continue,
+                Err(RmapMmLookupError::Gone)
+                    if page
+                        .rmap
+                        .try_snapshot()
+                        .is_ok_and(|keys| !keys.contains(&key)) =>
+                {
+                    // Reclaim may finish and unregister after the rmap snapshot.
+                    // The exact key must also be gone before skipping it.
+                    continue;
+                }
                 Err(RmapMmLookupError::Gone | RmapMmLookupError::Busy) => {
                     let _ = lease.cancel();
                     return CacheMappingResult::Busy;
@@ -506,8 +517,17 @@ impl FilePageDomain {
             }
         };
         for key in mappings {
-            let pin = match pin_mm_for_rmap(key.space_id) {
-                Ok(pin) => pin,
+            let pin = match pin_mm_for_cache_invalidation(key.space_id) {
+                Ok(Some(pin)) => pin,
+                Ok(None) => continue,
+                Err(RmapMmLookupError::Gone)
+                    if page
+                        .rmap
+                        .try_snapshot()
+                        .is_ok_and(|keys| !keys.contains(&key)) =>
+                {
+                    continue;
+                }
                 Err(_) => {
                     let _ = lease.cancel();
                     return CacheMappingResult::Busy;

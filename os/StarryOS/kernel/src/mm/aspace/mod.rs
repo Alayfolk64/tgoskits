@@ -2908,9 +2908,10 @@ impl AddrSpace {
         if leaf_start < frame_start || leaf_end > frame_end {
             return Err(StarryError::BadState);
         }
-        match self.pt.query(va) {
-            Ok((installed, _, installed_size))
-                if installed == paddr && installed_size == page_size => {}
+        // Publication validates ownership even when PROT_NONE disables
+        // translation. This does not grant access to the mapped bytes.
+        match self.pt.query_occupied_leaf(va) {
+            Ok(leaf) if leaf.vaddr == va && leaf.paddr == paddr && leaf.size == page_size => {}
             Ok(_) | Err(_) => return Err(StarryError::BadState),
         }
         if !matches!(page.state(), PageState::Present | PageState::LazyFree) {
