@@ -19,7 +19,7 @@
 | 组 | 当前状态 | 源码依据与缺口 |
 | --- | --- | --- |
 | P01 空闲区间索引 | Starry 消费者已接入 | [`VmaNode` / `FreeAreaSearch`](../../os/StarryOS/kernel/src/mm/aspace/vma.rs) 在持久 AVL 路径复制和旋转时维护 `first_start`、`last_end`、`max_gap`，`VmaMap::find_free_area` 剪枝并保留原 first-fit、对齐及溢出规则。`MemorySet` 继续使用现有 `GapIndex`。 |
-| P02 抢占退出与放置 | 使用新版等价及替代机制 | [`PreemptionState::finish`](../../components/cpu-local/src/preempt.rs) 保留无 pending 快速退出；[`exit_lock_preempt`](../../os/arceos/modules/axruntime/src/guard/mod.rs) 仅在最终 pending 退出关中断。新线程进入 [`stage_new_thread`](../../components/ax-task/src/sched/system/task_system/delivery/admission.rs)，由当前容量/需求放置策略选 CPU。旧无条件 previous-CPU 唤醒策略被新版亲和性及负载策略取代。 |
+| P02 抢占退出与放置 | 旧普通唤醒顺序已补齐 | [`PreemptionState::finish`](../../components/cpu-local/src/preempt.rs) 保留无 pending 快速退出；[`exit_lock_preempt`](../../os/arceos/modules/axruntime/src/guard/mod.rs) 仅在最终 pending 退出关中断。新线程进入 [`stage_new_thread`](../../components/ax-task/src/sched/system/task_system/delivery/admission.rs)，由当前容量/需求放置策略选 CPU。[`select_fair_wake_cpu`](../../components/ax-task/src/sched/system/task_system/dispatch/wake/placement.rs) 恢复普通唤醒的 previous CPU、waker CPU、可用 CPU 顺序，保留亲和性及 active 检查；同步唤醒、RT/Deadline 规则和独立的空闲核拉取继续使用当前协议。 |
 | P03 缺失页表发布 | 使用新版等价机制 | [`plan_map_page` / `PageTableMapPlan::prepare` / `try_map_page_with`](../../memory/page-table-generic/src/table.rs) 分别捕获无分配计划、锁外初始化未发布页表后缀、重走并验证 root/parent/空项后一次发布。失败返回 move-only deposit，在临界区外释放，不恢复旧安装调用。 |
 | P04 私有缺页锁外准备 | 当前消费者保留 | [`prepare_page_fault`](../../os/StarryOS/kernel/src/mm/aspace/mod.rs) 与 [`CowBackend::prepare_fault`](../../os/StarryOS/kernel/src/mm/aspace/backend/cow.rs) 继续使用准备、重验证、发布与取消协议。非缓存页保留有界文件读取、`MaybeUninit` 目的缓冲区和只清未读尾部；裸 exec 准备仍批量复制。 |
 | P05 共享匿名零页 | 当前消费者已接入 | [`ZeroPage`](../../os/StarryOS/kernel/src/mm/aspace/backend/zero.rs) 由内核镜像永久拥有只读 4 KiB RAM；源内 PageObject 由 COW 索引保留，匿名基本页读缺页不分配帧、不计 RSS。用户写与强制内核写均先 COW；THP 和共享匿名分支保持现有行为。零页不进入 `MADV_FREE` 的独占页回收。 |
@@ -31,7 +31,7 @@
 | P11 目录与元数据缓存 | 当前消费者保留 | [`DirNode` 缓存](../../fs/axfs-ng-vfs/src/node/dir/cache.rs) 保留正缓存及有界负缓存，权威变更推进 generation，查找结果发布前重验证。ext4 [`lookup_entry`](../../fs/ax-fs-ng/src/fs/ext4/rsext4/inode/directory/mod.rs) 使用已选父 inode 的生命周期对象；目录游标仅在用户复制成功后提交。 |
 | P12 批量解除映射 | 当前消费者已接入 | [`unmap_range_deferred`](../../memory/page-table-generic/src/unmap.rs) 复用现有 range walker，一次遍历并转移有界页表 owner，不自行刷新或释放。已发布 COW 解除映射进入该接口，再由 [`MappingMutationContext`](../../os/StarryOS/kernel/src/mm/aspace/backend/mod.rs) 和当前 tagged TLB 回执完成回收；回滚保留原有清理协议。 |
 
-上述状态是消费者级核对结果，不是按 Git 路径估算的迁移比例。首轮 P06 曾保留当前 `dev` 的 16 页/64 KiB 批次和固定写回水位，这没有完整保留旧优化的性能效果；1.9 节记录后续补齐。P12 保留当前多核确认和隔离所有者，只补充 range walk；没有绕过或并行运行第二套 TLB 协议。
+上述状态是消费者级核对结果，不是按 Git 路径估算的迁移比例。首轮 P02 将新版负载放置误称为旧 previous-CPU 策略的等价替代，实际不等价；1.11 节记录补齐及独立验证。首轮 P06 曾保留当前 `dev` 的 16 页/64 KiB 批次和固定写回水位，这没有完整保留旧优化的性能效果；1.9 节记录后续补齐。P12 保留当前多核确认和隔离所有者，只补充 range walk；没有绕过或并行运行第二套 TLB 协议。
 
 ### 1.3 物理所有权与失败路径
 
@@ -103,6 +103,20 @@
 
 复用现有缓存容量测试，加入连续增长写入和 append 后的完整内容核对，确认显式同步前没有 backing 写入、同步后内容全部持久化。现有第二批写回失败测试改为跨越原定 256 页边界，并继续检查未写尾部、pin 释放和重试结果。错误实现的这两个测试均失败；修复后 `tg-xtask test --since 2260f074f` 所选 13 个软件包全部通过，日志为 `std-writeback-migration-green.log`。`tg-xtask clippy --package ax-fs-ng` 的 7/7 项组合通过。真实板上冷自编及最终 17 分钟目标尚未取得通过证据。
 
+### 1.10 缺页取消后的缓存身份
+
+补齐写回策略后的完整冷编译在 232 秒内启动 118 个编译单元，随后 `core` 的读/执行缺页返回 `BadState`，rustc 收到 SIGSEGV，构建返回 1。该轮没有通过标记，不能作为成功耗时。诊断内核上四份相同的 `core` 编译全部失败，合计 161.025 秒；同板 Linux 上相同命令全部通过，合计 29.950 秒。诊断捕获的是 COW 索引的缓存页身份冲突，不是新的 `FilePageDomain::reserve_page` 失败。
+
+[`FilePageIndex::cancel_publication`](../../os/StarryOS/kernel/src/mm/aspace/backend/file.rs) 在取消最后一个准备 pin 且尚无映射时移除了身份条目。然而取消清理仍可持有原 PageObject 的强引用；此时另一个缺页重试会为同一物理缓存页创建第二个 PageObject，现有 COW 索引拒绝这个仍存活的身份替换。提交 `8e918cc82` 在取消时保留不拥有物理资源的弱身份，直到最后一个强 owner 消失；重试复用同一 PageObject，过期身份仍由 `retain_page` 按访问清理。
+
+增强既有 `private_cache_reads_fork_cow_and_truncate_keep_exact_owners`，通过真实文件缓存、缺页准备、取消及重试确定性保留旧 owner，继续核对同一 PageObject、页字节及 fork/truncate 生命周期。错误实现因 `BadState` 失败，内核入口返回 1；修复后八核 AArch64 QEMU 输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。所选 starry-kernel 标准库测试通过，静态检查 92/92 项通过。日志为 `kernel-axtest-cache-cancel-{red,green}.log`、`std-cache-cancel-fixed.log` 和 `clippy-cache-cancel-fixed.log`。修复后的板上编译尚待验证。
+
+### 1.11 普通唤醒的处理器亲和性
+
+旧分支的 `select_wake_run_queue_index` 优先选择线程上次运行且符合亲和性的 CPU，随后选择唤醒者 CPU，再选择其他 CPU。首轮迁移保留了当前 Fair 负载放置，可能在上次 CPU 仍可用时直接迁移到其他 CPU，因此没有完整迁移原策略。提交 `281b75594` 在 [`select_fair_wake_cpu`](../../components/ax-task/src/sched/system/task_system/dispatch/wake/placement.rs) 补回普通唤醒顺序；在线状态与亲和性检查仍由当前 owner 事务负责，新增线程分布、同步唤醒、实时调度和空闲核拉取继续使用现有机制。
+
+复用 [`fair_wake_idle_sibling`](../../test-suit/arceos/rust/src/task/fair_wake_idle_sibling.rs) 的真实四核等待/唤醒功能证明，保留 SCHED_IDLE 和 SCHED_BATCH 的有界进展及同步唤醒的空闲核选择。普通唤醒阶段限制到两个保持运行的候选 CPU，并增加源 CPU 的工作量，使负载选择与旧亲和策略产生不同结果；这样独立的空闲核拉取不会掩盖唤醒选择。错误实现选 CPU1，断言预期 CPU0，项目入口返回 1；恢复旧策略后同一用例通过，返回 0。对应日志为 `wake-previous-migration-{red,green}-isolated.log`。首次测试允许空闲 CPU 拉取，修复前后均最终运行在 CPU2；该结果不算普通唤醒选择的通过证据，原日志保留。ax-task 与 ArceOS 测试套件的静态检查 51/51 项通过，所选 15 个软件包的标准库测试全部通过。真实四核空闲核拉取及跨核等待唤醒分别通过，八核 AArch64 内核测试仍为 224 项通过、0 项失败；日志为 `clippy-wake-previous-migration.log`、`std-wake-previous-migration.log`、`wake-migration-idle-pull.log`、`wake-migration-remote-wait.log` 及 `kernel-axtest-wake-migration.log`。
+
 ## 2. 耗时证据与验收缺口
 
 迁移补齐前的内核曾完成自编；完整迁移后的运行仍有失败，当前没有达到最终 17 分钟目标的通过证据。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
@@ -118,6 +132,7 @@
 | 当前源码诊断运行 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 33m56s / 35m04s | `tg-xtask` 返回 0；随后 Bash 段错误，运行器返回 139，未生成 PASS |
 | 板载 Linux 同工作量冷编译 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 5m12s / 5m18s | `tg-xtask` 返回 0，ELF、BIN 与源码元数据校验通过，输出 PASS |
 | 完整接入后的缺页诊断运行 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 未完成 / 30m07s | 278 个编译单元启动，出现缓存页预留失败和 rustc SIGSEGV，最终构建返回 1 |
+| 补齐写回策略后的冷编译 | 相同 `81e736bd…` 与 nightly-2026-09-04 | `fat` | 未完成 / 3m52s | 118 个编译单元启动，core 缓存页身份冲突及 SIGSEGV，最终构建返回 1 |
 
 当前源码的最终 `starryos` 单元墙钟跨度约 709.87 秒。该跨度包含等待，不能等同于纯 CPU 时间或全部 LTO 时间。源码、依赖、目标配置和工具链也发生变化，不能把两种源码之间约十六分钟的差额全部归因于 LTO 或某个尚未迁移的优化。截图的缓存状态没有独立证据，不能将其直接标作已确认的冷编译基线。
 
