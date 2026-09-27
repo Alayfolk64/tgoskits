@@ -10,7 +10,7 @@
 
 2026-09-27 再次获取远端后，`upstream/dev` 为 `212ba669c2385b4a7b5394bedfdb6a40c9a65308`，比原基线新增一个 `feat(axbuild): support external Starry QEMU runs (#2509)` 提交。已将集成分支的十九个提交变基到该提交，迁移提交为 `ed1e26bfd`；`git merge-base --is-ancestor upstream/dev HEAD` 返回 0。唯一冲突是 procfs 的覆盖率导出与 profiling 入口，合并后保留各自条件编译与节点；没有 Cargo.lock 冲突或手工合并锁文件。变基前完整改动保存在 `snapshot/performance-port-before-latest-dev-20260927`，提交 `8d7ee75bc`。新增 dev 内容发生在已测运行基线之外，不能用它解释已测耗时。
 
-对旧实验的全部 616 个变化路径进行了 Git 对象比较：412 个与备份完全一致，50 个与旧实验基线一致，154 个采用不同的当前表示。这是路径与对象分类，包含移动和删除；不能换算成优化迁移百分比。
+初次迁移对旧实验的全部 616 个变化路径进行了 Git 对象比较：412 个与备份完全一致，50 个与旧实验基线一致，154 个采用不同的当前表示。补齐写回、普通唤醒及缓存身份后，在 `28ea96565` 再次全量核对：396 个与备份一致、171 个采用当前表示、49 个旧路径在旧基线和当前树中均不存在。后一类都是旧分支新增、当前已移动或由现有所有者接管的路径，不是保留旧基线实现的生产文件。这是路径与对象分类，包含移动和删除；不能换算成优化迁移百分比。
 
 ### 1.2 按生产消费者核对
 
@@ -109,7 +109,7 @@
 
 [`FilePageIndex::cancel_publication`](../../os/StarryOS/kernel/src/mm/aspace/backend/file.rs) 在取消最后一个准备 pin 且尚无映射时移除了身份条目。然而取消清理仍可持有原 PageObject 的强引用；此时另一个缺页重试会为同一物理缓存页创建第二个 PageObject，现有 COW 索引拒绝这个仍存活的身份替换。提交 `8e918cc82` 在取消时保留不拥有物理资源的弱身份，直到最后一个强 owner 消失；重试复用同一 PageObject，过期身份仍由 `retain_page` 按访问清理。
 
-增强既有 `private_cache_reads_fork_cow_and_truncate_keep_exact_owners`，通过真实文件缓存、缺页准备、取消及重试确定性保留旧 owner，继续核对同一 PageObject、页字节及 fork/truncate 生命周期。错误实现因 `BadState` 失败，内核入口返回 1；修复后八核 AArch64 QEMU 输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。所选 starry-kernel 标准库测试通过，静态检查 92/92 项通过。日志为 `kernel-axtest-cache-cancel-{red,green}.log`、`std-cache-cancel-fixed.log` 和 `clippy-cache-cancel-fixed.log`。修复后的八核 AArch64 直接系统回归 `qemu/system/test-private-cache-backing` 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0，日志为 `system-private-cache-cancel-wake-fixed.log`。修复后的板上编译尚待验证。
+增强既有 `private_cache_reads_fork_cow_and_truncate_keep_exact_owners`，通过真实文件缓存、缺页准备、取消及重试确定性保留旧 owner，继续核对同一 PageObject、页字节及 fork/truncate 生命周期。错误实现因 `BadState` 失败，内核入口返回 1；修复后八核 AArch64 QEMU 输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。所选 starry-kernel 标准库测试通过，静态检查 92/92 项通过。日志为 `kernel-axtest-cache-cancel-{red,green}.log`、`std-cache-cancel-fixed.log` 和 `clippy-cache-cancel-fixed.log`。修复后的八核 AArch64 直接系统回归 `qemu/system/test-private-cache-backing` 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0，日志为 `system-private-cache-cancel-wake-fixed.log`。板上四份相同 core 编译命令随后全部返回 0，合计 157.867 秒；日志为 `core-cancel-wake-fixed-probe.serial.log`。完整冷编译结果记录在 2.4 节。
 
 ### 1.11 普通唤醒的处理器亲和性
 
@@ -119,7 +119,7 @@
 
 ## 2. 耗时证据与验收缺口
 
-迁移补齐前的内核曾完成自编；完整迁移后的运行仍有失败，当前没有达到最终 17 分钟目标的通过证据。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
+迁移补齐前的内核曾完成自编；补齐后的当前源码冷编译已通过，但尚未达到最终 17 分钟目标。需要分别核对运行内核、被编译源码、工具链和编译策略，不能把不同工作量的总时间直接当作运行内核回归。
 
 ### 2.1 两种构建工作量
 
@@ -153,3 +153,19 @@ Linux 对照运行 `linux-frozen81-kernel-cold-20260927` 使用相同实体板�
 弱引用修复前的诊断运行出现 16 次缓存页预留失败和 14 份 rustc 回溯，最后 lwprintf 构建助手收到 SIGSEGV，随后报 `limits.h` 不存在。返回 Linux 后两个 Clang 头文件路径均存在，相同头文件的最小编译通过；不能把错误直接归因于 rootfs 缺少软件包。完整日志为 `performance-migrated-cache-fault-diag-20260928.serial.log`，失败 target 保留为 `target-after-cache-fault-diag-20260928`。
 
 弱引用修复后的运行在首个编译单元出现前发生 `Unhandled Page Fault @ 0xffffffff803544a0`，读取地址为 `0xffff000200000018`。使用精确匹配的 ELF `558988c9325ceb8d986383c8edb6553154e682d54e3979370aca8c9b60477e65` 解析，故障 PC 位于 `foldhash::hash_bytes_long`，调用点属于目录缓存 `HashMap` 的重哈希路径。真实原因尚未确认，目录缓存的短时扫描及键长度诊断没有捕获非法键。硬件 watchdog 在 panic 后停止喂狗并约 44 秒复位，这是 panic 恢复，尚未达到 22,200 秒的 feeder lease。Linux 随后正常启动；该轮不能用于性能比较。
+
+### 2.4 当前迁移源码冷编译
+
+补齐缓存取消身份与普通唤醒策略后，正式板级构建、八核内核测试和直接系统回归均通过。运行内核 BIN SHA-256 为 `20600f90e37cdedfab86b8a7dad9b3a5dcbeffbb4fe5053539e6306a5d9b1b96`，FIT 为 `ba28f2d4c77269720a5eeed6da167d60024b567619e6e51a3184efcf459561b4`。没有加入新的性能优化或诊断 Rust 代码。
+
+本轮 `performance-complete-current-cold-20260928` 被编译源码为干净提交 `28ea965658ecc7a3ca14c883fa2d9964cfcf4948`，归档 SHA-256 为 `2dae544eca2d24ccfe6f77557fdca2622d51847a5cbc37adb7a1b9dec7be18b0`，使用 nightly-2026-09-04、八核、离线依赖与默认 `release.lto="fat"`。正式 [`guest-kernel-selfbuild.sh`](../../apps/starry/orangepi-5-plus-selfbuild/guest-kernel-selfbuild.sh) 在构建前确认 target 不存在，仅复用已准备的任务工具。Cargo 输出 `Finished release profile ... in 29m 58s`，任务工具及二进制转换完整计时为 1,863 秒，即 31 分 03 秒，退出码 0；产物校验与串口运行器均输出 PASS。日志为 `performance-complete-current-cold-20260928.serial.log`。
+
+取回的 ELF SHA-256 为 `c641e9f84a157d43f1052eeb346d963312093f2ea3a531e0ef8088519997bf4d`，BIN 为 `2dac7153124efe28eabf2ff07c1a4e2076211c862a0d730ab33056d9b523f8e3`。本机再次检查全部 SHA256SUMS，并用匹配的 LLVM 23.1.1 将 ELF 完整转换；转换后的 BIN 与板上 BIN 逐字节一致。这证明本轮成功生成产物，不证明达到 17 分钟。该源码的 Cargo.lock SHA-256 为 `f1dad97448a5f8c1f2c216a27e61fa1e45f8a4bb45a399ad8d6df0211c03d0b2`，与冻结 `81e736bd…` 的锁文件不同，不能直接将历史 35 分 19 秒与本轮的差额归因于迁移效果。
+
+正常重启后 Linux 与 SSH 均可用，boot ID 为 `f79823f6-b47d-4120-9c65-1298afabd90a`，当前启动脚本和 Linux 备份的 SHA-256 均为 `d47fa003c0210128b863a04301e17ec56b7957cb3b3b2c80c1d467ee99c965e9`。fsck 重放日志、优化 extent tree，并报告 `Padding at end of inode bitmap is not set. Fix? yes`，返回 1，继续正常启动；不能记作无需修复的文件系统状态。运行末尾还出现一次 `ext4 periodic writeback failed: ResourceBusy`，没有使构建失败。inode 分配源码与旧性能快照完全一致；当前没有将这些现象定位为迁移遗漏，保留原始记录而不扩展修改范围。
+
+只读复核确认 [`CpuRemote::charge_busy_runtime`](../../components/ax-task/src/sched/system/cpu/remote/owner.rs) 在非 idle 调度计费时推进累计运行时间；[`timer_irq_handler`](../../os/arceos/modules/axruntime/src/clock_event_runtime.rs) 的非空闲周期 tick 会执行这条计费链。Fair 单独运行时停用的是 slice deadline，不是非空闲 CPU 的周期 tick。因此没有依据认定调频输入遗漏持续负载；实际送达频率仍需独立运行证据。旧性能快照和它的基线均使用 `release.lto=false`，该设置不是旧性能分支新增的优化；当前保留 dev 的 `fat`，没有将降低构建工作量计作优化迁移。
+
+为避免使用不同锁文件的历史对照，本轮随后在同板 Linux 上运行相同归档、工具链、任务工具、锁文件和 `fat` 配置。先将 Starry 构建目录保留为 `target-after-complete-current-starry-cold-20260928`，执行 `sync` 和 Linux 页缓存清理，再用相同正式 guest 脚本进行无 target 的构建。`linux-current-complete-cold-20260928` 的 Cargo 时间为 5 分 21 秒，完整构建 327 秒，即 5 分 27 秒，退出 0；产物校验及取回均通过。Linux ELF SHA-256 为 `842dc297d0e94735232738e4c45349de8ba356b917aeade6fea5caf10976d56f`，BIN 为 `e471fb2572e82120ef426aca2b87a846b07d7c61a49112e85cf3b3c97779a1d1`。Starry 完整构建耗时约为此对照的 5.70 倍；Linux 与 Starry 的调频策略和送达频率仍未完全对齐，不能将全部差距归因于单个软件机制。原始日志为 `linux-current-complete-cold.log`。
+
+在保留默认 `fat` 结果与仓库配置的前提下，另启动 `performance-current-old-lto-cold-20260928`，通过现有 Cargo 环境参数 `CARGO_PROFILE_RELEASE_LTO=false` 临时采用旧分支构建设置。源码和工具链保持相同，Linux target 已移走保留，正式脚本再次确认冷构建。该轮是构建配置对照，不是新性能优化；结果不能计作默认 `fat` 的 17 分钟验收。当前仍在运行，尚无成功耗时。
