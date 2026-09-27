@@ -42,7 +42,7 @@ impl CachedFile {
         let mut scratch = PageCache::new()?;
         let mut total = 0;
         while reader.current < reader.end {
-            let bytes = scratch.data();
+            let mut bytes = scratch.data();
             let mut snapshot = BorrowedBuf::from(&mut *bytes);
             let copied = reader.read_page(snapshot.unfilled())?;
             // A Writer may fault, block, or reenter this cache. read_page has

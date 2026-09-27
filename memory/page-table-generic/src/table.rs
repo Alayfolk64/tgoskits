@@ -15,9 +15,9 @@ use crate::{
 };
 
 const TARGETED_FLUSH_LIMIT: usize = 32;
-const MAX_DEFERRED_PAGE_TABLE_LEVELS: usize = 8;
+pub(crate) const MAX_DEFERRED_PAGE_TABLE_LEVELS: usize = 8;
 
-/// Intermediate page-table frames detached by one leaf removal.
+/// A bounded batch of detached intermediate page-table frames.
 ///
 /// The frames remain allocated until the stage-1 owner confirms that every
 /// CPU which could walk the old hierarchy has completed a TLB invalidation.
@@ -39,7 +39,7 @@ impl<A: FrameAllocator> core::fmt::Debug for DeferredPageTableFrames<A> {
 }
 
 impl<A: FrameAllocator> DeferredPageTableFrames<A> {
-    fn new(allocator: A) -> Self {
+    pub(crate) fn new(allocator: A) -> Self {
         Self {
             allocator,
             frames: heapless::Vec::new(),
@@ -49,7 +49,15 @@ impl<A: FrameAllocator> DeferredPageTableFrames<A> {
     pub(crate) fn push(&mut self, frame: PhysAddr) {
         self.frames
             .push(frame)
-            .expect("one leaf cannot detach more page tables than the hierarchy depth");
+            .expect("deferred page-table batch capacity must be reserved before detach");
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.frames.is_full()
+    }
+
+    pub(crate) fn allocator_clone(&self) -> A {
+        self.allocator.clone()
     }
 
     /// Returns whether this removal detached no intermediate table frames.

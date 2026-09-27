@@ -134,3 +134,24 @@ Not changed:portable ext4 transactions,journal policy,block driver,memory-set
 placement,shootdowns,scheduler,public syscall arguments/flags,guest workload,
 or profiling instrumentation. The remaining65.573s ext4 state-lock wait and CPU
 find_free_area hotspot are separate measured limits,not hidden by this scope.
+
+## 当前 dev 的写回迁移
+
+迁移使用 dev 的唯一 `CacheMappingEndpoint`，不恢复旧监听器列表。文件级
+`writeback_lock` 串行化显式、后台、周期、全局与容量写回，以及文件布局改变。
+一轮写回拥有有限的页号/物理身份选择，并增加页的瞬时 pin，禁止回收该轮页。
+保护回调、磁盘写入和 backing sync 均在 `io_lock` 与缓存索引锁外执行。
+页的 Idle/Active/Redirtied 状态、脏代际与物理身份共同决定是否清脏；析构路径
+无条件释放状态与 pin，包括保护、分配、短写和同步失败。
+
+保留 dev 的每批最多 16 页限制，改为直接生成一个拥有字节的连续批次，消除
+逐页 Box 快照再拼接的第二次复制。稀疏页在文件偏移不连续处结束批次，最后
+一页按该轮 EOF 截断。写回持有布局写入排他权，文件缩小必须等旧轮结束。
+
+普通缓存写入仍由 mapping-layout、更新守卫和缓存索引发布。更新守卫增加
+明确的锁外阶段：完成当前页写入后发布稳定状态、释放 io，执行脏页平衡，再
+重取 io 并恢复更新状态。容量清理和低水位写回通过同一批次协议执行；若已有
+写回轮持有排他权，写入只请求后台处理并允许暂时超出软容量，避免重入等待。
+扩容与 truncate 在布局锁之后、io 之前取得写回排他权，防止旧快照重新增长文件。
+现有同线程回调中执行 truncate 的测试不符合该排他协议，需改为确定性交错
+验证 truncate 等待写回、最后长度不被恢复；不能以放宽断言代替迁移。

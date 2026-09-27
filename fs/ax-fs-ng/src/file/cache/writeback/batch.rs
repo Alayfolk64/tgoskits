@@ -2,7 +2,7 @@
 
 use super::*;
 
-const MAX_BATCH_PAGES: usize = 256;
+const MAX_BATCH_PAGES: usize = 16;
 
 struct WritebackBatch {
     offset: u64,
@@ -41,7 +41,7 @@ impl WritebackPages<'_> {
             let tracked = &self.pages[*cursor];
             let current = cache
                 .get_mut(&tracked.number)
-                .filter(|page| page.matches_pin(&tracked.pin) && page.dirty);
+                .filter(|page| page.paddr() == Ok(tracked.paddr) && page.dirty);
             let Some(page) = current else {
                 if batch.bytes.is_empty() {
                     *cursor += 1;
@@ -74,7 +74,7 @@ impl WritebackPages<'_> {
         for version in &batch.versions {
             let tracked = &self.pages[version.selection_index];
             if let Some(page) = cache.get_mut(&tracked.number)
-                && page.matches_pin(&tracked.pin)
+                && page.paddr() == Ok(tracked.paddr)
             {
                 page.complete_writeback(version.generation);
             }

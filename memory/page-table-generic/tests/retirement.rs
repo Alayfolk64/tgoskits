@@ -51,6 +51,70 @@ fn detached_tables_are_invalidated_before_allocator_reuse() {
 }
 
 #[test]
+fn deferred_range_retains_tables_and_reports_an_error_prefix() {
+    for partial_huge in [false, true] {
+        let mut table = new_table();
+        let start = VirtAddr::from(0x20_0000);
+        let huge = VirtAddr::from(0x40_0000);
+        for offset in [0, 4096, 0x10_0000] {
+            table
+                .map_page(start + offset, PhysAddr::from(0x80_0000 + offset), 4096, 1)
+                .unwrap();
+        }
+        if partial_huge {
+            table
+                .map_page(huge, PhysAddr::from(0xa0_0000), 0x20_0000, 1)
+                .unwrap();
+        }
+        reset_events();
+        let mut batches = Vec::new();
+        let end = if partial_huge { huge + 4096 } else { huge };
+        let result = table.unmap_range_deferred(start..end, |batch| batches.push(batch));
+        assert_eq!(result.is_err(), partial_huge);
+        if !partial_huge {
+            assert_eq!(result.unwrap(), 3);
+        }
+        for offset in [0, 4096, 0x10_0000] {
+            assert_eq!(table.query(start + offset), Err(PagingError::NotMapped));
+        }
+        if partial_huge {
+            assert_eq!(table.query(huge).unwrap().2, 0x20_0000);
+        }
+        EVENTS.with_borrow(|events| {
+            assert!(events.iter().any(|event| matches!(event, Event::Clear)));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Free | Event::Flush | Event::Batch(_)))
+            );
+        });
+        assert!(
+            batches
+                .iter()
+                .map(DeferredPageTableFrames::len)
+                .sum::<usize>()
+                > 0
+        );
+        RetirementMeta::flush(None);
+        for batch in batches {
+            // SAFETY: the recording metadata's completed flush revokes all
+            // users of this exclusively owned test table before reclamation.
+            unsafe { batch.reclaim() };
+        }
+        EVENTS
+            .with_borrow(|events| assert!(events.iter().any(|event| matches!(event, Event::Free))));
+        reset_events();
+        assert_eq!(
+            table.unmap_range_deferred(start..huge, |_| {
+                panic!("a range containing only holes must not report a PTE change");
+            }),
+            Ok(0)
+        );
+        EVENTS.with_borrow(|events| assert!(events.is_empty()));
+    }
+}
+
+#[test]
 fn occupied_leaf_query_retains_inaccessible_mapping_geometry() {
     for size in [4096, 0x20_0000] {
         let mut table = new_table();

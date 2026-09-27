@@ -1,4 +1,4 @@
-//! One finite selection and unconditional reservation cleanup.
+//! Finite page reservations, retired on every success and failure path.
 
 use super::*;
 
@@ -7,69 +7,64 @@ impl<'a> WritebackPages<'a> {
         shared: &'a CachedFileShared,
         requested: Option<&[u32]>,
     ) -> VfsResult<Self> {
-        let mut requested_pns = requested
-            .map(|requested| -> VfsResult<Vec<u32>> {
-                let mut numbers = Vec::new();
-                numbers
-                    .try_reserve_exact(requested.len())
+        let requested = requested
+            .map(|numbers| -> VfsResult<Vec<u32>> {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(numbers.len())
                     .map_err(|_| VfsError::NoMemory)?;
-                numbers.extend_from_slice(requested);
-                Ok(numbers)
+                copy.extend_from_slice(numbers);
+                copy.sort_unstable();
+                copy.dedup();
+                Ok(copy)
             })
             .transpose()?;
-        if let Some(pns) = requested_pns.as_mut() {
-            pns.sort_unstable();
-            pns.dedup();
-        }
-        let io = shared.io_lock.lock();
-        let file_len = shared.len();
-        let selected = |number: u32| {
-            u64::from(number) * (PAGE_SIZE as u64) < file_len
-                && requested_pns
-                    .as_ref()
-                    .is_none_or(|pns| pns.binary_search(&number).is_ok())
+        let mut round = Self {
+            shared,
+            file_len: 0,
+            pages: Vec::new(),
         };
-        let count = shared
-            .page_cache
-            .lock()
-            .iter()
-            .filter(|(number, page)| page.dirty && selected(**number))
-            .count();
-        // Allocate before changing any page state, without the cache index.
-        // io_lock keeps the selected membership stable between both scans.
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(count)
-            .map_err(|_| VfsError::NoMemory)?;
-        {
+        let result = (|| -> VfsResult<()> {
+            let _io = shared.io_lock.lock();
+            let file_len = shared.len();
+            round.file_len = file_len;
+            let selected = |number: u32| {
+                u64::from(number) * (PAGE_SIZE as u64) < file_len
+                    && requested
+                        .as_ref()
+                        .is_none_or(|numbers| numbers.binary_search(&number).is_ok())
+            };
+            let count = shared
+                .page_cache
+                .lock()
+                .iter()
+                .filter(|(number, page)| page.dirty && selected(**number))
+                .count();
+            round
+                .pages
+                .try_reserve_exact(count)
+                .map_err(|_| VfsError::NoMemory)?;
             let mut cache = shared.page_cache.lock();
             for (&number, page) in cache.iter_mut() {
                 if page.dirty && selected(number) {
-                    page.begin_writeback();
-                    pages.push(WritebackPage {
-                        number,
-                        pin: page.pin(),
-                    });
+                    let paddr = page.paddr()?;
+                    let pins = page.pins.checked_add(1).ok_or(VfsError::ValueOverflow)?;
+                    page.begin_writeback()?;
+                    page.pins = pins;
+                    round.pages.push(WritebackPage { number, paddr });
                 }
             }
-        }
-        drop(io);
-        pages.sort_unstable_by_key(|page| page.number);
-        Ok(Self {
-            shared,
-            file_len,
-            pages,
-        })
+            Ok(())
+        })();
+        // The closure's io/cache guards end before an error drops this owner.
+        result?;
+        round.pages.sort_unstable_by_key(|page| page.number);
+        Ok(round)
     }
 
     pub(super) fn protect(&self) -> VfsResult<()> {
-        let listeners = self.shared.writeback_protect_listeners();
         for page in &self.pages {
-            for listener in &listeners {
-                if !listener(page.number) {
-                    return Err(VfsError::ResourceBusy);
-                }
-            }
+            self.shared
+                .protect_dirty_pages_before_writeback(core::slice::from_ref(&page.number))?;
         }
         Ok(())
     }
@@ -86,15 +81,16 @@ impl<'a> WritebackPages<'a> {
 
 impl Drop for WritebackPages<'_> {
     fn drop(&mut self) {
-        // All per-batch and callback guards have ended before this owner is
-        // dropped. On error, only already completed versions may be clean.
-        let _io = self.shared.io_lock.lock();
         let mut cache = self.shared.page_cache.lock();
         for tracked in &self.pages {
-            if let Some(page) = cache.get_mut(&tracked.number)
-                && page.matches_pin(&tracked.pin)
+            if let Some(page) = cache.peek_mut(&tracked.number)
+                && page.paddr() == Ok(tracked.paddr)
+                && page.pins != 0
             {
                 page.finish_writeback();
+                page.pins -= 1;
+            } else {
+                warn!("writeback reservation lost cached page {}", tracked.number);
             }
         }
     }

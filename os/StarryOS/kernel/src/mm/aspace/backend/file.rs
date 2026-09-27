@@ -9,7 +9,7 @@ use alloc::{
 use ax_fs_ng::{
     file::{
         CacheMappingEndpoint, CacheMappingEvent, CacheMappingResult, CachePageIdentity,
-        CachedFileIdentity, CachedPagePin,
+        CachedFileIdentity, CachedPageBacking, CachedPagePin,
     },
     vfs::{CachedFile, FileFlags},
 };
@@ -141,7 +141,12 @@ impl FilePageIndex {
             return Ok(page);
         }
 
-        let frame = FrameLease::borrowed(paddr, PAGE_SIZE_4K, None).ok_or(StarryError::BadState)?;
+        let source = Arc::new(CachedFilePage {
+            backing: pin.backing(),
+            page_number,
+        });
+        let frame =
+            FrameLease::borrowed(paddr, PAGE_SIZE_4K, Some(source)).ok_or(StarryError::BadState)?;
         let page = PageObject::new_present_with_resident_kind(
             PageId::allocate(),
             frame,
@@ -293,7 +298,13 @@ impl FilePageIndex {
     }
 }
 
-struct FilePageDomain {
+/// Provider capability retained by a PageObject through mapping retirement.
+pub(super) struct CachedFilePage {
+    pub(super) backing: CachedPageBacking,
+    pub(super) page_number: u32,
+}
+
+pub(super) struct FilePageDomain {
     identity: CachedFileIdentity,
     pages: Mutex<FilePageIndex>,
 }
@@ -304,7 +315,7 @@ static FILE_PAGE_DOMAINS: LazyLock<Mutex<FilePageDomains>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 impl FilePageDomain {
-    fn get_or_create(cache: &CachedFile) -> StarryResult<Arc<Self>> {
+    pub(super) fn get_or_create(cache: &CachedFile) -> StarryResult<Arc<Self>> {
         let identity = cache.identity();
         let domain = {
             let mut domains = FILE_PAGE_DOMAINS.lock();
@@ -325,7 +336,7 @@ impl FilePageDomain {
         Ok(domain)
     }
 
-    fn reserve_page(
+    pub(super) fn reserve_page(
         &self,
         file_epoch: u64,
         page_number: u32,
@@ -345,7 +356,7 @@ impl FilePageDomain {
         self.pages.lock().resolve(file_epoch, page_number, paddr)
     }
 
-    fn finish_page_publication(
+    pub(super) fn finish_page_publication(
         &self,
         file_epoch: u64,
         page_number: u32,
@@ -359,13 +370,17 @@ impl FilePageDomain {
         Ok(())
     }
 
-    fn cancel_page_publication(&self, page_number: u32, page: &Arc<PageObject>) -> StarryResult {
+    pub(super) fn cancel_page_publication(
+        &self,
+        page_number: u32,
+        page: &Arc<PageObject>,
+    ) -> StarryResult {
         let pin = self.pages.lock().cancel_publication(page_number, page)?;
         drop(pin);
         Ok(())
     }
 
-    fn ensure_page_identity(
+    pub(super) fn ensure_page_identity(
         &self,
         file_epoch: u64,
         page_number: u32,

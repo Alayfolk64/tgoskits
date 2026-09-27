@@ -1401,7 +1401,7 @@ impl DirectRwFsFileOps for ProcMemFile {
         let addr = usize::try_from(offset).map_err(|_| VfsError::BadAddress)?;
         self.populate_remote_range(addr, buf.len(), MappingFlags::WRITE)?;
         let aspace = self.proc_data.pin_aspace().map_err(VfsError::from)?;
-        let aspace = aspace.lock();
+        let mut aspace = aspace.lock();
         aspace.write(VirtAddr::from_usize(addr), buf)?;
         drop(aspace);
         ax_cpu::cache::flush_icache_all();
@@ -1666,8 +1666,7 @@ impl SimpleDirOps for ThreadDir {
                             let orig: u32 = parts[1].parse().map_err(|_| VfsError::InvalidInput)?;
                             let count: u32 =
                                 parts[2].parse().map_err(|_| VfsError::InvalidInput)?;
-                            if !may_map_id(orig, count, |cred| cred.euid, Cred::has_cap_setuid)
-                            {
+                            if !may_map_id(orig, count, |cred| cred.euid, Cred::has_cap_setuid) {
                                 return Err(VfsError::OperationNotPermitted);
                             }
                             let thr = task.as_thread();
@@ -1730,8 +1729,7 @@ impl SimpleDirOps for ThreadDir {
                             let orig: u32 = parts[1].parse().map_err(|_| VfsError::InvalidInput)?;
                             let count: u32 =
                                 parts[2].parse().map_err(|_| VfsError::InvalidInput)?;
-                            if !may_map_id(orig, count, |cred| cred.egid, Cred::has_cap_setgid)
-                            {
+                            if !may_map_id(orig, count, |cred| cred.egid, Cred::has_cap_setgid) {
                                 return Err(VfsError::OperationNotPermitted);
                             }
                             let thr = task.as_thread();

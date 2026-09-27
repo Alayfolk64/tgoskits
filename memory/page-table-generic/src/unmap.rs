@@ -3,11 +3,107 @@
 use core::{fmt, ops::Range};
 
 use crate::{
-    Frame, FrameAllocator, PageTable, PageTableEntry, PagingError, PhysAddr, PteConfigOf,
-    TableMeta, VirtAddr,
+    DeferredPageTableFrames, Frame, FrameAllocator, PageTable, PageTableEntry, PagingError,
+    PagingResult, PhysAddr, PteConfigOf, TableMeta, VirtAddr,
 };
 
 const BATCH_CAPACITY: usize = 64;
+
+/// One walk supplies either synchronous invalidation or deferred ownership.
+trait RangeRetirement<T: TableMeta, A: FrameAllocator, O> {
+    const RETIRE_EXISTING_EMPTY_PATHS: bool;
+    fn reserve(&mut self);
+    fn leaf_removed(&mut self, owner: O, address: VirtAddr);
+    fn table_removed(&mut self, frame: PhysAddr, address: VirtAddr);
+}
+
+struct RangeRemoval {
+    empty: bool,
+    changed: bool,
+}
+
+impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
+    /// Removes complete occupied leaves without allocation or TLB invalidation.
+    ///
+    /// The caller retains every data-frame owner before entry and transfers
+    /// returned table batches into its preallocated stage-1 retirement gather.
+    /// At most one nonempty batch per cleared leaf is emitted. Existing empty
+    /// paths and retained shared root entries remain installed. `retire` must
+    /// not allocate, panic, reenter the table, or reclaim unconfirmed frames.
+    ///
+    /// Errors leave the failing leaf intact and still transfer detached table
+    /// batches from the successful prefix. Return or callback completion does
+    /// not revoke hardware access; only the caller's TLB receipt does so.
+    pub fn unmap_range_deferred(
+        &mut self,
+        range: Range<VirtAddr>,
+        retire: impl FnMut(DeferredPageTableFrames<A>),
+    ) -> PagingResult<usize> {
+        self.validate_owned_unmap_range(&range)?;
+        if range.is_empty() {
+            return Ok(0);
+        }
+        if Frame::<T, A>::PT_LEVEL > crate::table::MAX_DEFERRED_PAGE_TABLE_LEVELS {
+            return Err(PagingError::hierarchy_error(
+                "Page-table depth exceeds deferred reclaim capacity",
+            ));
+        }
+        let retained = self.retained_root_entry_range();
+        let mut gather = DeferredRetirement {
+            tables: DeferredPageTableFrames::new(self.root.allocator.clone()),
+            retire,
+        };
+        let mut removed = 0;
+        let result = remove_range(
+            &mut self.root,
+            range,
+            Frame::<T, A>::PT_LEVEL,
+            retained,
+            &mut |_leaf: MappedLeaf<PteConfigOf<T>>| -> PagingResult<()> {
+                removed += 1;
+                Ok(())
+            },
+            &mut gather,
+        );
+        // An empty token still reports leaf changes when no intermediate table
+        // became empty. A range containing only holes changed no descriptors.
+        // No table is freed at this boundary, including an error prefix.
+        if removed != 0 {
+            gather.finish();
+        }
+        result.map(|_| removed)
+    }
+}
+
+struct DeferredRetirement<A: FrameAllocator, R: FnMut(DeferredPageTableFrames<A>)> {
+    tables: DeferredPageTableFrames<A>,
+    retire: R,
+}
+
+impl<A: FrameAllocator, R: FnMut(DeferredPageTableFrames<A>)> DeferredRetirement<A, R> {
+    fn finish(&mut self) {
+        let empty = DeferredPageTableFrames::new(self.tables.allocator_clone());
+        (self.retire)(core::mem::replace(&mut self.tables, empty));
+    }
+}
+
+impl<T: TableMeta, A: FrameAllocator, R: FnMut(DeferredPageTableFrames<A>)>
+    RangeRetirement<T, A, ()> for DeferredRetirement<A, R>
+{
+    const RETIRE_EXISTING_EMPTY_PATHS: bool = false;
+
+    fn reserve(&mut self) {
+        if self.tables.is_full() {
+            self.finish();
+        }
+    }
+
+    fn leaf_removed(&mut self, _owner: (), _address: VirtAddr) {}
+
+    fn table_removed(&mut self, frame: PhysAddr, _address: VirtAddr) {
+        self.tables.push(frame);
+    }
+}
 
 /// An occupied mapping presented before its descriptor is cleared.
 #[derive(Debug)]
@@ -137,24 +233,25 @@ where
     result.map(|_| ())
 }
 
-fn remove_range<T, A, O, E, R>(
+fn remove_range<T, A, O, E, G>(
     frame: &mut Frame<T, A>,
     range: Range<VirtAddr>,
     level: usize,
     retained_root_entries: Option<(usize, usize)>,
     prepare: &mut impl FnMut(MappedLeaf<PteConfigOf<T>>) -> Result<O, E>,
-    gather: &mut Retirement<T, A, O, R>,
-) -> Result<bool, E>
+    gather: &mut G,
+) -> Result<RangeRemoval, E>
 where
     T: TableMeta,
     A: FrameAllocator,
     E: From<PagingError>,
-    R: FnMut(O),
+    G: RangeRetirement<T, A, O>,
 {
     let allocator = frame.allocator.clone();
     let entries = frame.as_slice_mut();
     let level_size = Frame::<T, A>::level_size(level);
     let mut address = range.start;
+    let mut changed = false;
 
     while address < range.end {
         let index = Frame::<T, A>::virt_to_index(address, level);
@@ -181,9 +278,8 @@ where
                 config: entry.config(level > 1),
             })?;
             entry.clear();
-            // reserve() guarantees space, with no fallible step after clear.
-            assert!(gather.owners.push(owner).is_ok());
-            assert!(gather.addresses.push(address).is_ok());
+            changed = true;
+            gather.leaf_removed(owner, address);
         } else {
             if !entry.present() {
                 return Err(PagingError::hierarchy_error(
@@ -193,22 +289,49 @@ where
             }
             let child_paddr = entry.paddr(true);
             let mut child = Frame::<T, A>::from_paddr(child_paddr, allocator.clone());
-            if remove_range(&mut child, address..next, level - 1, None, prepare, gather)?
+            let child_removed =
+                remove_range(&mut child, address..next, level - 1, None, prepare, gather)?;
+            changed |= child_removed.changed;
+            if child_removed.empty
+                && (child_removed.changed || G::RETIRE_EXISTING_EMPTY_PATHS)
                 && !retained_root_entries.is_some_and(|(start, end)| start <= index && index < end)
             {
                 gather.reserve();
                 // Retain the detached frame until this parent update is covered
                 // by a completed invalidation, including capacity-driven drains.
                 entry.clear();
-                assert!(gather.tables.push(child_paddr).is_ok());
-                assert!(gather.addresses.push(address).is_ok());
+                changed = true;
+                gather.table_removed(child_paddr, address);
             }
         }
         address = next;
     }
 
     // Once per visited table, not once per removed page from the VMA.
-    Ok(entries.iter().all(PageTableEntry::unused))
+    Ok(RangeRemoval {
+        empty: entries.iter().all(PageTableEntry::unused),
+        changed,
+    })
+}
+
+impl<T: TableMeta, A: FrameAllocator, O, R: FnMut(O)> RangeRetirement<T, A, O>
+    for Retirement<T, A, O, R>
+{
+    const RETIRE_EXISTING_EMPTY_PATHS: bool = true;
+
+    fn reserve(&mut self) {
+        Retirement::reserve(self);
+    }
+
+    fn leaf_removed(&mut self, owner: O, address: VirtAddr) {
+        assert!(self.owners.push(owner).is_ok());
+        assert!(self.addresses.push(address).is_ok());
+    }
+
+    fn table_removed(&mut self, frame: PhysAddr, address: VirtAddr) {
+        assert!(self.tables.push(frame).is_ok());
+        assert!(self.addresses.push(address).is_ok());
+    }
 }
 
 struct Retirement<T: TableMeta, A: FrameAllocator, O, R: FnMut(O)> {

@@ -119,3 +119,24 @@ zero backing is not a privately resident page. Tests at the exact accounting
 boundary establish counts; noisy whole-process RSS deltas are not deterministic.
 Full syscall compatibility is not claimed by these focused checks; the affected
 entrypoints must retain their existing validation and failure priority.
+
+## 变基后的所有者适配
+
+当前 dev 使用 `PageObject`、`MappingSlot` 和带确认回执的退休批次，不再使用旧
+`FrameReference` 全局表。迁移保留这条所有权链：内核镜像中的只读 `ZeroPage`
+提供不释放物理内存的 `FrameLease`，每个匿名逻辑源在 `CowPageIndex` 中懒惰保存
+一个零页 `PageObject`，同源的不同地址、拆分和 fork 共用该对象。不同逻辑源
+共用物理零页，但不竞争同一个反向映射锁。对象构造及竞争失败对象的析构在
+索引锁外完成；零页不占普通物理帧索引，也不产生 RSS 记账。
+
+缺页准备、锁内 populate 和回滚均识别零页所有者。发布、撤销和恢复零页身份
+不更改普通 Pending/Weak 索引；安装与拆除仍由 dev 的 MappingSlot/rmap 和 TLB
+回执完成。只有非共享、匿名、4 KiB、非写访问使用零页；透明大页保留原有路径。
+PTE 始终禁止 WRITE，保护、fork 和内核强制写沿现有 COW 入口。COW 先排除零页
+再判断独占复用，首次写入直接分配并清零，不复制静态源。静态对象只有不可变
+访问，没有 allocator 的释放责任。文件缓存共享的适配另行处理。
+
+这里的元数据与旧实现不同：dev 要求每个已安装页有 MappingSlot，因此保留其
+页对象和映射计数，避免为性能恢复第二套生命周期机制。验收需要证明共享物理
+身份、无 RSS、首次写入隔离，以及现有退休和回滚协议；迁移完成前不执行完整
+编译或运行测试。

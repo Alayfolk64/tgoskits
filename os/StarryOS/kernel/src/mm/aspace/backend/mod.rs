@@ -17,10 +17,11 @@ use ax_runtime::hal::{
 use crate::{StarryError, StarryResult};
 
 mod cow;
-mod frame_zero;
 mod file;
+mod frame_zero;
 mod linear;
 mod shared;
+mod zero;
 
 pub use self::shared::SharedMemoryObject;
 pub use super::accounting::RssKind;
@@ -1209,6 +1210,19 @@ impl MappingOperation {
         MappingExecution::prepare_fault(self, space_id, request, flags, access_flags, preimage)
     }
 
+    /// Revalidates private cache backing before the caller takes PTE locks.
+    /// Provider completion and cleanup must happen after this callback returns.
+    pub(super) fn with_current_page_backing<T, E>(
+        &self,
+        page: &super::objects::PageObject,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        match &self.kind {
+            MappingOperationKind::Cow(cow) => cow.with_current_page_backing(page, publish),
+            _ => publish().map(Some),
+        }
+    }
+
     pub(super) fn clone_map(
         &self,
         range: VirtAddrRange,
@@ -1392,7 +1406,7 @@ impl MappingOperation {
             .map(VirtAddr::from)
             .ok_or(StarryError::InvalidInput)?;
         let mut operation = match &self.kind {
-            MappingOperationKind::Cow(cb) => Self::from_cow(cb.with_start(adjusted)),
+            MappingOperationKind::Cow(cb) => Self::from_cow(cb.with_start(adjusted)?),
             MappingOperationKind::Shared(sb) => Self::from_shared(sb.with_start(adjusted)),
             MappingOperationKind::Linear(_) => return Err(StarryError::OperationNotSupported),
             MappingOperationKind::File(fb) => Self::from_file(fb.with_start(adjusted)?),
@@ -1738,13 +1752,7 @@ impl MappingBackend for MappingOperation {
         MappingExecution::validate_map(self, range, pt)
     }
 
-    fn unmap(
-        &self,
-        start: VirtAddr,
-        size: usize,
-        _context: &mut (),
-        pt: &mut PageTable,
-    ) -> bool {
+    fn unmap(&self, start: VirtAddr, size: usize, _context: &mut (), pt: &mut PageTable) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
         let capacity = match occupied_leaf_ranges(range, pt) {
             Ok(leaves) => leaves.len(),

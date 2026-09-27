@@ -105,3 +105,23 @@ No successful build or smaller flame alone proves throughput improvement.
 
 Inputs are archived in tmp/operation-unmap.4U8Sgf/sources-before.tar. Temporary
 artifacts are not build sources. Existing unrelated dirty changes stay intact.
+
+## 当前 dev 迁移
+
+当前 `MappingMutationContext` 和 `TlbRequest` 已跨 VMA 收集物理页与页表
+所有权，并等待处理器确认；保留这些回执，不恢复旧同步 `UnmapSession`
+到 Starry 的 PTE 临界区。尚缺的效果是范围遍历：当前
+`take_occupied_leaf_deferred` 每解除一页就重新检查下级页表是否为空。
+
+复用通用 `remove_range` 的一次遍历，抽出同步回收与延迟回收共有的
+退休事件边界。新增 `unmap_range_deferred` 只清除描述符并交出固定容量的
+`DeferredPageTableFrames`，不失效 TLB、不释放物理页、不分配存储。
+调用者在修改前保留所有数据页与最终回执；回调只转移预留的所有权。
+范围失败后仍交出已解除部分的表页，最终由原回执恢复或确认退休。
+
+只有本轮修改后变空的子树可以进入延迟退休，避免清理既有空路径时
+超过调用者按叶项预留的容量。表深度不能超过单个退休令牌容量；每个
+叶项最多引出深度减一的表页，因此固定容量批次不超过已清除叶项数。
+保留共享根目录项。首先接入已有回执持有所有者的 Cow 解除映射路径；
+未发布映射的回滚继续保留逐页后端取消协议。后续验证需要同时证明
+范围清除、错误前缀、空路径保留、表页延迟释放和旧同步会话行为。

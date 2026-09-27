@@ -24,7 +24,10 @@ struct TestMappingEndpoint {
 }
 
 mod fill;
+mod mapping;
 mod read;
+mod writeback_batches;
+mod writeback_progress;
 
 impl CacheMappingEndpoint for TestMappingEndpoint {
     fn publish(&self, event: CacheMappingEvent) -> CacheMappingResult {
@@ -627,6 +630,23 @@ fn disk_cache_capacity_is_bounded_without_allocating_data_pages() {
             assert_eq!(shared.page_cache.lock().cap().get(), expected_pages);
             assert_eq!(provider.alloc_count(), 0);
         }
+        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let cached = reopen_cached_file(backing.clone());
+        cached
+            .set_len(MAX_DISK_PAGE_CACHE_BYTES + PAGE_SIZE as u64)
+            .unwrap();
+        assert_eq!(cached.shared.page_cache.lock().cap().get(), 65536);
+        cached.set_len(0).unwrap();
+        backing.fail_next_set_len();
+        assert_eq!(cached.set_len(MAX_DISK_PAGE_CACHE_BYTES), Err(VfsError::Io));
+        assert_eq!(cached.len(), 0);
+        assert_eq!(cached.shared.page_cache.lock().cap().get(), 512);
+        assert_eq!(provider.alloc_count(), 0);
+        assert_eq!(backing.state.lock().unwrap().write_calls, 0);
+        let unbounded = CachedFileShared::new_unbounded(0);
+        unbounded.update_len_max(MAX_DISK_PAGE_CACHE_BYTES);
+        unbounded.set_len(0);
+        assert_eq!(unbounded.page_cache.lock().cap(), NonZeroUsize::MAX);
     });
 }
 
@@ -750,7 +770,7 @@ fn writeback_protect_endpoint_runs_without_cached_io_lock() {
 }
 
 #[test]
-fn writeback_rechecks_eof_after_truncate_during_mapping_protection() {
+fn truncate_waits_for_writeback_without_restoring_the_old_eof() {
     let flushes: &[fn(&CachedFile) -> VfsResult<()>] = &[
         |cached| cached.writeback().map(|_| ()),
         |cached| cached.writeback_pages(&[0]),
@@ -766,11 +786,21 @@ fn writeback_rechecks_eof_after_truncate_during_mapping_protection() {
             let changed = Arc::new(AtomicBool::new(false));
             let observed = changed.clone();
             let concurrent = cached.clone();
+            let truncation = Arc::new(StdMutex::new(None));
+            let pending = truncation.clone();
             let endpoint = test_mapping_endpoint(move |event| match event {
                 CacheMappingEvent::WritebackProtect(_) => {
                     if !observed.swap(true, Ordering::AcqRel) {
-                        concurrent.set_len(64).unwrap();
-                        concurrent.write_at(&b"after"[..], 0).unwrap();
+                        assert!(concurrent.shared.writeback_lock.try_lock().is_none());
+                        let entered = Arc::new(std::sync::Barrier::new(2));
+                        let worker_entered = entered.clone();
+                        let worker_file = concurrent.clone();
+                        *pending.lock().unwrap() = Some(std::thread::spawn(move || {
+                            worker_entered.wait();
+                            worker_file.set_len(64).unwrap();
+                            worker_file.write_at(&b"after"[..], 0).unwrap();
+                        }));
+                        entered.wait();
                     }
                     CacheMappingResult::Protected
                 }
@@ -778,6 +808,8 @@ fn writeback_rechecks_eof_after_truncate_during_mapping_protection() {
             });
             cached.install_mapping_endpoint(&endpoint).unwrap();
             flush(&cached).unwrap();
+            truncation.lock().unwrap().take().unwrap().join().unwrap();
+            cached.sync(false).unwrap();
             assert!(changed.load(Ordering::Acquire));
             assert_eq!(
                 backing.metadata().unwrap().size,
@@ -1390,43 +1422,27 @@ fn mapped_file_with_unavailable_worker_retains_growing_dirty_pages() {
 }
 
 #[test]
-fn writer_owned_capacity_writeback_clears_page_redirtied_during_tracked_writeback() {
+fn buffered_redirty_during_writeback_keeps_current_bytes_for_retry() {
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
-        let data = vec![0x51; PAGE_SIZE];
-        assert_eq!(cached.write_at(data.as_slice(), 0).unwrap(), data.len());
-
-        let page_number = {
-            let mut cache = cached.shared.page_cache.lock();
-            let page_number = *cache.peek_lru().unwrap().0;
-            let page = cache.peek_mut(&page_number).unwrap();
-            page.writeback_protecting = true;
-            page.dirty_during_writeback = true;
-            page_number
-        };
-        {
-            let _io = cached.shared.io_lock.lock();
-            cached.shared.writeback_lru_for_capacity_locked().unwrap();
-        }
-        let dirty = cached
-            .shared
-            .page_cache
-            .lock()
-            .get(&page_number)
-            .unwrap()
-            .dirty;
-
-        {
-            let mut cache = cached.shared.page_cache.lock();
-            let page = cache.peek_mut(&page_number).unwrap();
-            page.writeback_protecting = false;
-            page.dirty_during_writeback = false;
-        }
+        cached.write_at(&[0x51][..], 0).unwrap();
+        let writer = cached.clone();
+        *backing.before_write.lock().unwrap() = Some(Box::new(move || {
+            assert!(writer.shared.io_lock_is_free_for_test());
+            writer.write_at(&[0x72][..], 0)?;
+            Ok(())
+        }));
         cached.sync(false).unwrap();
-
-        assert!(!dirty);
-        assert_eq!(backing.state.lock().unwrap().physical_data, data);
+        assert_eq!(backing.state.lock().unwrap().physical_data[0], 0x51);
+        assert_eq!(cached.dirty_pages_in_range(0, 1).unwrap(), [0]);
+        let mut byte = [0];
+        cached.read_at(&mut byte[..], 0).unwrap();
+        assert_eq!(byte, [0x72]);
+        assert!(cached.shared.writeback_lock.try_lock().is_some());
+        cached.sync(false).unwrap();
+        assert_eq!(backing.state.lock().unwrap().physical_data[0], 0x72);
+        assert!(cached.dirty_pages_in_range(0, 1).unwrap().is_empty());
     });
 }
 

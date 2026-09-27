@@ -1,18 +1,28 @@
 //! Stable cache-hit reads while another page is being loaded from storage.
 
-use core::{
-    io::BorrowedCursor,
-    ops::Range,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{io::BorrowedCursor, ops::Range, sync::atomic::Ordering};
 
 use super::CachedFileShared;
 use crate::os::sync::SleepMutexGuard;
 
 /// Keeps tentative content changes hidden until commit or rollback completes.
 pub(super) struct CacheUpdateGuard<'a> {
-    updating: &'a AtomicBool,
-    _io: SleepMutexGuard<'a, ()>,
+    shared: &'a CachedFileShared,
+    io: Option<SleepMutexGuard<'a, ()>>,
+}
+
+impl CacheUpdateGuard<'_> {
+    /// Publishes completed bytes before a potentially blocking writeback step.
+    /// The caller retains mapping-layout serialization throughout this phase.
+    pub(super) fn without_io<R>(&mut self, operation: impl FnOnce() -> R) -> R {
+        self.shared.updating.store(false, Ordering::Release);
+        drop(self.io.take());
+        let result = operation();
+        self.io = Some(self.shared.io_lock.lock());
+        self.shared.pending_fills.invalidate();
+        self.shared.updating.store(true, Ordering::Release);
+        result
+    }
 }
 
 impl CachedFileShared {
@@ -23,8 +33,8 @@ impl CachedFileShared {
         // content mutation subsequently takes page_cache, in that order.
         self.updating.store(true, Ordering::Release);
         CacheUpdateGuard {
-            updating: &self.updating,
-            _io: io,
+            shared: self,
+            io: Some(io),
         }
     }
 
@@ -65,7 +75,7 @@ impl CachedFileShared {
 
 impl Drop for CacheUpdateGuard<'_> {
     fn drop(&mut self) {
-        // Publish stable bytes before dropping _io, including all error paths.
-        self.updating.store(false, Ordering::Release);
+        // Publish stable bytes before dropping io, including all error paths.
+        self.shared.updating.store(false, Ordering::Release);
     }
 }

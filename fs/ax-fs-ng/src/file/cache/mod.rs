@@ -1,4 +1,6 @@
+mod backing;
 mod fill;
+mod mapping;
 mod pages;
 mod read;
 mod readahead;
@@ -28,7 +30,7 @@ pub use reclaim::{page_cache_reclaim, sync_all_cached_files, sync_filesystem_cac
 #[cfg(feature = "vfs")]
 pub(crate) use writeback_worker::start_background_writeback;
 
-use super::page::PageCache;
+use super::page::{CachedPageBacking, PageCache};
 use crate::os::{
     memory::PAGE_SIZE,
     sync::{SleepMutex as Mutex, SleepMutexGuard},
@@ -229,18 +231,23 @@ pub trait CacheMappingEndpoint: Send + Sync {
 
 /// A transient, typed pin on one page-cache frame.
 ///
-/// The cache index remains the physical owner.  The pin only prevents reclaim
-/// or truncate from detaching that owner while a caller publishes a PTE; it
-/// never exposes mutable page data outside the cache lock.
+/// Prevents reclaim or truncate from detaching the indexed page during PTE
+/// publication. Its independently retained backing can outlive this transient
+/// pin without blocking subsequent mapping invalidation or cache eviction.
 pub struct CachedPagePin {
     shared: Arc<CachedFileShared>,
     page_number: u32,
     paddr: usize,
+    backing: CachedPageBacking,
 }
 
 impl CachedPagePin {
     pub const fn paddr(&self) -> usize {
         self.paddr
+    }
+
+    pub fn backing(&self) -> CachedPageBacking {
+        self.backing.clone()
     }
 }
 
@@ -257,6 +264,13 @@ impl Drop for CachedPagePin {
             );
             return;
         };
+        if !page.matches_backing(&self.backing) {
+            warn!(
+                "cached page identity changed before pin release for page {}",
+                self.page_number
+            );
+            return;
+        }
         if page.pins == 0 {
             warn!("cached page pin underflow for page {}", self.page_number);
             return;
@@ -296,6 +310,7 @@ struct CachedFileShared {
     updating: AtomicBool,
     mapping_layout_lock: Mutex<()>,
     io_lock: Mutex<()>,
+    writeback_lock: Mutex<()>,
     mapping_endpoint: Mutex<Option<Weak<dyn CacheMappingEndpoint>>>,
     backing: Option<FileNode>,
     len: AtomicU64,
@@ -322,6 +337,7 @@ impl CachedFileShared {
             updating: AtomicBool::new(false),
             mapping_layout_lock: Mutex::new(()),
             io_lock: Mutex::new(()),
+            writeback_lock: Mutex::new(()),
             mapping_endpoint: Mutex::new(None),
             backing: Some(backing),
             len: AtomicU64::new(len),
@@ -345,6 +361,7 @@ impl CachedFileShared {
             updating: AtomicBool::new(false),
             mapping_layout_lock: Mutex::new(()),
             io_lock: Mutex::new(()),
+            writeback_lock: Mutex::new(()),
             mapping_endpoint: Mutex::new(None),
             backing: None,
             len: AtomicU64::new(len),
@@ -921,7 +938,7 @@ impl CachedFile {
             // tail beyond the read length so a partial last page never exposes stale
             // physical memory past EOF — POSIX/Linux require those bytes to read as 0
             // (e.g. an mmap of a 100-byte file must see `[100, PAGE_SIZE)` as zero).
-            let read = file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            let read = file.read_at(&mut *page.data(), pn as u64 * PAGE_SIZE as u64)?;
             page.data()[read..].fill(0);
         }
         Ok(page)
@@ -951,16 +968,6 @@ impl CachedFile {
         }
 
         let mut prepared = self.prepare_cache_page(file, pn, read_backing)?;
-        let needs_capacity_writeback = {
-            let cache = self.shared.page_cache.lock();
-            cache.len() >= cache.cap().get()
-                && cache
-                    .peek_lru()
-                    .is_some_and(|(_, page)| page.dirty && page.pins == 0)
-        };
-        if needs_capacity_writeback && !self.shared.has_mapping_endpoint() {
-            self.shared.writeback_lru_for_capacity_locked()?;
-        }
         let (result, retired) = {
             let mut cache = self.shared.page_cache.lock();
             if let Some(page) = cache.get_mut(&pn) {
@@ -1084,6 +1091,7 @@ impl CachedFile {
             shared: self.shared.clone(),
             page_number: pn,
             paddr,
+            backing: page.backing(),
         })
     }
 
@@ -1098,29 +1106,40 @@ impl CachedFile {
             shared: self.shared.clone(),
             page_number: pn,
             paddr,
+            backing: page.backing(),
         }))
     }
 
-    fn write_at_locked(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
+    fn write_at_locked(
+        &self,
+        mut buf: impl Read + IoBuf,
+        offset: u64,
+        update: &mut update::CacheUpdateGuard<'_>,
+    ) -> VfsResult<usize> {
         self.shared.ensure_writeback_owner_active()?;
         let file = self.inner.entry().as_file()?;
         let end = offset.saturating_add(buf.remaining() as u64);
         let old_len = self.shared.len();
         if end > old_len {
-            let next_epoch = self.shared.prepare_mapping_epoch()?;
-            if !old_len.is_multiple_of(PAGE_SIZE as u64) {
-                let page_number = (old_len / PAGE_SIZE as u64) as u32;
-                let page_start = u64::from(page_number) * PAGE_SIZE as u64;
-                self.zero_partial_page_locked(
-                    file,
-                    page_number,
-                    (old_len - page_start) as usize,
-                    (end - page_start).min(PAGE_SIZE as u64) as usize,
-                )?;
-            }
-            file.set_len(end)?;
-            self.shared.update_len_max(end);
-            self.shared.publish_mapping_epoch(next_epoch);
+            update.without_io(|| -> VfsResult<()> {
+                let _writeback = self.shared.writeback_lock.lock();
+                let _update = self.shared.lock_for_update();
+                let next_epoch = self.shared.prepare_mapping_epoch()?;
+                if !old_len.is_multiple_of(PAGE_SIZE as u64) {
+                    let page_number = (old_len / PAGE_SIZE as u64) as u32;
+                    let page_start = u64::from(page_number) * PAGE_SIZE as u64;
+                    self.zero_partial_page_locked(
+                        file,
+                        page_number,
+                        (old_len - page_start) as usize,
+                        (end - page_start).min(PAGE_SIZE as u64) as usize,
+                    )?;
+                }
+                file.set_len(end)?;
+                self.shared.update_len_max(end);
+                self.shared.publish_mapping_epoch(next_epoch);
+                Ok(())
+            })?;
         }
 
         let mut scratch = PageCache::new()?;
@@ -1148,7 +1167,7 @@ impl CachedFile {
                 }
             })?;
             if !self.in_memory {
-                self.shared.balance_dirty_pages_locked()?;
+                update.without_io(|| self.shared.balance_dirty_pages())?;
             }
 
             written += n;
@@ -1162,17 +1181,17 @@ impl CachedFile {
     pub fn write_at(&self, buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
         let _layout = self.shared.mapping_layout_lock.lock();
         let _write = axfs_ng_vfs::CachedWriteGuard::acquire(self.inner.filesystem())?;
-        let _update = self.shared.lock_for_update();
-        self.write_at_locked(buf, offset)
+        let mut update = self.shared.lock_for_update();
+        self.write_at_locked(buf, offset, &mut update)
     }
 
     /// Appends `buf` to the end of the file. Returns `(bytes_written, new_end)`.
     pub fn append(&self, buf: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
         let _layout = self.shared.mapping_layout_lock.lock();
         let _write = axfs_ng_vfs::CachedWriteGuard::acquire(self.inner.filesystem())?;
-        let _update = self.shared.lock_for_update();
+        let mut update = self.shared.lock_for_update();
         let len = self.shared.len();
-        self.write_at_locked(buf, len)
+        self.write_at_locked(buf, len, &mut update)
             .map(|written| (written, len + written as u64))
     }
 

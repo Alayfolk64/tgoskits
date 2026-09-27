@@ -162,6 +162,26 @@ reference-count lock.
 
 ## Validation sequence
 
+### 当前 dev 的迁移所有者
+
+当前缓存页的瞬时 `CachedPagePin` 只阻止索引删除，没有独立物理所有权。
+迁移先将 `PageCache` 的分配移入引用计数的 `CachedPageBacking`，由该对象
+唯一释放 `FsPage`，并通过页级字节锁序列化内核复制。缓存条目继续拥有脏状态、
+写回状态和瞬时 pin 计数。瞬时 pin 不变为永久 pin；额外保留物理 backing
+不能代替缓存身份、EOF 或映射有效性证明。
+
+`FilePageDomain` 仍是每个 `CachedFileIdentity` 唯一的映射端点，并为共享映射
+和私有缓存映射提供同一个 PageObject。其 FrameLease 保留物理 backing；COW
+写入通过 backing 的字节锁复制到私有页，不能因映射计数为 1 而直接授予 WRITE。
+Cow 的源内弱索引仅用于物理地址查找，发布/撤销与缓存页退休继续进入已有域。
+缺页、锁内 populate、fork、内核强制写、回滚、移动和解除映射必须一并适配。
+未发布的裸地址空间仍保留复制路径，避免创建没有生命周期所有者的缓存 PTE。
+
+最终 PTE 发布需要验证瞬时 pin 对应的缓存身份、更新屏障和完整页 EOF；取消
+必须释放准备阶段的域保留。缓存物理 owner 在 PageObject 与退休回执存活期间
+不能释放，回收不依赖恢复旧监听器列表或第二个全局物理帧表。已有系统回归
+及物理生命周期测试须移入当前入口后才能验证；完整迁移前不启动完整编译。
+
 Add deterministic production-path coverage for physical pin lifetime,
 canonical identity rejection, shared read PFNs without private allocation,
 independent private writes, fork ownership/rollback, pinned source retirement,
