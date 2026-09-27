@@ -519,10 +519,7 @@ impl<B: MappingBackend> MemorySet<B> {
         let end = range.end;
         // Keep the unpublished preimage contract, but search only mappings
         // whose start lies in this mutation. Unrelated VMAs need no comparison.
-        loop {
-            let Some((&area_start, area)) = areas.range(start..end).next() else {
-                break;
-            };
+        while let Some((&area_start, area)) = areas.range(start..end).next() {
             if area.end() > end {
                 break;
             }

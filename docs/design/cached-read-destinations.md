@@ -79,6 +79,16 @@ and locked file-run preparation use this entry. PTE ownership, COW, RSS,
 truncation listeners, readahead policy and the on-disk format are unchanged.
 Existing 32-bit cached page-number limits are not widened in this change.
 
+On the rebased PageObject path, CowBackend::prepare_new_at_sized retains a
+FrameLease for an uninitialized file-backed allocation before starting I/O.
+BorrowedBuf tracks the initialized file bytes; the method then clears the
+unaligned prefix and unread suffix. Only the fully initialized frame reaches
+index_new_frame and the Pending page index. An I/O or EOF error drops the
+unpublished lease without leaving an index entry. Anonymous allocations keep
+their existing full-zero initialization. A private mmap fault at or beyond EOF
+still fails through cow_file_max_read_len when no explicit segment end exists;
+an explicit loader segment end retains its zero-fill behavior on a short read.
+
 ## Validation and risks
 
 Deterministic host cases cover warm reads with no page allocation or backing
@@ -97,3 +107,9 @@ old double-copy behavior returned incorrect data. After the whole implementation
 Only then run host/QEMU regressions and a new full cold 8c8g profiling workload.
 Require complete compile-unit/ELF equality, raw SHA checks and read-only fsck.
 No timeout or partial profile may substitute for the full result.
+
+The PageObject adaptation adds a kernel axtest that reads an entire prepared
+physical page and compares file bytes, an unaligned prefix, a short-read tail,
+and an explicit loader boundary. The same operation verifies rejection at EOF
+without a Pending index entry. This proves initialization before publication,
+not the Linux signal translation of a userspace mmap fault or its throughput.

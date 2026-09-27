@@ -81,10 +81,23 @@ def main() -> int:
                 append_output(log_file, data)
                 window = (window + data)[-131_072:]
 
+                if success in window:
+                    print(f"serial_selfbuild_pass={args.run_id}", flush=True)
+                    return 0
+                if any(marker in window for marker in failures):
+                    print(f"serial_selfbuild_fail={args.run_id}", flush=True)
+                    return 1
+
                 prompt_input = prompt_carry + data
                 new_prompts = prompt_input.count(SHELL_PROMPT)
                 prompt_carry = prompt_input[-(len(SHELL_PROMPT) - 1) :]
                 for _ in range(new_prompts):
+                    if args.kernel_only and prompt_generation:
+                        print(
+                            f"serial_selfbuild_incomplete={args.run_id}",
+                            flush=True,
+                        )
+                        return 1
                     # Re-inject after a watchdog-caused StarryOS reboot as well.
                     # init.sh restores the Linux selector before doing any work.
                     uart.write(guest_command)
@@ -94,13 +107,6 @@ def main() -> int:
                         f"serial_selfbuild_command_sent={prompt_generation}",
                         flush=True,
                     )
-
-                if success in window:
-                    print(f"serial_selfbuild_pass={args.run_id}", flush=True)
-                    return 0
-                if any(marker in window for marker in failures):
-                    print(f"serial_selfbuild_fail={args.run_id}", flush=True)
-                    return 1
 
     print(f"serial_selfbuild_timeout={args.run_id}", file=sys.stderr)
     return 124

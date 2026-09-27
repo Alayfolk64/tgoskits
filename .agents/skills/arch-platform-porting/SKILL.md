@@ -136,6 +136,8 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
   sysroot before starting the clock. Preserve the source archive and toolchain
   when comparing runtime kernel versions; a fresh compilation alone does not
   prove that the board's storage page cache was cold.
+  The kernel-only UART driver sends the build command once. A shell return
+  without a terminal marker fails the run rather than retrying a warm target.
 
 ## someboot 必备条件
 

@@ -11,6 +11,8 @@ use core::{
     time::Duration,
 };
 
+use ax_runtime as _;
+
 extern crate alloc;
 
 #[test]
@@ -99,7 +101,7 @@ fn axfs_ng_vfs_path_ownership_and_join_rules_hold() {
 
 #[test]
 fn axfs_ng_vfs_type_rules_hold() {
-    use axfs_ng_vfs::{DeviceId, NodePermission, NodeType, Reference, TypeMap};
+    use axfs_ng_vfs::{DeviceId, NodePermission, NodeType, TypeMap};
     use axpoll::IoEvents;
 
     assert_eq!(NodeType::from(0o10), NodeType::RegularFile);

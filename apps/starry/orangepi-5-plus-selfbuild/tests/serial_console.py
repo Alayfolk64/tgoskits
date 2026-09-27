@@ -1,17 +1,83 @@
 """Exercise pasted input through a real picocom process and two PTYs."""
 
+import io
 import os
 from pathlib import Path
 import re
 import select
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 import tty
 import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import serial_selfbuild
 
 
 CONNECT_SERIAL = Path(__file__).resolve().parents[1] / "connect_serial.sh"
+
+
+class SelfbuildDriverTests(unittest.TestCase):
+    def test_kernel_build_command_is_sent_once_and_terminal_status_is_preserved(self):
+        class SerialInput:
+            def __init__(self, ending):
+                self.chunks = [serial_selfbuild.SHELL_PROMPT, ending]
+                self.commands = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            @property
+            def in_waiting(self):
+                return len(self.chunks[0]) if self.chunks else 0
+
+            def read(self, size):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def write(self, command):
+                self.commands.append(command)
+
+            def flush(self):
+                pass
+
+        root = CONNECT_SERIAL.parents[3]
+        temporary_root = root / "tmp"
+        temporary_root.mkdir(exist_ok=True)
+        for ending, expected_status in [
+            (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=cold elapsed=900===\r\n", 0),
+            (b"===STARRY-ORANGEPI5PLUS-SELFBUILD-FAIL rc=1===\r\n", 1),
+            (b"", 1),
+        ]:
+            with (
+                self.subTest(ending=ending),
+                tempfile.TemporaryDirectory(dir=temporary_root) as temporary,
+            ):
+                uart = SerialInput(ending + serial_selfbuild.SHELL_PROMPT)
+                directory = Path(temporary)
+                arguments = [
+                    "serial_selfbuild.py", "--serial", "fake-uart", "--log",
+                    str(directory / "serial.log"), "--ready-file",
+                    str(directory / "ready"), "--run-id", "cold",
+                    "--kernel-only", "--timeout", "1",
+                ]
+                with io.TextIOWrapper(io.BytesIO()) as output:
+                    with (
+                        patch.object(sys, "argv", arguments),
+                        patch.object(sys, "stdout", output),
+                        patch.object(serial_selfbuild.serial, "Serial", return_value=uart),
+                    ):
+                        status = serial_selfbuild.main()
+                self.assertEqual(status, expected_status)
+                self.assertEqual(uart.commands, [
+                    b"sh /opt/starry-orangepi5plus-selfbuild/init-kernel-selfbuild.sh cold\r"
+                ])
 
 
 def read_until(descriptor, marker, timeout=5):

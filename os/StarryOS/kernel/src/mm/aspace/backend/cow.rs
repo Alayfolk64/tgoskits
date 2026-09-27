@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{io::BorrowedBuf, slice};
+use core::{io::BorrowedBuf, mem::MaybeUninit, slice};
 
 use ax_fs_ng::vfs::FileBackend;
 use ax_memory_addr::{
@@ -173,7 +173,9 @@ impl CowPageIndexReservation {
 
 impl CowPageIndex {
     const fn new() -> Self {
-        Self { pages: VecDeque::new() }
+        Self {
+            pages: VecDeque::new(),
+        }
     }
 
     /// Returns the allocation size needed by the next insert. This method only
@@ -252,7 +254,9 @@ impl CowPageIndex {
         let mut index = 0;
         while index < reservation.replacement.len() {
             if reservation.replacement[index].is_live() {
-                let entry = reservation.replacement.swap_remove_back(index)
+                let entry = reservation
+                    .replacement
+                    .swap_remove_back(index)
                     .expect("compaction index is in bounds");
                 self.pages.push_back(entry);
             } else {
@@ -817,11 +821,19 @@ impl CowBackend {
             return Err(StarryError::InvalidInput);
         }
         let frame = alloc_frame(zeroed, size)?;
+        // SAFETY: alloc_frame returned this unique allocation with the same
+        // size, and the lease takes over its only release duty.
+        self.index_new_frame(unsafe { FrameLease::owned(frame, size) }, resident_kind)
+    }
+
+    fn index_new_frame(
+        &self,
+        frame: FrameLease,
+        resident_kind: RssKind,
+    ) -> StarryResult<Arc<PageObject>> {
         let page = PageObject::new_present_with_resident_kind(
             PageId::allocate(),
-            // SAFETY: alloc_frame just returned this unique allocation with
-            // the same size, and the lease takes over its only release duty.
-            unsafe { FrameLease::owned(frame, size) },
+            frame,
             Some(resident_kind),
         );
         // The source-local index owns this page only while the PTE/slot pair
@@ -874,54 +886,60 @@ impl CowBackend {
         access_flags: MappingFlags,
     ) -> StarryResult<Arc<PageObject>> {
         let kind = self.rss_kind_for_fault(access_flags);
-        let page = self.alloc_new_frame_sized(true, kind, leaf_size)?;
-        let frame = page.frame().paddr();
-
-        if let Some((file, file_vaddr_base, file_start, file_end)) = &self.file {
-            let buf =
-                unsafe { slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), leaf_size) };
-            // vaddr can be smaller than file_vaddr_base (at most 1 page) due to
-            // non-aligned mappings; compute page-internal write offset accordingly.
-            // The mapping invariant is: a virtual address `V` corresponds to
-            // file offset `file_start + (V - file_vaddr_base)`. The file-backed
-            // bytes of this page begin at buf[start] (= virtual address
-            // `file_vaddr_base` when the page starts below it, i.e. the
-            // unaligned first page), which therefore reads from `file_start`.
-            // `saturating_sub` yields exactly that: 0 when vaddr < file_vaddr_base
-            // (read from file_start) and the positive delta otherwise. Do NOT
-            // subtract the gap here — doing so reads the segment's bytes from
-            // the wrong offset and corrupts e.g. the dynamic linker's
-            // .dynamic/GOT, making ld-musl jump to a null pointer.
-            let start = file_vaddr_base.as_usize().saturating_sub(vaddr.as_usize());
-            if start >= leaf_size {
-                self.discard_pending_page(&page);
-                return Err(StarryError::InvalidInput);
-            }
-
-            let relative = vaddr.as_usize().saturating_sub(file_vaddr_base.as_usize());
-            let file_read_offset = (*file_start).checked_add(relative as u64).ok_or_else(|| {
-                self.discard_pending_page(&page);
-                StarryError::InvalidInput
-            })?;
-            let available = buf
-                .len()
-                .checked_sub(start)
-                .ok_or(StarryError::InvalidInput)?;
-            let max_read = match cow_file_max_read(file, *file_end, file_read_offset, available) {
-                Ok(max_read) => max_read,
-                Err(err) => {
-                    self.discard_pending_page(&page);
-                    return Err(err);
-                }
-            };
-
-            let mut destination = BorrowedBuf::from(&mut buf[start..start + max_read]);
-            if let Err(err) = file.read_buf_at(destination.unfilled(), file_read_offset) {
-                self.discard_pending_page(&page);
-                return Err(err.into());
-            }
+        let Some((file, file_vaddr_base, file_start, file_end)) = &self.file else {
+            return self.alloc_new_frame_sized(true, kind, leaf_size);
+        };
+        if leaf_size < PAGE_SIZE_4K || !leaf_size.is_power_of_two() {
+            return Err(StarryError::InvalidInput);
         }
-        Ok(page)
+        let frame = alloc_frame(false, leaf_size)?;
+        // SAFETY: this unique allocation is not indexed or mapped. The lease
+        // releases it on every error before an initialized PageObject exists.
+        let lease = unsafe { FrameLease::owned(frame, leaf_size) };
+        // SAFETY: the lease exclusively owns this writable direct-map range;
+        // MaybeUninit does not assert validity of the allocator's contents.
+        let buf = unsafe {
+            slice::from_raw_parts_mut(
+                phys_to_virt(frame).as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                leaf_size,
+            )
+        };
+        // vaddr can be smaller than file_vaddr_base (at most 1 page) due to
+        // non-aligned mappings; compute page-internal write offset accordingly.
+        // The mapping invariant is: a virtual address `V` corresponds to
+        // file offset `file_start + (V - file_vaddr_base)`. The file-backed
+        // bytes of this page begin at buf[start] (= virtual address
+        // `file_vaddr_base` when the page starts below it, i.e. the
+        // unaligned first page), which therefore reads from `file_start`.
+        // `saturating_sub` yields exactly that: 0 when vaddr < file_vaddr_base
+        // (read from file_start) and the positive delta otherwise. Do NOT
+        // subtract the gap here — doing so reads the segment's bytes from
+        // the wrong offset and corrupts e.g. the dynamic linker's
+        // .dynamic/GOT, making ld-musl jump to a null pointer.
+        let start = file_vaddr_base.as_usize().saturating_sub(vaddr.as_usize());
+        if start >= leaf_size {
+            return Err(StarryError::InvalidInput);
+        }
+
+        let relative = vaddr.as_usize().saturating_sub(file_vaddr_base.as_usize());
+        let file_read_offset = (*file_start)
+            .checked_add(relative as u64)
+            .ok_or(StarryError::InvalidInput)?;
+        let available = buf
+            .len()
+            .checked_sub(start)
+            .ok_or(StarryError::InvalidInput)?;
+        let max_read = cow_file_max_read(file, *file_end, file_read_offset, available)?;
+        let filled = {
+            let mut destination = BorrowedBuf::from(&mut buf[start..start + max_read]);
+            file.read_buf_at(destination.unfilled(), file_read_offset)?;
+            destination.len()
+        };
+        // File I/O owns the filled bytes. Clear only the unaligned prefix
+        // and unread suffix before publishing the frame in the page index.
+        buf[..start].fill(MaybeUninit::new(0));
+        buf[start + filled..].fill(MaybeUninit::new(0));
+        self.index_new_frame(lease, kind)
     }
 
     fn rollback_new_pages(
@@ -933,9 +951,10 @@ impl CowBackend {
     ) {
         let complete = rollback_live_mapped_pages(
             pt,
-            pages.iter().rev().map(|(vaddr, page)| {
-                (*vaddr, page.frame().paddr(), self.page_size)
-            }),
+            pages
+                .iter()
+                .rev()
+                .map(|(vaddr, page)| (*vaddr, page.frame().paddr(), self.page_size)),
             range,
             context,
         );
@@ -976,12 +995,7 @@ impl CowBackend {
                 let page = match self.alloc_new_at(addr, flags, access_flags, pt) {
                     Ok(page) => page,
                     Err(error) => {
-                        self.rollback_new_pages(
-                            &mut mapped,
-                            rollback_range,
-                            rollback_context,
-                            pt,
-                        );
+                        self.rollback_new_pages(&mut mapped, rollback_range, rollback_context, pt);
                         return Err(error);
                     }
                 };
@@ -1009,12 +1023,7 @@ impl CowBackend {
                 let page = match self.alloc_new_at(addr, flags, access_flags, pt) {
                     Ok(page) => page,
                     Err(error) => {
-                        self.rollback_new_pages(
-                            &mut mapped,
-                            rollback_range,
-                            rollback_context,
-                            pt,
-                        );
+                        self.rollback_new_pages(&mut mapped, rollback_range, rollback_context, pt);
                         return Err(error);
                     }
                 };
@@ -1066,22 +1075,12 @@ impl CowBackend {
             let frame = page.frame().paddr();
             let Some(chunk_start) = k.checked_mul(ps) else {
                 self.discard_pending_page(&page);
-                self.rollback_new_pages(
-                    &mut mapped_pages,
-                    rollback_range,
-                    rollback_context,
-                    pt,
-                );
+                self.rollback_new_pages(&mut mapped_pages, rollback_range, rollback_context, pt);
                 return Err(StarryError::InvalidInput);
             };
             let Some(chunk_end) = chunk_start.checked_add(ps) else {
                 self.discard_pending_page(&page);
-                self.rollback_new_pages(
-                    &mut mapped_pages,
-                    rollback_range,
-                    rollback_context,
-                    pt,
-                );
+                self.rollback_new_pages(&mut mapped_pages, rollback_range, rollback_context, pt);
                 return Err(StarryError::InvalidInput);
             };
             let dst = unsafe { slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), ps) };
@@ -1090,12 +1089,7 @@ impl CowBackend {
             page.prepare_executable_mapping(frame, self.page_size, pte_flags);
             if let Err(err) = pt.map_page(addr, frame, self.page_size, pte_flags) {
                 self.discard_pending_page(&page);
-                self.rollback_new_pages(
-                    &mut mapped_pages,
-                    rollback_range,
-                    rollback_context,
-                    pt,
-                );
+                self.rollback_new_pages(&mut mapped_pages, rollback_range, rollback_context, pt);
                 return Err(err.into());
             }
             materialization.push(PreparedPteOwner::installed(
@@ -1230,9 +1224,8 @@ impl CowBackend {
                 .filter(|page| page.mapping_refs() == 0)
                 .map(|page| self.rollback_owner(page))
         };
-        let (frame, _flags, page_size, deferred) = pt
-            .unmap_page_deferred(addr)
-            .map_err(StarryError::from)?;
+        let (frame, _flags, page_size, deferred) =
+            pt.unmap_page_deferred(addr).map_err(StarryError::from)?;
         context.record_unmap(deferred);
         if let Some(owner) = rollback_owner {
             context.defer_cow_cleanup(owner);
@@ -3484,6 +3477,79 @@ fn sparse_mapping_mutations_walk_only_occupied_leaves_for_test() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(axtest)]
+    #[axtest::axtest]
+    fn private_file_fault_initializes_prefix_and_short_read_tail() {
+        use ax_fs_ng::{file::CachedFile, vfs::FileBackend};
+        use ax_memory_addr::{PAGE_SIZE_4K, VirtAddr};
+        use ax_runtime::hal::{mem::phys_to_virt, paging::MappingFlags};
+        use axfs_ng_vfs::{Location, Mountpoint, NodePermission};
+
+        let (filesystem, memory_fs) = crate::pseudofs::MemoryFs::new_with_handle();
+        let entry = memory_fs.create_anonymous_file(
+            "private-file-initialization",
+            NodePermission::from_bits_truncate(0o600),
+            0,
+            0,
+        );
+        let cache =
+            CachedFile::get_or_create(Location::new(Mountpoint::new_root(&filesystem), entry))
+                .unwrap();
+        let contents: alloc::vec::Vec<u8> = (0..256).map(|byte| (byte % 251 + 1) as u8).collect();
+        assert_eq!(
+            cache.write_at(contents.as_slice(), 0).unwrap(),
+            contents.len()
+        );
+        let base = VirtAddr::from_usize(0x4800_0000);
+
+        for (prefix, offset, end) in [
+            (0, 0, None),
+            (37, 11, None),
+            (37, 11, Some(30)),
+            (37, 11, Some(8192)),
+            (0, 256, Some(256)),
+            (0, 256, None),
+        ] {
+            let operation = super::MappingOperation::new_cow(
+                base + prefix,
+                PAGE_SIZE_4K,
+                FileBackend::Cached(cache.clone()),
+                offset,
+                end,
+                false,
+            );
+            let super::super::MappingOperationKind::Cow(backend) = &operation.kind else {
+                unreachable!();
+            };
+            let prepared = backend.prepare_new_at_sized(base, PAGE_SIZE_4K, MappingFlags::READ);
+            if end.is_none() && offset >= contents.len() as u64 {
+                assert!(matches!(prepared, Err(crate::StarryError::BadAddress)));
+                assert!(backend.pages.lock().pages.is_empty());
+                continue;
+            }
+            let page = prepared.unwrap();
+            let count = end
+                .unwrap_or(contents.len() as u64)
+                .min(contents.len() as u64)
+                .saturating_sub(offset)
+                .min((PAGE_SIZE_4K - prefix) as u64) as usize;
+            let mut expected = alloc::vec![0; PAGE_SIZE_4K];
+            expected[prefix..prefix + count]
+                .copy_from_slice(&contents[offset as usize..offset as usize + count]);
+            // SAFETY: successful preparation owns an initialized, unpublished
+            // frame. No PTE, other task, or device can mutate these bytes.
+            let actual = unsafe {
+                core::slice::from_raw_parts(
+                    phys_to_virt(page.frame().paddr()).as_ptr(),
+                    PAGE_SIZE_4K,
+                )
+            };
+            assert_eq!(actual, expected.as_slice());
+            backend.discard_pending_page(&page);
+            assert!(backend.pages.lock().pages.is_empty());
+        }
+    }
+
     #[cfg_attr(axtest, axtest::axtest)]
     #[cfg_attr(not(axtest), test)]
     fn cow_page_index_retired_capacity_does_not_compound() {
@@ -3572,16 +3638,28 @@ mod tests {
             Err(CowPageIndexInsertError::StaleReservation)
         ));
         assert!(index.get(next.frame().paddr()).is_none());
-        assert!(Arc::ptr_eq(&index.get(first.frame().paddr()).unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            &index.get(first.frame().paddr()).unwrap(),
+            &first
+        ));
         drop(reservation);
         index.insert_pending_for_test(&next).unwrap();
-        assert!(Arc::ptr_eq(&index.get(next.frame().paddr()).unwrap(), &next));
+        assert!(Arc::ptr_eq(
+            &index.get(next.frame().paddr()).unwrap(),
+            &next
+        ));
 
         // Alternate descending and ascending addresses through repeated
         // growth. Lookups and rollback must retain each owner's identity
         // regardless of which end the sorted storage moves.
         let owners: alloc::vec::Vec<_> = (0..64)
-            .map(|number| make_page(if number % 2 == 0 { 200 - number } else { 200 + number }))
+            .map(|number| {
+                make_page(if number % 2 == 0 {
+                    200 - number
+                } else {
+                    200 + number
+                })
+            })
             .collect();
         for page in &owners {
             index.insert_pending_for_test(page).unwrap();

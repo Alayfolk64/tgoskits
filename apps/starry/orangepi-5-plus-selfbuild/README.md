@@ -89,4 +89,6 @@ records tool and artifact hashes, source metadata, CPU affinity, available
 frequency settings and wall time under `/output/runs/<run-name>`. The UART
 driver's `--kernel-only` option selects this entry. A pass requires the task
 command to succeed and both the AArch64 ELF and nonempty raw binary to exist.
+The driver sends the command once; returning to the shell without a terminal
+marker fails the run instead of restarting it with compiled dependencies.
 Linux must subsequently retrieve the artifacts and verify `SHA256SUMS`.

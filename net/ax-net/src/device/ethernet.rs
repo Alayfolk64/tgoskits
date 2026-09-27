@@ -860,7 +860,6 @@ mod ethernet_counter_tests {
         tx_frames: Vec<Vec<u8>>,
         /// When set, frame publication returns an error.
         tx_alloc_fail: bool,
-        tx_error: Option<NetDeviceError>,
     }
 
     impl MockEthernetDriver {
@@ -871,7 +870,6 @@ mod ethernet_counter_tests {
                 rx_frames: VecDeque::new(),
                 tx_frames: Vec::new(),
                 tx_alloc_fail: false,
-                tx_error: None,
             }
         }
 
