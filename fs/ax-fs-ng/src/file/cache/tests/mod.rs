@@ -647,6 +647,42 @@ fn disk_cache_capacity_is_bounded_without_allocating_data_pages() {
         unbounded.update_len_max(MAX_DISK_PAGE_CACHE_BYTES);
         unbounded.set_len(0);
         assert_eq!(unbounded.page_cache.lock().cap(), NonZeroUsize::MAX);
+
+        for append in [false, true] {
+            let backing = Arc::new(CacheTestFile::new(Vec::new()));
+            let cached = reopen_cached_file(backing.clone());
+            let mut contents = Vec::new();
+            for page_number in 0..MIN_DISK_PAGE_CACHE_PAGES + 1 {
+                let bytes = vec![(page_number % 251) as u8; PAGE_SIZE];
+                if append {
+                    let (written, end) = cached.append(bytes.as_slice()).unwrap();
+                    assert_eq!(written, bytes.len());
+                    assert_eq!(end, (contents.len() + bytes.len()) as u64);
+                } else {
+                    assert_eq!(
+                        cached.write_at(bytes.as_slice(), contents.len() as u64),
+                        Ok(bytes.len())
+                    );
+                }
+                contents.extend_from_slice(&bytes);
+            }
+            assert!(
+                backing.write_lengths().is_empty(),
+                "growing files must retain dirty bytes within their retention target"
+            );
+            let mut read = vec![0; contents.len()];
+            assert_eq!(cached.read_at(read.as_mut_slice(), 0), Ok(contents.len()));
+            assert_eq!(read, contents);
+            assert_eq!(backing.state.lock().unwrap().read_calls, 0);
+            cached.sync(false).unwrap();
+            assert_eq!(backing.state.lock().unwrap().physical_data, contents);
+            assert!(
+                cached
+                    .dirty_pages_in_range(0, (MIN_DISK_PAGE_CACHE_PAGES + 1) as u32)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     });
 }
 
