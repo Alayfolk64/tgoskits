@@ -35,7 +35,7 @@ impl TaskSystem {
                     task_runtime::current_cpu_id().as_u32()
                 }))
             });
-            let wake_wide = {
+            let wake_wide = intent.is_sync() && {
                 let publication = task_runtime::current_thread_publication();
                 // SAFETY: the preempt scope pins this execution context until
                 // the synchronous wake transaction returns. Bootstrap
@@ -184,10 +184,12 @@ impl TaskSystem {
             .unwrap_or(target)
     }
 
-    /// Mirrors Linux Fair `select_task_rq_fair()` for a blocked wake.
+    /// Selects an active affinity-eligible CPU for a blocked Fair wake.
     ///
-    /// Wake-affine first compares the post-wake demand on the waking and
-    /// previous CPUs. Linux's PELT `cpu_load(previous)` still includes a
+    /// Ordinary wakes retain the previous
+    /// eligible CPU to preserve cache affinity, then fall back to the waker.
+    /// Synchronous wakes compare post-wake demand before idle-sibling selection.
+    /// Linux's PELT `cpu_load(previous)` still includes a
     /// blocked wakee, so `wake_affine_weight()` removes that contribution from
     /// the previous candidate and adds it to the waker candidate. This
     /// instantaneous model excludes blocked tasks already: leave the previous
@@ -215,6 +217,11 @@ impl TaskSystem {
         };
         let waker = waker.filter(|cpu| eligible(*cpu));
         let previous = previous.filter(|cpu| eligible(*cpu));
+        if !intent.is_sync() {
+            return previous
+                .or(waker)
+                .or_else(|| self.select_fair_active_cpu(affinity, None));
+        }
         let target = match (waker, previous) {
             (_, Some(previous)) if wake_wide => Some(previous),
             (Some(waker), Some(previous)) if waker != previous => {
