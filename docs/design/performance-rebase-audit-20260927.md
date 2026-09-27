@@ -77,7 +77,17 @@
 
 最终生产修复后的内核回归再次输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，增强原有退休测试以确认 `NeedsRepair` 与仍有 kernel pin 的退出 continuation 不被等待。`test-anonymous-zero-backing` 与 `test-getrandom-chroot` 均在板载 Linux 和精确选择的 Starry AArch64 QEMU 入口通过。隔离 target 的标准库重跑首次因 axbuild 配置测试继承 `CARGO_TARGET_DIR` 失败，实际目录优先级符合预期，测试夹具没有隔离环境；现按相邻已有测试使用独立子进程清除该变量，生产配置解析未改。最终 68 个软件包全部通过，axbuild 为 421 项通过。
 
-板级构建与 `cargo xtask clippy` 并行使用同一个 target 时，构建报告含宿主 `bitmaps@3.2.1`，被现有 AArch64 门禁拒绝；另一入口等待报告锁超时，两个非零结果和原报告均保存。顺序重跑板级项目入口后，报告仅包含已批准的 `core@0.0.0` 与 `memchr@2.8.3`，构建返回 0；没有放宽包名单或屏蔽门禁。最终顺序执行的内核静态检查 92/92 项通过，隔离 target 的 axbuild 静态检查 1/1 项通过，两个入口均返回 0。新板级 ELF 为 `0a7f19f29576f46c30aa69ae8918dee2889fa28af28ac0bec46034a6536caa2f`，BIN 为 `a1e88b9cedb8401e70875720cd77813d09f958fb2236ce06e338656624d1cf71`，打包 FIT 为 `7f05911ef465f4da745a6bdbdb9e4fa6290ed7e0a5f1f80098d9ddb8759a8dd6`。部署入口核对 FIT 内嵌 BIN、板载 Linux DTB、远端文件哈希及根 PARTUUID；当前 Linux 启动入口保持不变。
+板级构建与 `cargo xtask clippy` 并行使用同一个 target 时，构建报告含宿主 `bitmaps@3.2.1`，被现有 AArch64 门禁拒绝；另一入口等待报告锁超时，两个非零结果和原报告均保存。顺序重跑板级项目入口后，报告仅包含已批准的 `core@0.0.0` 与 `memchr@2.8.3`，构建返回 0；没有放宽包名单或屏蔽门禁。顺序执行的内核静态检查 92/92 项通过，隔离 target 的 axbuild 静态检查 1/1 项通过，两个入口均返回 0。该轮板级 ELF 为 `0a7f19f29576f46c30aa69ae8918dee2889fa28af28ac0bec46034a6536caa2f`，BIN 为 `a1e88b9cedb8401e70875720cd77813d09f958fb2236ce06e338656624d1cf71`，打包 FIT 为 `7f05911ef465f4da745a6bdbdb9e4fa6290ed7e0a5f1f80098d9ddb8759a8dd6`。部署入口核对 FIT 内嵌 BIN、板载 Linux DTB、远端文件哈希及根 PARTUUID；这些哈希属于后续弱引用修复前的镜像，不能代表当前源码产物。
+
+### 1.7 缓存页查找生命周期
+
+板上迁移后的首次冷编译在 `llvm-objcopy --version` 预检查中遇到读缺页 `BadState`，输出 `llvm-objcopy-preflight` 失败标记，尚未创建构建 target。正常返回 Linux 后，诊断内核进一步捕获 `FilePageDomain::reserve_page` 失败以及 rustc 的 SIGSEGV。迁移完整接入并不保证运行正确，这两轮失败不能用作成功耗时或十五分钟验收。
+
+[`FilePageIndex`](../../os/StarryOS/kernel/src/mm/aspace/backend/file.rs) 原先先扫描整棵索引、升级每个弱引用判断存活，再在目标条目上第二次升级。最后一个映射或退休页 owner 可以在两次升级之间释放，导致第二次返回 `None` 并被转换为 `BadState`。现由 `retain_page` 对目标条目只升级一次，并保留取得的 `Arc` 到校验及发布结束；过期条目按访问删除，整个 domain 析构负责剩余弱引用。epoch、物理地址和发布状态的检查仍保留。删除每次缺页的全索引扫描也改变了热路径成本，但尚无板上数据证明其性能收益。
+
+增强既有 `independent_file_backends_share_page_object` 内核用例，使用真实 `CachedFile`、缓存页 pin、`MappingSlot` 发布和 detach，再在查找交接时确定性释放最后一个外部 owner。错误实现的同一用例在 `file.rs:1331:77` 因 `BadState` 失败，项目入口返回 1；修复后仍检查物理页身份和完整页字节内容，AArch64 内核测试输出 `AXTEST_SUMMARY pass=224 fail=0 skip=0 total=224`，返回 0。红绿日志分别为 `kernel-axtest-cache-lookup-red.log` 与 `kernel-axtest-cache-lookup-green.log`，保存在本轮验证目录。
+
+移除临时诊断输出后的生产修复再次通过 `cargo xtask clippy --package starry-kernel`，共 92/92 项；隔离 target 的 `tg-xtask test --since upstream/dev` 覆盖 68 个软件包并全部通过，包含 axbuild 的 421 项测试。曾尝试 `--since HEAD`，它不包含未提交差异、选择了零个软件包，该次返回 0 不计入通过证据。`tg-xtask starry test qemu --arch aarch64 -c qemu/system/test-private-cache-backing` 的直接系统调用回归在八核 QEMU 输出 `PRIVATE_CACHE_BACKING_PASSED` 和分组成功标记，外层返回 0；完整日志为 `system-private-cache-aarch64-cache-lookup-fixed.log`。修复后的板上完整冷编译仍待取得终态。
 
 ## 2. 耗时证据与验收缺口
 
