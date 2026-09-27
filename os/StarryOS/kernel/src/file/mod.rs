@@ -9,6 +9,8 @@ mod epoll_file;
 mod epoll_topology;
 pub mod event;
 mod fs;
+#[cfg(axtest)]
+mod fs_tests;
 pub mod inotify;
 pub mod io_uring;
 #[cfg(feature = "sg2002")]
@@ -24,6 +26,8 @@ mod pipe;
 pub mod signalfd;
 pub mod timerfd;
 mod wext;
+#[cfg(axtest)]
+mod write_sync_axtest;
 
 use alloc::{
     borrow::Cow,

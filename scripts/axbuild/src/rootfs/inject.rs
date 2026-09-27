@@ -1082,6 +1082,4 @@ mod tests {
             .iter()
             .any(|command| command.starts_with("sif \"/dir with space/file with space\" mode ")));
     }
-
-
 }

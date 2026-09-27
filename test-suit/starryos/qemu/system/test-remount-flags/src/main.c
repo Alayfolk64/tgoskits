@@ -8,6 +8,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "writeback_flags.h"
+
 #define BUF_SIZE 65536
 
 static long remount_tmp(unsigned long flags) {
@@ -51,6 +53,9 @@ static int verify_remount_readonly_transition(void) {
 }
 
 int main(void) {
+    if (verify_writeback_mount_flags() != 0) {
+        return 1;
+    }
     if (verify_remount_readonly_transition() != 0) {
         return 1;
     }

@@ -17,6 +17,7 @@ use ax_runtime::hal::{
 use crate::{StarryError, StarryResult};
 
 mod cow;
+mod frame_zero;
 mod file;
 mod linear;
 mod shared;
@@ -264,7 +265,9 @@ pub(crate) fn alloc_frame(zeroed: bool, size: usize) -> StarryResult<PhysAddr> {
             .map_err(|_| StarryError::NoMemory)?,
     );
     if zeroed {
-        unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, size) };
+        // SAFETY: the allocator returned exclusive, aligned Normal RAM and
+        // no PTE or other owner has been published for this allocation.
+        unsafe { frame_zero::clear_owned(vaddr.as_mut_ptr(), size) };
     }
     let paddr = virt_to_phys(vaddr);
 

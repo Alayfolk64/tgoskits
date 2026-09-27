@@ -86,4 +86,23 @@ impl TableMeta for ArchPagingMeta {
     fn flush(vaddr: Option<VirtAddr>) {
         crate::asm::flush_tlb(vaddr);
     }
+
+    fn flush_batch(vaddrs: &[VirtAddr]) {
+        #[cfg(target_arch = "aarch64")]
+        crate::asm::flush_tlb_batch(vaddrs);
+        #[cfg(not(target_arch = "aarch64"))]
+        for &vaddr in vaddrs {
+            Self::flush(Some(vaddr));
+        }
+    }
+
+    fn publish_new_mapping(vaddr: VirtAddr) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = vaddr;
+            crate::asm::publish_new_mapping();
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        Self::flush_batch(core::slice::from_ref(&vaddr));
+    }
 }

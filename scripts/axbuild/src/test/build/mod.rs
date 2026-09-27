@@ -89,8 +89,8 @@ use toolchain::{
 };
 use wrappers::{
     apply_case_script_envs, case_script_envs, ensure_guest_tool_exists, find_qemu_user_binary,
-    guest_library_path, shell_single_quote, write_guest_command_wrappers,
-    write_guest_exec_wrapper, write_wrapper_script,
+    guest_library_path, shell_single_quote, write_guest_command_wrappers, write_guest_exec_wrapper,
+    write_wrapper_script,
 };
 
 #[cfg(test)]

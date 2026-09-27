@@ -129,6 +129,13 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
   and subsequent Linux availability with a changed boot ID. Keep this policy
   app-specific and fail closed when the watchdog, `tclk`, or root partition
   identity is unavailable. See `docs/design/orangepi5plus-starry-selfbuild.md`.
+  For kernel-only cold build timing, use the app's `init-kernel-selfbuild.sh`
+  and `guest-kernel-selfbuild.sh` with the prepared chroot executable at
+  `/usr/local/bin/tg-xtask`. Require the source `target` directory to be absent,
+  retain failure products, and verify `llvm-objcopy` against the installed Rust
+  sysroot before starting the clock. Preserve the source archive and toolchain
+  when comparing runtime kernel versions; a fresh compilation alone does not
+  prove that the board's storage page cache was cold.
 
 ## someboot 必备条件
 

@@ -22,10 +22,10 @@ fn read_until() {
     let mut v = Vec::new();
     assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 3);
     assert_eq!(v, b"123");
-    v.truncate(0);
+    v.clear();
     assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 1);
     assert_eq!(v, b"3");
-    v.truncate(0);
+    v.clear();
     assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 0);
     assert_eq!(v, []);
 }
@@ -88,10 +88,10 @@ fn read_line() {
     let mut v = String::new();
     assert_eq!(buf.read_line(&mut v).unwrap(), 3);
     assert_eq!(v, "12\n");
-    v.truncate(0);
+    v.clear();
     assert_eq!(buf.read_line(&mut v).unwrap(), 1);
     assert_eq!(v, "\n");
-    v.truncate(0);
+    v.clear();
     assert_eq!(buf.read_line(&mut v).unwrap(), 0);
     assert_eq!(v, "");
 }
@@ -448,7 +448,7 @@ struct ExampleHugeRangeOfZeroes {
 
 impl Read for ExampleHugeRangeOfZeroes {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let max = buf.len().min(usize::MAX);
+        let max = buf.len();
         for (i, e) in buf.iter_mut().enumerate().take(max) {
             if self.position == u64::MAX {
                 return Ok(i);

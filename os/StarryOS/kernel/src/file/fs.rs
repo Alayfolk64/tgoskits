@@ -5,12 +5,14 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ax_fs_ng::vfs::{FileBackend, FileFlags, FsContext};
-use ax_io::{Seek, SeekFrom};
+use ax_fs_ng::{
+    file::WriteSync,
+    vfs::{FileBackend, FileFlags, FsContext},
+};
 use axfs_ng_vfs::{DirectoryCursor, DirectoryReadState, Location, Metadata, NodeFlags, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::{
-    general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL},
+    general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_DSYNC, O_EXCL, O_SYNC},
     ioctl::TIOCSCTTY,
 };
 
@@ -20,7 +22,7 @@ use crate::{
     file::{IoDst, IoSrc},
     mm::VmPtr,
     pseudofs::Device,
-    sync::Mutex,
+    sync::{FsMutex, Mutex},
     task::{
         current_user_task,
         future::{block_on_user, poll_io},
@@ -30,17 +32,28 @@ use crate::{
 // FusionIO/directFS atomic-write toggle used by MySQL.
 const DFS_IOCTL_ATOMIC_WRITE_SET: u32 = 0x4004_9502;
 
-pub fn with_fs<R>(
-    dirfd: c_int,
-    f: impl FnOnce(&mut FsContext) -> StarryResult<R>,
-) -> StarryResult<R> {
+/// Resolves paths against one snapshot of the process directory context.
+pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&FsContext) -> StarryResult<R>) -> StarryResult<R> {
     let fs_context = ax_fs_ng::vfs::current_fs_context();
-    let mut fs = fs_context.lock();
+    with_fs_context(&fs_context, dirfd, f)
+}
+
+/// Snapshots directory references before invoking a potentially blocking operation.
+pub(super) fn with_fs_context<R>(
+    fs_context: &FsMutex<FsContext>,
+    dirfd: c_int,
+    f: impl FnOnce(&FsContext) -> StarryResult<R>,
+) -> StarryResult<R> {
+    // Root, cwd, and mount namespace must come from one coherent snapshot.
+    // Location references stay valid without retaining this process-wide lock
+    // across path walking or filesystem I/O. Directory updates use the original
+    // shared context, not this read-only operation view.
+    let fs = fs_context.lock().clone();
     if dirfd == AT_FDCWD {
-        f(&mut fs)
+        f(&fs)
     } else {
         let dir = Directory::from_fd(dirfd)?.inner.clone();
-        f(&mut fs.with_dirfd(dir)?)
+        f(&fs.with_dirfd(dir)?)
     }
 }
 
@@ -95,8 +108,7 @@ pub fn resolve_at_checked(
     check_search: impl Fn(&Location) -> VfsResult<()>,
 ) -> StarryResult<ResolveAtResult> {
     let check = |_: &FsContext, directory: &Location| check_search(directory);
-    resolve_at_with_search(dirfd, path, flags, Some(&check))
-        .map(|(result, _, _)| result)
+    resolve_at_with_search(dirfd, path, flags, Some(&check)).map(|(result, ..)| result)
 }
 
 type SearchCheck<'a> = Option<&'a dyn Fn(&FsContext, &Location) -> VfsResult<()>>;
@@ -114,7 +126,11 @@ fn resolve_at_with_search(
             }
             if dirfd == AT_FDCWD {
                 return with_fs(dirfd, |fs| {
-                    Ok((ResolveAtResult::File(fs.current_dir().clone()), None, Vec::new()))
+                    Ok((
+                        ResolveAtResult::File(fs.current_dir().clone()),
+                        None,
+                        Vec::new(),
+                    ))
                 });
             }
             Ok((resolve_fd(dirfd)?, None, Vec::new()))
@@ -168,7 +184,7 @@ pub fn resolve_at_with_boundary_checked(
 }
 
 pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> StarryResult<ResolveAtResult> {
-    resolve_at_with_boundary(dirfd, path, flags).map(|(result, _, _)| result)
+    resolve_at_with_boundary(dirfd, path, flags).map(|(result, ..)| result)
 }
 
 pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
@@ -202,8 +218,17 @@ pub struct File {
 
 impl File {
     pub fn new(inner: ax_fs_ng::File, open_flags: u32) -> Self {
+        // O_SYNC includes O_DSYNC. Linux also normalizes the standalone
+        // __O_SYNC bit to full synchronization at open time.
+        let policy = if open_flags & (O_SYNC & !O_DSYNC) != 0 {
+            WriteSync::All
+        } else if open_flags & O_DSYNC != 0 {
+            WriteSync::Data
+        } else {
+            WriteSync::Buffered
+        };
         Self {
-            inner,
+            inner: inner.with_write_sync(policy),
             open_flags,
             nonblock: AtomicBool::new(false),
             append: AtomicBool::new(open_flags & O_APPEND != 0),
@@ -262,10 +287,9 @@ impl FileLike for File {
     }
 
     fn write(&self, src: &mut IoSrc) -> StarryResult<usize> {
-        let mut inner = self.inner();
-        if self.append() {
-            inner.seek(SeekFrom::End(0))?;
-        }
+        // The shared File owns append placement and its cursor. Pre-seeking
+        // here would publish EOF even if the write or its sync then failed.
+        let inner = self.inner();
         let result: StarryResult<usize> = if likely(self.is_blocking()) {
             Ok(inner.write(src)?)
         } else {

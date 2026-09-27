@@ -138,6 +138,8 @@ impl IoBufMutSpec for Vec<u8> {
 
 impl IoBufMutSpec for BorrowedCursor<'_, u8> {
     fn read_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<usize> {
+        // Reborrows share the buffer's cumulative filled count. Report only
+        // this operation's progress, including zero after a prior short read.
         let before = self.written();
         reader.read_buf(self.reborrow())?;
         Ok(self.written() - before)

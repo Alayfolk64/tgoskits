@@ -1,7 +1,23 @@
-#![feature(core_io_borrowed_buf)]
-#![feature(core_io)]
+#![feature(core_io, core_io_borrowed_buf)]
+
+use core::{io::BorrowedBuf, mem::MaybeUninit};
 
 use ax_io::{BufReader, BufWriter, Cursor, SeekFrom, empty, prelude::*, repeat, sink};
+
+#[test]
+fn borrowed_cursor_reports_each_read_and_eof_progress() {
+    let mut storage = [MaybeUninit::uninit(); 8];
+    let mut buffer = BorrowedBuf::from(storage.as_mut_slice());
+    let mut cursor = buffer.unfilled();
+    assert_eq!(cursor.read_from(&mut b"ab".as_slice()), Ok(2));
+    let second = cursor.read_from(&mut b"c".as_slice());
+    let eof = cursor.read_from(&mut empty());
+    let mut failed = ax_io::read_fn(|_| Err(ax_io::Error::Io));
+    assert_eq!(cursor.read_from(&mut failed), Err(ax_io::Error::Io));
+    assert_eq!(cursor.remaining_mut(), 5);
+    assert_eq!(buffer.filled(), b"abc");
+    assert_eq!((second, eof), (Ok(1), Ok(0)));
+}
 
 #[test]
 fn test_slice() {
@@ -16,6 +32,57 @@ fn test_slice() {
 
     buf.write(&[1, 2, 3, 4, 5]).unwrap();
     assert_eq!(buf.remaining_mut(), 5);
+}
+
+#[test]
+fn slice_write_to_consumes_only_the_written_prefix() {
+    let mut source = b"build".as_slice();
+    let mut output = [0; 5];
+    let mut prefix = &mut output[..2];
+    assert_eq!(source.write_to(&mut prefix), Ok(2));
+    assert_eq!(source, b"ild");
+
+    let mut suffix = &mut output[2..];
+    assert_eq!(source.write_to(&mut suffix), Ok(3));
+    assert!(source.is_empty());
+    assert_eq!(&output, b"build");
+}
+
+#[test]
+fn slice_read_from_consumes_only_the_filled_prefix() {
+    let mut output = [0; 5];
+    let mut destination = output.as_mut_slice();
+    assert_eq!(destination.read_from(&mut b"bu".as_slice()), Ok(2));
+    assert_eq!(destination.remaining_mut(), 3);
+    assert_eq!(destination.read_from(&mut b"ild".as_slice()), Ok(3));
+    assert!(destination.is_empty());
+    assert_eq!(&output, b"build");
+}
+
+#[test]
+fn slice_transfer_errors_and_zero_progress_preserve_the_cursor() {
+    let mut source = b"build".as_slice();
+    let mut failed_writer = ax_io::write_fn(|_| Err(ax_io::Error::StorageFull));
+    assert_eq!(
+        source.write_to(&mut failed_writer),
+        Err(ax_io::Error::StorageFull)
+    );
+    assert_eq!(source, b"build");
+    let mut stalled_writer = ax_io::write_fn(|_| Ok(0));
+    assert_eq!(source.write_to(&mut stalled_writer), Ok(0));
+    assert_eq!(source, b"build");
+
+    let mut output = [0x5a; 5];
+    let mut destination = output.as_mut_slice();
+    let mut failed_reader = ax_io::read_fn(|_| Err(ax_io::Error::Io));
+    assert_eq!(
+        destination.read_from(&mut failed_reader),
+        Err(ax_io::Error::Io)
+    );
+    assert_eq!(destination.remaining_mut(), 5);
+    assert_eq!(destination.read_from(&mut empty()), Ok(0));
+    assert_eq!(destination.remaining_mut(), 5);
+    assert_eq!(output, [0x5a; 5]);
 }
 
 #[cfg(feature = "alloc")]

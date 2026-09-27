@@ -315,8 +315,7 @@ impl<B: MappingBackend> MemoryArea<B> {
         Ok(())
     }
 
-    /// Inverse of [`shrink_right`]: extends the end by `additional_size`
-    /// and maps the new region via the backend.
+    /// Extends the end by `additional_size` and maps the new backend region.
     pub(crate) fn grow_right(
         &mut self,
         additional_size: usize,

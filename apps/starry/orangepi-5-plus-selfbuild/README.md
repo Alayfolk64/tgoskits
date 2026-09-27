@@ -19,6 +19,24 @@ apps/starry/orangepi-5-plus-selfbuild/run_selfbuild.sh \
   --host <BOARD_IP>
 ```
 
+For an interactive console, use:
+
+```bash
+apps/starry/orangepi-5-plus-selfbuild/connect_serial.sh
+```
+
+This starts picocom on `/dev/ttyACM0` at 1,500,000 baud after disabling
+bracketed paste in the host terminal. Without that reset, a terminal left in
+bracketed-paste mode sends `ESC[200~` and `ESC[201~` to the board shell as part
+of each paste. Pass one serial device path to select another adapter. Exit
+with Ctrl+A, then Ctrl+X before running an automated board workload.
+If the board's `/bin/sh` is dash, run `bash --noprofile --norc -i` at the board
+prompt for command-line editing and bracketed-paste handling. A Linux Bash
+prompt may enable bracketed paste again before rebooting into StarryOS dash
+within the same picocom session.
+`tests/script_smoke.sh` includes a regression that sends pasted input through
+real picocom and two PTYs; it requires picocom for that check.
+
 The application enables the RK3588 DesignWare hardware watchdog only for this
 build. It requests a 30-second reset timeout, feeds from CPU 0 every 10 seconds,
 and limits the guest command to 21,600 seconds. The feeder lease is 22,200
@@ -29,7 +47,7 @@ parallelism: it first builds the debug `tg-xtask` host runner with plain
 `cargo build -p tg-xtask`, then invokes that exact binary to build
 StarryOS from the application build config. It emits minute-level compile-unit
 progress markers for Linux/StarryOS comparison. The seed kernel remains a
-separate native-Cargo bootstrap built by `build_seed.sh`.
+separate build using `cargo xtask starry build` with the board configuration.
 Profiling is deliberately bounded to the first command: `--profile stat` or
 `--profile record` measures at most 300 seconds of `cargo build -p tg-xtask`
 and exits without starting the StarryOS build. `record` uses flat 49 Hz cycle
@@ -39,3 +57,36 @@ The one-time boot selects the Linux root partition by GPT `PARTUUID`; Linux,
 StarryOS, and U-Boot do not share stable MMC device numbers. The end-to-end
 entry drives the UART, waits for Linux to return, and fetches and verifies the
 output artifacts before reporting success.
+
+## 1. Kernel build timing
+
+`guest-kernel-selfbuild.sh` measures the StarryOS build using the prepared
+`/usr/local/bin/tg-xtask`, excluding the task tool's own build time. It requires
+an absent source `target` directory and a new output run directory, checks the
+installed toolchain's `llvm-objcopy` before timing, and retains both build
+products and failure evidence. Cargo registry sources remain installed for
+offline compilation; compiled dependencies must be absent.
+
+### 1.1 Cold build preparation
+
+In board Linux, preserve the prepared task executable outside `target` and move
+the old source `target` directory into a uniquely named backup before rebooting.
+Verify the executable and LLVM tools inside the build chroot. The benchmark
+keeps the source archive, Rust toolchain, build configuration and default Cargo
+parallelism fixed between kernel versions.
+
+### 1.2 Runtime evidence
+
+After StarryOS boots, run the dedicated entry with a fresh run name:
+
+```sh
+sh /opt/starry-orangepi5plus-selfbuild/init-kernel-selfbuild.sh performance-dev-cold
+```
+
+`init-kernel-selfbuild.sh` restores the verified Linux boot script, mounts the
+build environment's proc/dev/sys directories and enters its Bash. The guest
+records tool and artifact hashes, source metadata, CPU affinity, available
+frequency settings and wall time under `/output/runs/<run-name>`. The UART
+driver's `--kernel-only` option selects this entry. A pass requires the task
+command to succeed and both the AArch64 ELF and nonempty raw binary to exist.
+Linux must subsequently retrieve the artifacts and verify `SHA256SUMS`.

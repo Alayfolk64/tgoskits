@@ -6,6 +6,7 @@ use ax_memory_set::MappingError;
 use ax_runtime::hal::paging::MappingFlags;
 use linux_raw_sys::general::*;
 
+use super::placement::find_mapping_start;
 use crate::{
     StarryError, StarryResult,
     file::get_file_like,
@@ -321,13 +322,11 @@ pub fn sys_mmap(
                 };
                 match device {
                     Ok(DeviceMmap::PhysicalCached(..)) => false,
-                    Ok(DeviceMmap::Physical(..))
-                    | Ok(DeviceMmap::PhysicalResolved(..)) => false,
+                    Ok(DeviceMmap::Physical(..)) | Ok(DeviceMmap::PhysicalResolved(..)) => false,
                     #[cfg(feature = "rknpu")]
                     Ok(DeviceMmap::PhysicalResolvedPageCapped(..))
                     | Ok(DeviceMmap::PhysicalCachedResolvedPageCapped(..)) => false,
-                    Ok(DeviceMmap::PhysicalPages(..))
-                    | Ok(DeviceMmap::Cache(_)) => false,
+                    Ok(DeviceMmap::PhysicalPages(..)) | Ok(DeviceMmap::Cache(_)) => false,
                     Ok(DeviceMmap::None) => true,
                     Err(_) => false,
                 }
@@ -372,10 +371,9 @@ pub fn sys_mmap(
             .as_usize()
             .saturating_sub(STACK_GUARD_GAP);
         let limit = VirtAddrRange::new(aspace.base(), VirtAddr::from(upper));
-        aspace
-            .find_free_area(VirtAddr::from(aligned), length, limit, align)
-            .or(aspace.find_free_area(aspace.base(), length, limit, align))
-            .ok_or(StarryError::NoMemory)?
+        find_mapping_start(VirtAddr::from(aligned), aspace.base(), |hint| {
+            aspace.find_free_area(hint, length, limit, align)
+        })?
     };
 
     // IonBufferFile 特殊处理：直接线性映射物理地址，跳过通用 file_mmap/device_mmap 路径。
@@ -580,8 +578,7 @@ pub fn sys_mmap(
                                         if range.is_empty() {
                                             return Err(StarryError::InvalidInput);
                                         }
-                                        length =
-                                            device_map_len(length, range.size(), page_size)?;
+                                        length = device_map_len(length, range.size(), page_size)?;
                                         match retain {
                                             Some(retain) => MappingOperation::new_linear_anchored(
                                                 start,
@@ -600,8 +597,7 @@ pub fn sys_mmap(
                                         if range.is_empty() {
                                             return Err(StarryError::InvalidInput);
                                         }
-                                        length =
-                                            device_map_len(length, range.size(), page_size)?;
+                                        length = device_map_len(length, range.size(), page_size)?;
                                         match retain {
                                             Some(retain) => MappingOperation::new_linear_anchored(
                                                 start,
@@ -621,8 +617,7 @@ pub fn sys_mmap(
                                         if range.is_empty() {
                                             return Err(StarryError::InvalidInput);
                                         }
-                                        length =
-                                            device_map_len(length, range.size(), page_size)?;
+                                        length = device_map_len(length, range.size(), page_size)?;
                                         match retain {
                                             Some(retain) => MappingOperation::new_linear_anchored(
                                                 start,
@@ -662,10 +657,7 @@ pub fn sys_mmap(
                                         }
                                     }
                                     #[cfg(feature = "rknpu")]
-                                    DeviceMmap::PhysicalCachedResolvedPageCapped(
-                                        range,
-                                        retain,
-                                    ) => {
+                                    DeviceMmap::PhysicalCachedResolvedPageCapped(range, retain) => {
                                         if range.is_empty() {
                                             return Err(StarryError::InvalidInput);
                                         }
@@ -1744,7 +1736,10 @@ fn mmap_device_map_len_rules_hold_for_test() -> bool {
     // KPU_CFG_SIZE is 0x800 on the K230. The VMA is page-granular, so the
     // ordinary MMIO contract must retain the containing 4 KiB page.
     let page_size = PAGE_SIZE_4K;
-    assert_eq!(device_map_len(PAGE_SIZE_4K, 0x800, PAGE_SIZE_4K).unwrap(), PAGE_SIZE_4K);
+    assert_eq!(
+        device_map_len(PAGE_SIZE_4K, 0x800, PAGE_SIZE_4K).unwrap(),
+        PAGE_SIZE_4K
+    );
     assert_eq!(device_map_len(0x800, 0x800, PAGE_SIZE_4K).unwrap(), 0x800);
 
     #[cfg(feature = "rknpu")]
@@ -1752,12 +1747,27 @@ fn mmap_device_map_len_rules_hold_for_test() -> bool {
         // Device GEMs expose only fully initialized pages; a partial final
         // page is not safe to publish because its allocation layout covers
         // only the requested bytes.
-        assert_eq!(page_capped_device_map_len(1000, 4096, page_size).unwrap(), 1000); // request < available
-        assert_eq!(page_capped_device_map_len(8192, 4096, page_size).unwrap(), 4096); // request > available
+        assert_eq!(
+            page_capped_device_map_len(1000, 4096, page_size).unwrap(),
+            1000
+        ); // request < available
+        assert_eq!(
+            page_capped_device_map_len(8192, 4096, page_size).unwrap(),
+            4096
+        ); // request > available
         assert_eq!(page_capped_device_map_len(0, 8192, page_size).unwrap(), 0); // zero request
-        assert_eq!(page_capped_device_map_len(5000, 4096, page_size).unwrap(), 4096); // request > available (aligned)
-        assert_eq!(page_capped_device_map_len(0x2_000, 0x1_001, page_size).unwrap(), 0x1_000);
-        assert_eq!(page_capped_device_map_len(0x10_000, 0x9_708, page_size).unwrap(), 0x9_000);
+        assert_eq!(
+            page_capped_device_map_len(5000, 4096, page_size).unwrap(),
+            4096
+        ); // request > available (aligned)
+        assert_eq!(
+            page_capped_device_map_len(0x2_000, 0x1_001, page_size).unwrap(),
+            0x1_000
+        );
+        assert_eq!(
+            page_capped_device_map_len(0x10_000, 0x9_708, page_size).unwrap(),
+            0x9_000
+        );
         assert!(page_capped_device_map_len(0x1000, 0x1001, 0).is_err());
     }
     assert!(checked_align_up(usize::MAX, page_size).is_err());

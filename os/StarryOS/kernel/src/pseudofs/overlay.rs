@@ -241,11 +241,15 @@ fn lookup_lower(dirs: &[Location], name: &str) -> VfsResult<Option<Location>> {
 /// Whiteouts remove earlier lower names from the merged view, while opaque
 /// markers are hidden from users.
 fn read_names(dir: &Location, names: &mut BTreeMap<String, DirentInfo>) -> VfsResult<()> {
+    let mut name_result = Ok(());
     dir.read_dir(
         DirectoryCursor::START,
         &mut |name: &[u8], ino, node_type, _| {
             let Ok(name) = core::str::from_utf8(name) else {
-                return true;
+                // Overlay lookup still has a UTF-8 path boundary. Do not silently
+                // hide entries that this boundary cannot represent.
+                name_result = Err(VfsError::InvalidData);
+                return false;
             };
             if name == "." || name == ".." || name == OPAQUE_MARKER_NAME {
                 return true;
@@ -261,7 +265,7 @@ fn read_names(dir: &Location, names: &mut BTreeMap<String, DirentInfo>) -> VfsRe
             true
         },
     )?;
-    Ok(())
+    name_result
 }
 
 /// Copy regular file contents from lower to a newly-created upper file.

@@ -199,6 +199,7 @@ impl Process {
         self.pid
     }
 
+    #[track_caller]
     pub(crate) fn identity(&self) -> Arc<PidIdentity> {
         self.identity.clone()
     }

@@ -382,7 +382,8 @@ pub(crate) fn prepare_aspace_unmap_deltas(
         return Vec::new();
     };
     let mut deltas = Vec::new();
-    for area in aspace.shared_file_vmas() {
+    let range = ax_memory_addr::VirtAddrRange::new(ustart, uend);
+    for area in aspace.shared_file_vmas_in_range(range) {
         let a0 = area.range.start;
         let a1 = area.range.end;
         if a1 <= ustart || a0 >= uend {
@@ -418,7 +419,8 @@ pub(crate) fn collect_metas_touching_mprotect_range(
         return Vec::new();
     };
     let mut memfds = Vec::new();
-    for area in aspace.shared_file_vmas() {
+    let range = ax_memory_addr::VirtAddrRange::new(ustart, uend);
+    for area in aspace.shared_file_vmas_in_range(range) {
         if area.range.end <= ustart || area.range.start >= uend {
             continue;
         }
@@ -486,7 +488,8 @@ pub(crate) fn prepare_aspace_replace_deltas(
     let Some(uend) = ustart.checked_add(ulen) else {
         return deltas;
     };
-    for old in aspace.shared_file_vmas() {
+    let range = ax_memory_addr::VirtAddrRange::new(ustart, uend);
+    for old in aspace.shared_file_vmas_in_range(range) {
         if old.range.end <= ustart || old.range.start >= uend {
             continue;
         }

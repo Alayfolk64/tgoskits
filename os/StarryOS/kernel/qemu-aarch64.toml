@@ -1,4 +1,4 @@
-args = ["-m", "512M", "-nographic", "-cpu", "cortex-a53", "-smp", "4"]
+args = ["-m", "8G", "-nographic", "-cpu", "cortex-a53", "-smp", "8"]
 uefi = false
 to_bin = true
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b"]

@@ -41,6 +41,8 @@ cmp -s /boot/boot.scr /boot/boot.scr.tgoskits-backup \
 if is_starry_boot_script /boot/boot.scr.tgoskits-backup; then
     fail "Linux boot-script backup appears to select StarryOS"
 fi
+"$app_root/ensure_linux_fsck.sh" /boot/armbianEnv.txt \
+    || fail "cannot arm the forced Linux filesystem check"
 
 printf '%s  %s\n' "$expected_fit_sha" /image.fit | sha256sum -c - >/dev/null
 printf '%s  %s\n' "$expected_boot_sha" /boot/boot-starryos-emmc.scr \
@@ -68,5 +70,6 @@ cmp -s /boot/boot.scr /boot/boot-starryos-emmc.scr \
 
 echo "starry_boot_previous_linux_boot_id=$(cat /proc/sys/kernel/random/boot_id)"
 echo "starry_boot_selector_sha256=$expected_boot_sha"
+echo "starry_boot_linux_fsck=armed"
 echo "starry_boot_reboot=scheduled"
 systemctl --force --force reboot

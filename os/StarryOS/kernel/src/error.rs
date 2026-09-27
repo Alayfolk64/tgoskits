@@ -212,7 +212,7 @@ impl StarryError {
             Self::Alloc(error) => alloc_errno(*error),
             Self::Cgroup(error) => cgroup_errno(*error),
             Self::IoDomain(error) => io_errno(*error),
-            Self::Net(error) => io_errno((*error).into()),
+            Self::Net(error) => net_errno(*error),
             Self::Task(error) => task_errno(*error),
             Self::Runtime(error) => runtime_errno(error),
             Self::Block(error) => block_errno(error),
@@ -526,6 +526,19 @@ fn io_errno(error: IoError) -> Errno {
         IoError::TooManyOpenFiles => Errno::EMFILE,
         IoError::Unsupported => Errno::ENOSYS,
         IoError::WouldBlock => Errno::EAGAIN,
+    }
+}
+
+fn net_errno(error: NetError) -> Errno {
+    // Preserve filesystem errno through path-backed AF_UNIX operations;
+    // conversion through the generic I/O domain would erase these categories.
+    match error {
+        NetError::DataMissing => Errno::ENODATA,
+        NetError::FilesystemCorrupted => Errno::EUCLEAN,
+        NetError::QuotaExceeded => Errno::EDQUOT,
+        NetError::TooManyLinks => Errno::EMLINK,
+        NetError::ValueOverflow => Errno::EOVERFLOW,
+        error => io_errno(error.into()),
     }
 }
 

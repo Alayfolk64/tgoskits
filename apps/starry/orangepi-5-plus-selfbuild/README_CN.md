@@ -35,6 +35,53 @@ MMC 枚举顺序不同。OrangePi 5 Plus 的 eMMC 在当前 U-Boot 中实测为 
 另有一次性 missed-feed 验证：测试内核只启动 watchdog、不创建 feeder；只有
 串口确实出现 armed 日志且随后 Linux SSH 恢复，测试才通过。
 
+## 手动连接串口
+
+在主机交互终端运行：
+
+```bash
+apps/starry/orangepi-5-plus-selfbuild/connect_serial.sh
+```
+
+入口直接使用 picocom，默认设备为 `/dev/ttyACM0`、波特率为 1,500,000；
+可以用一个位置参数指定其他串口设备。连接前先关闭主机终端遗留的括号粘贴模式，
+避免粘贴时把 `ESC[200~` 和 `ESC[201~` 一起发到板端，被 shell 当成命令。
+退出时先按 Ctrl+A，再按 Ctrl+X。运行自动板卡流程前先退出该串口会话。
+
+板端默认 `/bin/sh` 可能是没有命令行编辑功能的 dash。需要退格、方向键和
+括号粘贴处理时，在 StarryOS 控制台运行：
+
+```sh
+bash --noprofile --norc -i
+```
+
+这会启动交互 Bash，两个启动文件参数用于避免执行板载 Linux 的初始化脚本；
+`exit` 返回原来的 shell。Linux Bash 开启的终端粘贴模式也可能在重启进入
+StarryOS 的 dash 后遗留，因此同一串口会话跨系统启动时要留意 shell 类型。
+
+`tests/script_smoke.sh` 包含使用真实 picocom 和两对 PTY 的粘贴回归测试；
+运行该项检查需要主机安装 picocom。
+
+## 手动启动 SSH
+
+使用带 OpenSSH 和既有用户公钥的 Linux rootfs 时，在 StarryOS 的 root
+串口控制台执行：
+
+```sh
+ip -brief address
+mkdir -p /run/sshd
+/usr/sbin/sshd -t
+/usr/sbin/sshd -4
+```
+
+第一条查看板端实际地址，后续命令创建隔离目录、检查配置并启动 IPv4 SSH 服务。
+然后在主机运行 `ssh orangepi@<BOARD_IP>`。StarryOS 与 Linux 的 DHCP 地址可能
+不同；主机 `enp3s0` 的地址也不是板子的地址。
+
+如果服务在认证前报告 `Fatal glibc error: cannot get entropy for arc4random`，
+检查内核是否包含 `getrandom` 的 chroot 修复。该 syscall 应直接读取内核随机源，
+而非在 sshd 的空隔离目录中解析 `/dev/urandom`。
+
 ## 一次性准备可复用 glibc rootfs
 
 先让板卡进入默认 Linux，并从 Linux 控制台得到 IP。自动入口需要独占直连串口，

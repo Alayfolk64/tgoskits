@@ -22,8 +22,6 @@ mod arch;
 pub(crate) mod define;
 pub mod sys_reg;
 
-#[cfg(test)]
-mod tests;
 mod version;
 
 use core::{
@@ -129,3 +127,6 @@ impl Display for VirtAddr {
         write!(f, "VirtAddr({:#p})", self.0 as *const u8)
     }
 }
+
+#[cfg(test)]
+mod tests;

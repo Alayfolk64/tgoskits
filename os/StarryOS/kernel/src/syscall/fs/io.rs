@@ -236,8 +236,10 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> StarryResu
         if new_pos > i64::MAX as u64 {
             return Err(StarryError::InvalidInput);
         }
-        position.cursor = DirectoryCursor::new(new_pos);
-        position.read_state = None;
+        if new_pos != position.cursor.offset() {
+            position.cursor = DirectoryCursor::new(new_pos);
+            position.read_state = None;
+        }
         return Ok(new_pos as _);
     }
 

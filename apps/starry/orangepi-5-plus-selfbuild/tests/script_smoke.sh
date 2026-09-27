@@ -11,6 +11,7 @@ for script in \
     build_seed.sh \
     connect_serial.sh \
     deploy_starry_boot_remote.sh \
+    ensure_linux_fsck.sh \
     fetch_artifacts.sh \
     guest-selfbuild.sh \
     init.sh \
@@ -58,6 +59,7 @@ PY
 
 bash "$app_dir/tests/boot_script_identity.sh"
 bash "$app_dir/tests/guest_clock.sh"
+bash "$app_dir/tests/linux_recovery.sh"
 bash "$app_dir/tests/selfbuild_contract.sh"
 python3 "$app_dir/tests/serial_console.py"
 

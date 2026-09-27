@@ -10,7 +10,9 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use arm_gic_driver::v3::{Affinity, GITS_TRANSLATER_OFFSET, Its, ItsCommand, ItsTableType};
+use arm_gic_driver::v3::{
+    Affinity, GITS_TRANSLATER_OFFSET, Its, ItsCommand, ItsTableType, LPI_PENDING_TABLE_ALIGNMENT,
+};
 use ax_sync::{RawSpinLockGuard, SpinLock};
 use irq_framework::{HwIrq, IrqError, IrqId};
 use rdif_msi::{
@@ -186,10 +188,11 @@ impl GicItsProvider {
         property_table.clean();
 
         let use_physical_collection_target = its.uses_physical_collection_target();
-        let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, 4096);
+        let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, LPI_PENDING_TABLE_ALIGNMENT);
         let rd_count = with_gic(|gic| Ok(gic.redistributor_count().max(1)))?;
-        let pending_tables = AlignedMemory::new(pending_stride * rd_count, 65536)
-            .ok_or_else(|| OnProbeError::other("failed to allocate LPI pending tables"))?;
+        let pending_tables =
+            AlignedMemory::new(pending_stride * rd_count, LPI_PENDING_TABLE_ALIGNMENT)
+                .ok_or_else(|| OnProbeError::other("failed to allocate LPI pending tables"))?;
         pending_tables.clean();
 
         let collection_targets = with_gic(|gic| {

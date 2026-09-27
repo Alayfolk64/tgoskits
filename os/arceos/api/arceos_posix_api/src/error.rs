@@ -52,7 +52,7 @@ impl PosixError {
             #[cfg(feature = "fs")]
             Self::Vfs(error) => vfs_error_to_errno(error),
             #[cfg(feature = "net")]
-            Self::Net(error) => io_error_to_errno(error.into()),
+            Self::Net(error) => net_error_to_errno(error),
             Self::Io(error) => io_error_to_errno(error),
         }
     }
@@ -114,6 +114,18 @@ fn io_error_to_errno(error: IoError) -> Errno {
         IoError::TooManyOpenFiles => Errno::EMFILE,
         IoError::Unsupported => Errno::ENOSYS,
         IoError::WouldBlock => Errno::EAGAIN,
+    }
+}
+
+#[cfg(feature = "net")]
+fn net_error_to_errno(error: NetError) -> Errno {
+    match error {
+        NetError::DataMissing => Errno::ENODATA,
+        NetError::FilesystemCorrupted => Errno::EUCLEAN,
+        NetError::QuotaExceeded => Errno::EDQUOT,
+        NetError::TooManyLinks => Errno::EMLINK,
+        NetError::ValueOverflow => Errno::EOVERFLOW,
+        error => io_error_to_errno(error.into()),
     }
 }
 

@@ -23,6 +23,10 @@ pub enum ProfileEvent {
     OffCpu       = 6,
     /// Contended acquisition time for the filesystem-wide ext4 mutex.
     Ext4LockWait = 7,
+    /// Time owning the filesystem-wide ext4 mutex, excluding acquisition and release.
+    Ext4LockHold = 8,
+    /// Time spent in a synchronous device flush issued by ext4.
+    BlockFlush   = 9,
 }
 
 type BeginHook = fn(ProfileEvent, usize) -> u64;

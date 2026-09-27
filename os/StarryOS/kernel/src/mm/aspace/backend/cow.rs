@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::slice;
+use core::{io::BorrowedBuf, slice};
 
 use ax_fs_ng::vfs::FileBackend;
 use ax_memory_addr::{
@@ -915,8 +915,8 @@ impl CowBackend {
                 }
             };
 
-            if let Err(err) = file.read_at(&mut &mut buf[start..start + max_read], file_read_offset)
-            {
+            let mut destination = BorrowedBuf::from(&mut buf[start..start + max_read]);
+            if let Err(err) = file.read_buf_at(destination.unfilled(), file_read_offset) {
                 self.discard_pending_page(&page);
                 return Err(err.into());
             }
@@ -1042,7 +1042,8 @@ impl CowBackend {
             .map_err(|_| StarryError::NoMemory)?;
         buf.resize(total, 0);
         if max_read > 0 {
-            file.read_at(&mut &mut buf[..max_read], file_read_offset)?;
+            let mut destination = BorrowedBuf::from(&mut buf[..max_read]);
+            file.read_buf_at(destination.unfilled(), file_read_offset)?;
         }
         let kind = self.rss_kind_for_fault(access_flags);
         let mut mapped_pages = Vec::new();

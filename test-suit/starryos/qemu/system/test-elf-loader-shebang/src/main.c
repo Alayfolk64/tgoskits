@@ -6,14 +6,12 @@
 // exercised here by execve()-ing scripts *directly* — no shell in between, so
 // the kernel loader, not busybox, is what handles them:
 //
-//   - /tmp/loader-shebang     (no .sh suffix) -> kernel `#!` shebang branch:
-//       not an ELF, starts with "#!", so the loader resolves the interpreter
-//       (/bin/sh) via open_exec and loads it as the new image.
-//   - /tmp/loader-dotsh.sh    (.sh suffix)    -> kernel `.sh` redirect branch:
-//       the loader rewrites argv to "/bin/sh <path>" before any ELF load.
+// Both extensionless and .sh scripts must honor their shebang. A .sh script
+// naming this executable as its interpreter checks interpreter selection and
+// argument forwarding independently of the installed /bin/sh implementation.
 //
-// Each child must exec the script and exit 0; only then is the final marker
-// printed. A loader regression makes a child fail to exec (non-zero / signal),
+// Each child must exec the script and report its expected exit status before
+// the final marker is printed. A loader regression makes a child fail to exec,
 // which prints a `FAIL:` line (caught by fail_regex) instead of the marker.
 
 #define _GNU_SOURCE
@@ -22,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -49,17 +48,17 @@ static int write_script(const char *path, const char *body) {
     return 0;
 }
 
-// fork() + execve(path) directly; returns 0 iff the child exec'd and exited 0.
-static int run_exec(const char *path) {
+// Use the raw syscall so a libc ENOEXEC fallback cannot select an interpreter.
+static int run_exec(const char *path, int expected_exit) {
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
         return -1;
     }
     if (pid == 0) {
-        char *argv[] = {(char *)path, NULL};
+        char *argv[] = {(char *)path, "SCRIPT_ARGUMENT", NULL};
         char *envp[] = {NULL};
-        execve(path, argv, envp);
+        syscall(SYS_execve, path, argv, envp);
         // execve only returns on failure.
         perror("execve");
         _exit(127);
@@ -69,7 +68,7 @@ static int run_exec(const char *path) {
         perror("waitpid");
         return -1;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_exit) {
         fprintf(stderr, "child for %s did not exit cleanly (status=0x%x)\n", path,
                 status);
         return -1;
@@ -109,11 +108,20 @@ static int run_expect_errno(const char *path, int expected_errno) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--check-script-interpreter") == 0) {
+        if (argc != 4 || strcmp(argv[2], "/tmp/loader-dotsh-interpreter.sh") != 0 ||
+            strcmp(argv[3], "SCRIPT_ARGUMENT") != 0) {
+            fprintf(stderr, "FAIL: shebang interpreter argument forwarding\n");
+            return 1;
+        }
+        return 37;
+    }
     // No .sh suffix -> exercises the kernel `#!` shebang branch.
     const char *shebang = "/tmp/loader-shebang";
-    // .sh suffix -> exercises the kernel `.sh` redirect branch.
+    // The suffix must not override the script's interpreter.
     const char *dotsh = "/tmp/loader-dotsh.sh";
+    const char *dotsh_interpreter = "/tmp/loader-dotsh-interpreter.sh";
     const char *chain0 = "/tmp/loader-shebang-chain-0";
     const char *chain1 = "/tmp/loader-shebang-chain-1";
     const char *chain2 = "/tmp/loader-shebang-chain-2";
@@ -135,6 +143,11 @@ int main(void) {
     }
     if (write_script(dotsh, "#!/bin/sh\necho DOTSH_RAN\n") != 0) {
         printf("FAIL: write .sh script\n");
+        return 1;
+    }
+    if (write_script(dotsh_interpreter,
+                     "#!/proc/self/exe --check-script-interpreter\nexit 0\n") != 0) {
+        printf("FAIL: write .sh interpreter selection script\n");
         return 1;
     }
     // Five script-to-interpreter rewrites are valid; the last script reaches
@@ -164,15 +177,19 @@ int main(void) {
         return 1;
     }
 
-    if (run_exec(shebang) != 0) {
+    if (run_exec(shebang, 0) != 0) {
         printf("FAIL: exec shebang script\n");
         return 1;
     }
-    if (run_exec(dotsh) != 0) {
+    if (run_exec(dotsh, 0) != 0) {
         printf("FAIL: exec .sh script\n");
         return 1;
     }
-    if (run_exec(chain0) != 0) {
+    if (run_exec(dotsh_interpreter, 37) != 0) {
+        printf("FAIL: .sh suffix overrides the shebang interpreter\n");
+        return 1;
+    }
+    if (run_exec(chain0, 0) != 0) {
         printf("FAIL: exec bounded shebang chain\n");
         return 1;
     }

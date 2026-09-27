@@ -7,8 +7,12 @@ overlay_dir="${STARRY_OVERLAY_DIR:-}"
 rootfs="${STARRY_ROOTFS:-}"
 rootfs_size_mib="${ROOTFS_SIZE_MIB:-16384}"
 out_dir="$workspace/target/starry-macos-selfbuild"
+profile_source_host="$out_dir/profile-source-host"
+task_tmp_dir="$workspace/tmp"
 selfbuild_mode="${STARRY_MACOS_SELFBUILD_MODE:-full}"
 export COPYFILE_DISABLE=1
+mkdir -p "$task_tmp_dir"
+export TMPDIR="$task_tmp_dir"
 
 usage() {
     cat <<'USAGE'
@@ -65,7 +69,7 @@ tar_create_flags=()
 
 detect_tar_create_flags() {
     local flag list
-    list="$(mktemp "${TMPDIR:-/tmp}/starry-tar-flags.XXXXXX")"
+    list="$(mktemp -p "$task_tmp_dir" starry-tar-flags.XXXXXX)"
     : >"$list"
     for flag in --no-xattrs --no-fflags --no-mac-metadata --disable-copyfile; do
         if tar "$flag" -cf /dev/null -T "$list" >/dev/null 2>&1; then
@@ -238,6 +242,115 @@ prepare_toolchain_overlay() {
     echo "toolchain_overlay=$toolchain_overlay_dir"
 }
 
+profile_tg_xtask_source_fingerprint() {
+    (
+        cd "$profile_source_host"
+        {
+            local path tree
+            for path in Cargo.toml Cargo.lock rust-toolchain.toml; do
+                [[ ! -f "$path" ]] || sha256sum "$path"
+            done
+            for tree in xtask scripts/axbuild; do
+                find "$tree" -type f -print | LC_ALL=C sort | while IFS= read -r path; do
+                    sha256sum "$path"
+                done
+            done
+        } | sha256sum | sed 's/[[:space:]].*$//'
+    )
+}
+
+prepare_profile_source_host_cache() {
+    [[ "$selfbuild_mode" == "tg-xtask-profile" ]] || return 0
+
+    local archive_hash source_stamp
+    archive_hash="$(sha256sum "$src_tar" | sed 's/[[:space:]].*$//')"
+    source_stamp="$profile_source_host/.source.tar.sha256"
+    if [[ -f "$profile_source_host/Cargo.toml" \
+        && -f "$source_stamp" \
+        && "$(sed -n '1p' "$source_stamp")" == "$archive_hash" ]]; then
+        echo "profile_source_host_reused=true"
+        return 0
+    fi
+
+    rm -rf "$profile_source_host"
+    mkdir -p "$profile_source_host"
+    tar -xf "$src_tar" -C "$profile_source_host"
+    printf '%s\n' "$archive_hash" >"$source_stamp"
+    echo "profile_source_host_reused=false"
+    echo "profile_source_host_sha256=$archive_hash"
+}
+
+prepare_profile_tg_xtask() {
+    [[ "$selfbuild_mode" == "tg-xtask-profile" ]] || return 0
+
+    # Cross-build the orchestration tool once so the measured guest run starts
+    # directly at the ArceOS build instead of bootstrapping tg-xtask in StarryOS.
+    # shellcheck source=prepare_host_tools.sh
+    source "$app_dir/prepare_host_tools.sh"
+    prepare_macos_selfbuild_host_tools
+
+    local profile_host_target profile_tg_xtask_bin profile_tg_xtask_stamp
+    local source_fingerprint cc ar
+    profile_host_target="${STARRY_PROFILE_HOST_TARGET_DIR:-$workspace/target/starry-profile-host-tools}"
+    profile_tg_xtask_bin="$profile_host_target/aarch64-unknown-linux-musl/release/tg-xtask"
+    profile_tg_xtask_stamp="$profile_host_target/tg-xtask.source.sha256"
+    source_fingerprint="$(profile_tg_xtask_source_fingerprint)"
+    cc="$(command -v aarch64-linux-musl-gcc || command -v aarch64-linux-musl-cc)"
+    ar="$(command -v aarch64-linux-musl-ar)"
+
+    if [[ ! -x "$profile_tg_xtask_bin" \
+        || ! -f "$profile_tg_xtask_stamp" \
+        || "$(sed -n '1p' "$profile_tg_xtask_stamp")" != "$source_fingerprint" ]]; then
+        (
+            cd "$profile_source_host"
+            CARGO_TARGET_DIR="$profile_host_target" \
+                CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$cc" \
+                CC_aarch64_unknown_linux_musl="$cc" \
+                AR_aarch64_unknown_linux_musl="$ar" \
+                cargo build --locked --release -p tg-xtask --target aarch64-unknown-linux-musl
+        )
+        printf '%s\n' "$source_fingerprint" >"$profile_tg_xtask_stamp"
+    fi
+
+    mkdir -p "$overlay_dir/opt/tgoskits-profile/bin"
+    install -m 0755 "$profile_tg_xtask_bin" \
+        "$overlay_dir/opt/tgoskits-profile/bin/tg-xtask"
+    install -m 0644 "$profile_tg_xtask_stamp" \
+        "$overlay_dir/opt/tgoskits-profile/tg-xtask.source.sha256"
+    echo "profile_tg_xtask=$profile_tg_xtask_bin"
+    echo "profile_tg_xtask_source_fingerprint=$source_fingerprint"
+}
+
+prepare_profile_source_overlay() {
+    [[ "$selfbuild_mode" == "tg-xtask-profile" ]] || return 0
+
+    local archive_hash rootfs_hash profile_source_overlay
+    archive_hash="$(sha256sum "$src_tar" | sed 's/[[:space:]].*$//')"
+    rootfs_hash=""
+    if [[ "${STARRY_PROFILE_REFRESH_ROOTFS_SOURCE:-0}" != "1" ]] \
+        && command -v debugfs >/dev/null 2>&1; then
+        rootfs_hash="$(
+            debugfs -R 'cat /opt/tgoskits-profile/source.tar.sha256' "$rootfs" 2>/dev/null \
+                | tr -d '\r' \
+                | sed -n '1p'
+        )"
+    fi
+
+    if [[ "$rootfs_hash" == "$archive_hash" ]]; then
+        echo "profile_rootfs_source_reused=true"
+        return 0
+    fi
+
+    profile_source_overlay="$overlay_dir/opt/tgoskits-profile/source"
+    rm -rf "$profile_source_overlay"
+    mkdir -p "$profile_source_overlay"
+    tar -xf "$src_tar" -C "$profile_source_overlay"
+    printf '%s\n' "$archive_hash" \
+        >"$overlay_dir/opt/tgoskits-profile/source.tar.sha256"
+    echo "profile_rootfs_source_reused=false"
+    echo "profile_rootfs_source_sha256=$archive_hash"
+}
+
 actual_commit="$(git_value unknown rev-parse HEAD)"
 if [[ -n "${TGOSKITS_COMMIT:-}" && "$actual_commit" != "unknown" && "$TGOSKITS_COMMIT" != "$actual_commit" ]]; then
     echo "error: TGOSKITS_COMMIT=$TGOSKITS_COMMIT does not match workspace HEAD $actual_commit" >&2
@@ -271,16 +384,38 @@ meta_in_tar="$out_dir/.tgoskits-source-meta"
 cp "$meta_file" "$meta_in_tar"
 
 src_tar="$out_dir/tgoskits-src.tar"
-tar_create -C "$workspace" \
-    --exclude .git \
-    --exclude target \
-    --exclude tmp \
-    --exclude .cache \
-    --exclude .idea \
-    --exclude .vscode \
-    -cf "$src_tar" .
+profile_src_tar="$out_dir/arceos-helloworld-profile-source.tar"
+profile_meta_file="$out_dir/arceos-helloworld-profile-source.meta"
+profile_source_reused=false
+if [[ "$selfbuild_mode" == "tg-xtask-profile" \
+    && "${STARRY_PROFILE_REFRESH_SOURCE:-0}" != "1" \
+    && -f "$profile_src_tar" \
+    && -f "$profile_meta_file" ]]; then
+    cp "$profile_src_tar" "$src_tar"
+    cp "$profile_meta_file" "$meta_file"
+    profile_source_reused=true
+else
+    tar_create -C "$workspace" \
+        --exclude .git \
+        --exclude target \
+        --exclude tmp \
+        --exclude .cache \
+        --exclude .idea \
+        --exclude .vscode \
+        --exclude docs/node_modules \
+        --exclude docs/build \
+        -cf "$src_tar" .
 
-tar_create -C "$out_dir" -rf "$src_tar" .tgoskits-source-meta
+    tar_create -C "$out_dir" -rf "$src_tar" .tgoskits-source-meta
+    if [[ "$selfbuild_mode" == "tg-xtask-profile" ]]; then
+        cp "$src_tar" "$profile_src_tar"
+        cp "$meta_file" "$profile_meta_file"
+    fi
+fi
+
+prepare_profile_source_host_cache
+prepare_profile_source_overlay
+prepare_profile_tg_xtask
 
 cargo_registry_cache_count=0
 copy_cargo_registry_cache
@@ -298,4 +433,5 @@ echo "selfbuild_mode=$selfbuild_mode"
 echo "source_commit=$source_commit"
 echo "source_ref=$source_ref"
 echo "source_dirty=$dirty"
+echo "profile_source_reused=$profile_source_reused"
 echo "cargo_registry_cache_archives=$cargo_registry_cache_count"

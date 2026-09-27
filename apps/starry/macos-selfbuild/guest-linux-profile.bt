@@ -1,0 +1,48 @@
+/* All guest CPUs/tasks, matching Starry's 10 Hz and 1/8 off-CPU sampling.
+ * Run only inside the isolated AArch64 Linux comparison guest. No pid filter:
+ * compiler threads and asynchronous filesystem workers must remain visible.
+ */
+config = { max_map_keys = 65536; }
+
+BEGIN
+{
+    @started = nsecs;
+    printf("LINUX_KERNEL_PROFILE_BEGIN\n");
+}
+
+profile:hz:10
+{
+    @cpu[kstack(20), comm] = count();
+    @cpu_state[cpu, tid == 0] = count();
+}
+
+tracepoint:sched:sched_switch
+{
+    if (@off_start[args.next_pid]) {
+        $duration = nsecs - @off_start[args.next_pid];
+        @offcpu[@off_stack[args.next_pid], @off_comm[args.next_pid]] = sum($duration * 8);
+        @offcpu_count = count();
+        delete(@off_start, args.next_pid);
+        delete(@off_stack, args.next_pid);
+        delete(@off_comm, args.next_pid);
+    }
+    if (args.prev_pid != 0 && args.prev_state != 0) {
+        @off_tick[cpu] = @off_tick[cpu] + 1;
+        if ((@off_tick[cpu] & 7) == 1) {
+            @off_start[args.prev_pid] = nsecs;
+            @off_stack[args.prev_pid] = kstack(20);
+            @off_comm[args.prev_pid] = args.prev_comm;
+        }
+    }
+}
+
+END
+{
+    printf("LINUX_KERNEL_PROFILE_END elapsed_ns=%llu pending_offcpu=%llu\n",
+           nsecs - @started, len(@off_start));
+    clear(@started);
+    clear(@off_start);
+    clear(@off_stack);
+    clear(@off_comm);
+    clear(@off_tick);
+}

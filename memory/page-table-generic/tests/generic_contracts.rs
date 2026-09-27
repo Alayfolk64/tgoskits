@@ -1,3 +1,4 @@
+mod installation;
 mod mocks;
 
 use core::fmt;
@@ -366,6 +367,32 @@ fn query_reports_arbitrary_base_page_size() {
     let (mapped_paddr, _, page_size) = page_table.query(vaddr).unwrap();
     assert_eq!(mapped_paddr, paddr);
     assert_eq!(page_size, PAGE_SIZE_16K);
+}
+
+#[test]
+fn absent_install_preserves_opaque_configuration() {
+    let mut page_table = PageTable::<OpaqueMeta, Fram4k>::new(Fram4k).unwrap();
+    let vaddr = VirtAddr::from_usize(0x4000);
+    let paddr = PhysAddr::from_usize(0x8000);
+    let config = OpaqueConfig {
+        domain: 0xa5,
+        present: true,
+    };
+    // SAFETY: this host-only table has no hardware users or previous mappings.
+    unsafe { page_table.install_absent_page(vaddr, paddr, config) }.unwrap();
+    assert_eq!(page_table.query(vaddr).unwrap(), (paddr, config, 0x1000));
+}
+
+#[test]
+fn absent_install_uses_the_metadata_base_page_size() {
+    let mut page_table = PageTable::<T16kL4, Fram16k>::new(Fram16k).unwrap();
+    let vaddr = VirtAddr::from_usize(PAGE_SIZE_16K);
+    let paddr = PhysAddr::from_usize(PAGE_SIZE_16K * 2);
+    // SAFETY: this host-only table has no hardware users or previous mappings.
+    unsafe { page_table.install_absent_page(vaddr, paddr, MappingFlags::READ.into()) }.unwrap();
+    let (mapped, _, size) = page_table.query(vaddr + PAGE_SIZE_16K - 1).unwrap();
+    assert_eq!(mapped, paddr + PAGE_SIZE_16K - 1);
+    assert_eq!(size, PAGE_SIZE_16K);
 }
 
 #[test]

@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log", required=True, type=pathlib.Path)
     parser.add_argument("--ready-file", required=True, type=pathlib.Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--kernel-only", action="store_true")
     parser.add_argument("--timeout", type=int, default=22_800)
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.run_id):
@@ -42,6 +43,12 @@ def append_output(log_file, data: bytes) -> None:
 
 def main() -> int:
     args = parse_args()
+    guest_command = GUEST_COMMAND
+    if args.kernel_only:
+        guest_command = (
+            "sh /opt/starry-orangepi5plus-selfbuild/init-kernel-selfbuild.sh "
+            f"{args.run_id}\r"
+        ).encode()
     args.log.parent.mkdir(parents=True, exist_ok=True)
     args.ready_file.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.timeout
@@ -80,7 +87,7 @@ def main() -> int:
                 for _ in range(new_prompts):
                     # Re-inject after a watchdog-caused StarryOS reboot as well.
                     # init.sh restores the Linux selector before doing any work.
-                    uart.write(GUEST_COMMAND)
+                    uart.write(guest_command)
                     uart.flush()
                     prompt_generation += 1
                     print(

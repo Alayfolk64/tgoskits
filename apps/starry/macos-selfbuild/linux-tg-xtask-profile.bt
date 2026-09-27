@@ -1,0 +1,199 @@
+/*
+ * Linux counterpart of the StarryOS in-kernel build profiler.
+ *
+ * Keep the primary sampling/event boundaries aligned with the guest:
+ * CPU 10 Hz, page cache 1/32, off-CPU 1/8, and complete lock/I/O waits.
+ */
+
+BEGIN
+{
+    @tracked[$1] = 1;
+}
+
+tracepoint:sched:sched_process_fork /@tracked[args.parent_pid]/
+{
+    @tracked[args.child_pid] = 1;
+}
+
+tracepoint:sched:sched_process_exit /@tracked[pid]/
+{
+    delete(@tracked[pid]);
+}
+
+profile:hz:10 /@tracked[pid]/
+{
+    @cpu[comm, kstack] = count();
+}
+
+kprobe:__mutex_lock_slowpath /@tracked[tid]/
+{
+    @mutex_active[tid] = 1;
+}
+
+kretprobe:__mutex_lock_slowpath
+{
+    delete(@mutex_active[tid]);
+}
+
+kprobe:rwsem_down_read_slowpath,
+kprobe:rwsem_down_write_slowpath /@tracked[tid]/
+{
+    @rwsem_active[tid] = 1;
+}
+
+kretprobe:rwsem_down_read_slowpath,
+kretprobe:rwsem_down_write_slowpath
+{
+    delete(@rwsem_active[tid]);
+}
+
+tracepoint:sched:sched_switch /@tracked[args.prev_pid] && args.prev_state != 0/
+{
+    @offcpu_tick[cpu] = @offcpu_tick[cpu] + 1;
+    if ((@offcpu_tick[cpu] & 7) == 1) {
+        @off_start[args.prev_pid] = nsecs;
+        @off_stack[args.prev_pid] = kstack;
+        @off_comm[args.prev_pid] = args.prev_comm;
+        @off_state[args.prev_pid] = args.prev_state;
+    }
+
+    if (@mutex_active[args.prev_pid]) {
+        @mutex_start[args.prev_pid] = nsecs;
+        @mutex_stack[args.prev_pid] = kstack;
+        @mutex_comm[args.prev_pid] = args.prev_comm;
+    }
+    if (@rwsem_active[args.prev_pid]) {
+        @rwsem_start[args.prev_pid] = nsecs;
+        @rwsem_stack[args.prev_pid] = kstack;
+        @rwsem_comm[args.prev_pid] = args.prev_comm;
+    }
+}
+
+tracepoint:sched:sched_switch
+{
+    if (@off_start[args.next_pid]) {
+        $elapsed = nsecs - @off_start[args.next_pid];
+        @offcpu[@off_comm[args.next_pid], @off_state[args.next_pid],
+                @off_stack[args.next_pid]] = sum($elapsed * 8);
+        @offcpu_count[@off_comm[args.next_pid], @off_state[args.next_pid],
+                      @off_stack[args.next_pid]] = count();
+        @offcpu_max[@off_comm[args.next_pid], @off_state[args.next_pid],
+                    @off_stack[args.next_pid]] = max($elapsed);
+        delete(@off_start[args.next_pid]);
+        delete(@off_stack[args.next_pid]);
+        delete(@off_comm[args.next_pid]);
+        delete(@off_state[args.next_pid]);
+    }
+
+    if (@mutex_start[args.next_pid]) {
+        $elapsed = nsecs - @mutex_start[args.next_pid];
+        @mutex[@mutex_comm[args.next_pid], @mutex_stack[args.next_pid]] = sum($elapsed);
+        @mutex_count[@mutex_comm[args.next_pid], @mutex_stack[args.next_pid]] = count();
+        @mutex_max[@mutex_comm[args.next_pid], @mutex_stack[args.next_pid]] = max($elapsed);
+        delete(@mutex_start[args.next_pid]);
+        delete(@mutex_stack[args.next_pid]);
+        delete(@mutex_comm[args.next_pid]);
+    }
+    if (@rwsem_start[args.next_pid]) {
+        $elapsed = nsecs - @rwsem_start[args.next_pid];
+        @rwsem[@rwsem_comm[args.next_pid], @rwsem_stack[args.next_pid]] = sum($elapsed);
+        @rwsem_count[@rwsem_comm[args.next_pid], @rwsem_stack[args.next_pid]] = count();
+        @rwsem_max[@rwsem_comm[args.next_pid], @rwsem_stack[args.next_pid]] = max($elapsed);
+        delete(@rwsem_start[args.next_pid]);
+        delete(@rwsem_stack[args.next_pid]);
+        delete(@rwsem_comm[args.next_pid]);
+    }
+}
+
+kprobe:filemap_fault,
+kprobe:filemap_read /@tracked[tid]/
+{
+    @page_tick[cpu] = @page_tick[cpu] + 1;
+    if ((@page_tick[cpu] & 31) == 1) {
+        @page_start[tid] = nsecs;
+        @page_stack[tid] = kstack;
+        @page_comm[tid] = comm;
+    }
+}
+
+kretprobe:filemap_fault,
+kretprobe:filemap_read /@page_start[tid]/
+{
+    $elapsed = nsecs - @page_start[tid];
+    @pagecache[@page_comm[tid], @page_stack[tid]] = sum($elapsed * 32);
+    @pagecache_count[@page_comm[tid], @page_stack[tid]] = count();
+    @pagecache_max[@page_comm[tid], @page_stack[tid]] = max($elapsed);
+    delete(@page_start[tid]);
+    delete(@page_stack[tid]);
+    delete(@page_comm[tid]);
+}
+
+kprobe:ext4_file_read_iter,
+kprobe:ext4_buffered_write_iter /@tracked[tid]/
+{
+    @ext4_tick[cpu] = @ext4_tick[cpu] + 1;
+    if ((@ext4_tick[cpu] & 15) == 1) {
+        @ext4_start[tid] = nsecs;
+        @ext4_stack[tid] = kstack;
+        @ext4_comm[tid] = comm;
+    }
+}
+
+kretprobe:ext4_file_read_iter,
+kretprobe:ext4_buffered_write_iter /@ext4_start[tid]/
+{
+    $elapsed = nsecs - @ext4_start[tid];
+    @ext4[@ext4_comm[tid], @ext4_stack[tid]] = sum($elapsed * 16);
+    @ext4_count[@ext4_comm[tid], @ext4_stack[tid]] = count();
+    @ext4_max[@ext4_comm[tid], @ext4_stack[tid]] = max($elapsed);
+    delete(@ext4_start[tid]);
+    delete(@ext4_stack[tid]);
+    delete(@ext4_comm[tid]);
+}
+
+kprobe:io_schedule /@tracked[tid]/
+{
+    @block_sync_start[tid] = nsecs;
+    @block_sync_stack[tid] = kstack;
+    @block_sync_comm[tid] = comm;
+}
+
+kretprobe:io_schedule /@block_sync_start[tid]/
+{
+    $elapsed = nsecs - @block_sync_start[tid];
+    @block_sync[@block_sync_comm[tid], @block_sync_stack[tid]] = sum($elapsed);
+    @block_sync_count[@block_sync_comm[tid], @block_sync_stack[tid]] = count();
+    @block_sync_max[@block_sync_comm[tid], @block_sync_stack[tid]] = max($elapsed);
+    delete(@block_sync_start[tid]);
+    delete(@block_sync_stack[tid]);
+    delete(@block_sync_comm[tid]);
+}
+
+END
+{
+    clear(@tracked);
+    clear(@offcpu_tick);
+    clear(@page_tick);
+    clear(@ext4_tick);
+    clear(@mutex_active);
+    clear(@rwsem_active);
+    clear(@off_start);
+    clear(@off_stack);
+    clear(@off_comm);
+    clear(@off_state);
+    clear(@mutex_start);
+    clear(@mutex_stack);
+    clear(@mutex_comm);
+    clear(@rwsem_start);
+    clear(@rwsem_stack);
+    clear(@rwsem_comm);
+    clear(@page_start);
+    clear(@page_stack);
+    clear(@page_comm);
+    clear(@ext4_start);
+    clear(@ext4_stack);
+    clear(@ext4_comm);
+    clear(@block_sync_start);
+    clear(@block_sync_stack);
+    clear(@block_sync_comm);
+}

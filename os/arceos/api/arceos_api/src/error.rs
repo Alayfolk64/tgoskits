@@ -108,8 +108,6 @@ fn vfs_error_to_io_error(error: VfsError) -> IoError {
         VfsError::BadFileDescriptor => IoError::BadFileDescriptor,
         VfsError::BadState => IoError::BadState,
         VfsError::CrossesDevices => IoError::CrossesDevices,
-        // These VFS categories have no exact `ax-io` representation. Keep
-        // them exact for VFS/POSIX callers and degrade only at this facade.
         VfsError::DataMissing => IoError::InvalidData,
         VfsError::DirectoryNotEmpty => IoError::DirectoryNotEmpty,
         VfsError::FilesystemCorrupted => IoError::InvalidData,

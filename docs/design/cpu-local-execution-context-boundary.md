@@ -91,9 +91,13 @@ context-switch resume handoff may replace a CPU-owned switch token.
 
 `finish_preemption` consumes a nested or non-pending final depth. A final
 pending exit returns `PendingPreemption` while depth one remains published.
-`ax-runtime` masks local IRQs, mirrors task work into the pending bit, claims a
-per-CPU scheduler baton, releases the pending depth, clears the mirror, and only
-then invokes the task safe point. The baton stays in `ax-runtime`: every
+Task request events publish the pending bit through `ax-runtime` while IRQs
+are excluded. Ordinary guard exits consume their token without mirroring task
+policy again. A final pending exit makes `ax-runtime` mask local IRQs, claim a
+per-CPU scheduler baton, release the pending depth, clear the mirror, and only
+then invoke the task safe point. Scheduler completion reconciles incoming task
+policy before IRQ enable. See `event-driven-preemption.md` for the measured
+motivation and interrupt interleavings. The baton stays in `ax-runtime`: every
 switch-capable task path claims it before selecting the next task, a raw switch
 transfers it to the incoming continuation, and the resumed or first-entry tail
 consumes it before enabling local IRQs. The task layer never manipulates the
@@ -107,11 +111,13 @@ If the suspended context resumes on the same CPU, its token retains the same
 owner. If it resumes on another CPU, the old CPU's incoming context has consumed
 the old switch depth and the destination CPU's outgoing context has left an
 equivalent depth. The incoming runtime tail therefore consumes the old linear
-proof and uses `handoff_preemption_after_context_switch` to adopt the destination
-CPU's depth before finishing the guard. A context running for the first time has
+proof and uses `finish_current_preemption` to resolve the destination anchor
+under that inherited depth and adopt it before finishing the guard. The explicit
+pinned `handoff_preemption_after_context_switch` API remains available to other
+switch owners. A context running for the first time has
 no suspended caller, so its first-entry runtime tail invokes
 `release_initial_context_preemption`. Load/store architectures migrate the
-context-owned word itself, reject any owner change, and start a new context at
+context-owned word itself, preserve its captured token owner, and start a new context at
 depth zero.
 
 ## Alternatives rejected

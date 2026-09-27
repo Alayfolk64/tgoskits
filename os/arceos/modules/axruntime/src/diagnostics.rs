@@ -1,14 +1,15 @@
 //! Runtime observations for scheduler and execution-context diagnostics.
 
 #[cfg(feature = "profile")]
-pub use crate::thread::{
-    context::current_kernel_stack_range,
-    scheduler_events::register_timer_profile_hook,
-};
+pub use ax_sync::{ProfileEvent, register_profile_hooks};
 
 #[cfg(feature = "qperf-metrics")]
 pub use crate::thread::scheduler_events::{
     QperfRuntimeSchedulerMetricsSnapshot, qperf_runtime_scheduler_metrics_snapshot,
+};
+#[cfg(feature = "profile")]
+pub use crate::thread::{
+    context::current_kernel_stack_range, scheduler_events::register_timer_profile_hook,
 };
 pub use crate::thread::{
     context::diagnose_current_stack_guard_page_fault,
@@ -17,6 +18,3 @@ pub use crate::thread::{
     },
     scheduler_events::timer_irq_count,
 };
-
-#[cfg(feature = "profile")]
-pub use ax_sync::{ProfileEvent, register_profile_hooks};

@@ -9,7 +9,6 @@ pub(crate) mod card1;
 #[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
 mod dmaheap;
 mod drm;
-mod vblank;
 pub mod event;
 mod fb;
 #[cfg(feature = "sg2002")]
@@ -35,6 +34,7 @@ mod sync_file;
 #[cfg(feature = "sg2002")]
 pub mod tpu;
 pub mod tty;
+mod vblank;
 
 #[cfg(feature = "sg2002-cvi-usb-camera")]
 mod cvi_jpu;
@@ -67,6 +67,7 @@ use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, Simple
 const RANDOM_SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 static RANDOM_SEED_COUNTER: AtomicU64 = AtomicU64::new(0xa076_1d64_78bd_642f);
+static RANDOM_SOURCE: OnceLock<Arc<Random>> = OnceLock::new();
 
 static INITIAL_PTS_INSTANCE: OnceLock<Arc<tty::PtsInstance>> = OnceLock::new();
 
@@ -202,6 +203,16 @@ impl DeviceOps for Zero {
 
 struct Random {
     state: Mutex<RandomState>,
+}
+
+/// Reads the kernel random source without resolving a process-visible path.
+/// The source is shared with random device nodes, including their entropy writes.
+pub(crate) fn read_random(buf: &mut [u8]) -> VfsResult<usize> {
+    random_source().read_at(buf, 0)
+}
+
+fn random_source() -> &'static Arc<Random> {
+    RANDOM_SOURCE.call_once(|| Arc::new(Random::new()))
 }
 
 impl Random {
@@ -466,7 +477,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 8),
-            Arc::new(Random::new()),
+            random_source().clone(),
         ),
     );
     root.add(
@@ -475,7 +486,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 9),
-            Arc::new(Random::new()),
+            random_source().clone(),
         ),
     );
     // Root block device node. Its rdev must equal the root filesystem's st_dev

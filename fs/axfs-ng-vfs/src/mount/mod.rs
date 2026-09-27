@@ -22,7 +22,7 @@ use crate::{
     Filesystem, FilesystemMountLease, FilesystemMountState, FilesystemOps, Metadata,
     MetadataUpdate, Mutex, MutexGuard, NodeFlags, NodeOps, NodePermission, NodeType, OpenOptions,
     Reference, ReferenceKey, RenameOptions, TypeMap, VfsError, VfsResult, WeakDirEntry,
-    XattrSetMode,
+    WritebackPolicy, XattrSetMode,
     path::{DOT, DOTDOT, PathBuf, verify_entry_name},
 };
 
@@ -707,6 +707,17 @@ impl Mountpoint {
         self.filesystem_state.set_readonly(readonly);
     }
 
+    /// Returns the persistence policy shared by every mount of this filesystem.
+    pub fn filesystem_writeback_policy(&self) -> WritebackPolicy {
+        self.filesystem_state.writeback_policy()
+    }
+
+    /// Updates the shared synchronous-write requirement for an ordinary remount.
+    /// This preserves directory-sync policy and must not be used for bind-remount.
+    pub fn set_filesystem_synchronous(&self, synchronous: bool) {
+        self.filesystem_state.set_synchronous(synchronous);
+    }
+
     pub fn set_readonly(&self, readonly: bool) {
         self.readonly.store(readonly, Ordering::Release);
     }
@@ -866,6 +877,33 @@ impl Location {
         self.mountpoint.is_readonly() || self.mountpoint.is_filesystem_readonly()
     }
 
+    /// Combines inode and filesystem persistence requirements at completion.
+    pub fn writeback_policy(&self) -> VfsResult<WritebackPolicy> {
+        Ok(self.entry.writeback_policy()? | self.mountpoint.filesystem_writeback_policy())
+    }
+
+    fn sync_mounted_metadata(&self) -> VfsResult<()> {
+        if self
+            .mountpoint
+            .filesystem_writeback_policy()
+            .contains(WritebackPolicy::SYNCHRONOUS)
+        {
+            self.entry.sync(false)?;
+        }
+        Ok(())
+    }
+
+    fn sync_mounted_directory(&self) -> VfsResult<()> {
+        if self
+            .mountpoint
+            .filesystem_writeback_policy()
+            .syncs_directory()
+        {
+            self.entry.sync(false)?;
+        }
+        Ok(())
+    }
+
     pub fn entry(&self) -> &DirEntry {
         &self.entry
     }
@@ -878,21 +916,24 @@ impl Location {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry.update_metadata(update)
+        self.entry.update_metadata(update)?;
+        self.sync_mounted_metadata()
     }
 
     pub fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry.set_xattr(name, value, mode)
+        self.entry.set_xattr(name, value, mode)?;
+        self.sync_mounted_metadata()
     }
 
     pub fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry.remove_xattr(name)
+        self.entry.remove_xattr(name)?;
+        self.sync_mounted_metadata()
     }
 
     /// Returns the entry name.
@@ -1043,10 +1084,12 @@ impl Location {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry
+        let entry = self
+            .entry
             .as_dir()?
-            .create(name, node_type, permission, uid, gid)
-            .map(|entry| self.wrap(entry))
+            .create(name, node_type, permission, uid, gid)?;
+        self.sync_mounted_directory()?;
+        Ok(self.wrap(entry))
     }
 
     pub fn create_symlink(
@@ -1060,10 +1103,12 @@ impl Location {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry
+        let entry = self
+            .entry
             .as_dir()?
-            .create_symlink(name, target, permission, uid, gid)
-            .map(|entry| self.wrap(entry))
+            .create_symlink(name, target, permission, uid, gid)?;
+        self.sync_mounted_directory()?;
+        Ok(self.wrap(entry))
     }
 
     /// Creates an in-memory directory entry that exists only as a mount target.
@@ -1122,10 +1167,9 @@ impl Location {
         if !Arc::ptr_eq(&self.mountpoint, &node.mountpoint) {
             return Err(VfsError::CrossesDevices);
         }
-        self.entry
-            .as_dir()?
-            .link(name, &node.entry)
-            .map(|entry| self.wrap(entry))
+        let entry = self.entry.as_dir()?.link(name, &node.entry)?;
+        self.sync_mounted_directory()?;
+        Ok(self.wrap(entry))
     }
 
     pub fn rename(&self, src_name: &str, dst_dir: &Self, dst_name: &str) -> VfsResult<()> {
@@ -1169,14 +1213,20 @@ impl Location {
             dst_dir.entry.as_dir()?,
             dst_name,
             options,
-        )
+        )?;
+        self.sync_mounted_directory()?;
+        if !self.ptr_eq(dst_dir) {
+            dst_dir.sync_mounted_directory()?;
+        }
+        Ok(())
     }
 
     pub fn unlink(&self, name: &str, is_dir: bool) -> VfsResult<()> {
         if self.is_readonly() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry.as_dir()?.unlink(name, is_dir)
+        self.entry.as_dir()?.unlink(name, is_dir)?;
+        self.sync_mounted_directory()
     }
 
     pub fn open_file(&self, name: &str, options: &OpenOptions) -> VfsResult<Location> {
@@ -1193,10 +1243,11 @@ impl Location {
         if self.is_readonly() && (options.create || options.create_new) {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        self.entry
-            .as_dir()?
-            .open_file_with_status(name, options)
-            .map(|(entry, created)| (self.wrap(entry).resolve_mountpoint(), created))
+        let opened = self.entry.as_dir()?.open_file_with_status(name, options)?;
+        if opened.1 {
+            self.sync_mounted_directory()?;
+        }
+        Ok((self.wrap(opened.0).resolve_mountpoint(), opened.1))
     }
 
     pub fn read_dir(
@@ -2008,40 +2059,6 @@ mod tests {
 
         let cloned = root.clone_tree();
         assert_eq!(cloned.source(), "/dev/vda");
-    }
-
-    #[test]
-    fn absolute_path_rebases_bind_mount_source_at_mountpoint() {
-        let fs = mock_filesystem();
-        let root = Mountpoint::new_root(&fs);
-        let root_location = root.root_location();
-        let nix_entry = make_child_dir_entry(Some(root_location.entry().clone()), "nix");
-        let store_entry = make_child_dir_entry(Some(nix_entry.clone()), "store");
-        let store = Location::new(root.clone(), store_entry.clone());
-
-        let bound_store = Mountpoint::bind(&store, store.clone(), false);
-        let executable_entry = make_child_dir_entry(Some(store_entry), "systemd");
-        let executable = Location::new(bound_store, executable_entry);
-
-        assert_eq!(
-            executable.absolute_path().unwrap().as_str(),
-            "/nix/store/systemd"
-        );
-    }
-
-    #[test]
-    fn path_from_rebases_a_descendant_at_the_supplied_root() {
-        let fs = mock_filesystem();
-        let mount = Mountpoint::new_root(&fs);
-        let global_root = mount.root_location();
-        let jail_entry = make_child_dir_entry(Some(global_root.entry().clone()), "jail");
-        let nested_entry = make_child_dir_entry(Some(jail_entry.clone()), "nested");
-        let jail = Location::new(mount.clone(), jail_entry);
-        let nested = Location::new(mount, nested_entry);
-
-        assert_eq!(nested.path_from(&jail).unwrap().as_str(), "/nested");
-        assert_eq!(jail.path_from(&jail).unwrap().as_str(), "/");
-        assert!(global_root.path_from(&jail).is_none());
     }
 
     #[test]

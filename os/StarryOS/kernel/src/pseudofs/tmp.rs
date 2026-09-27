@@ -712,16 +712,12 @@ impl DirNodeOps for MemoryNode {
         uid: u32,
         gid: u32,
     ) -> VfsResult<DirEntry> {
-        let target = target.to_owned();
-        let target_len = target.len() as u64;
         let dir = self.inode.as_dir()?;
-        {
-            let entries = dir.entries.lock();
-            if entries.contains_key(name) {
-                return Err(VfsError::AlreadyExists);
-            }
+        if dir.entries.lock().contains_key(name) {
+            return Err(VfsError::AlreadyExists);
         }
-        self.fs.resize_usage(0, target_len)?;
+        let target = target.to_owned();
+        self.fs.resize_usage(0, target.len() as u64)?;
         let inode = Inode::new(
             &self.fs,
             Some(self.inode.ino),
@@ -731,40 +727,28 @@ impl DirNodeOps for MemoryNode {
             gid,
             TMPFS_NESTED_DIR_ENTRIES_SUBCLASS,
         );
-        let NodeContent::File(file) = &inode.content else {
-            self.fs
-                .used_bytes
-                .fetch_sub(target_len, AtomicOrdering::AcqRel);
-            drop(self.fs.inodes.lock().remove(inode.ino as usize - 1));
-            return Err(VfsError::InvalidData);
-        };
-        file.length.store(target_len, AtomicOrdering::Release);
-        // The symlink payload uses a sleepable mutex. Initialize it before taking the
-        // IRQ-safe directory lock so no blocking lock is acquired in atomic context.
+        // Inode::new always gives non-directory inodes FileContent. Initialize
+        // its sleepable target before taking the namespace's IRQ-safe lock.
+        let file = inode
+            .as_file()
+            .expect("a new symlink inode has file content");
+        file.length
+            .store(target.len() as u64, AtomicOrdering::Release);
         *file.symlink.lock() = Some(target);
-
-        let entry = DirEntry::new_file(
-            FileNode::new(MemoryNode::new(self.fs.clone(), inode.clone(), None)),
-            NodeType::Symlink,
-            Reference::new(
-                self.this.as_ref().and_then(WeakDirEntry::upgrade),
-                name.to_owned(),
-            ),
-        );
+        let ino = inode.ino;
+        let entry = self.new_entry(name, NodeType::Symlink, inode)?;
         let mut entries = dir.entries.lock();
         if entries.contains_key(name) {
             drop(entries);
+            // The unpublished entry is the sole inode owner outside the slab.
+            // Its drop removes the inode; Inode::drop refunds the charge once.
             drop(entry);
-            self.fs
-                .used_bytes
-                .fetch_sub(target_len, AtomicOrdering::AcqRel);
-            release_inode(&self.fs, &inode, 0);
             return Err(VfsError::AlreadyExists);
         }
         let cookie = dir.next_cookie.fetch_add(1, AtomicOrdering::Relaxed);
         entries.insert(
             name.into(),
-            InodeRef::new(self.fs.clone(), inode.ino, NodeType::Symlink, cookie),
+            InodeRef::new(self.fs.clone(), ino, NodeType::Symlink, cookie),
         );
         Ok(entry)
     }

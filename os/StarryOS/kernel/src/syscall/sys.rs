@@ -1000,25 +1000,18 @@ pub fn sys_getrandom(
 
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 
-    let path = if flags.contains(GetRandomFlags::RANDOM) {
-        "/dev/random"
-    } else {
-        "/dev/urandom"
-    };
-
     // Linux `import_ubuf()` limits the iterator before feeding it to the
     // random source. Bound the request equivalently, and reject an address
     // range that wraps before touching the random device.
     let len = len.min(GETRANDOM_MAX_LEN);
     (buf as usize).checked_add(len).ok_or(Errno::EFAULT)?;
 
-    let f = ax_fs_ng::vfs::current_fs_context().lock().resolve(path)?;
-    let file = f.entry().as_file()?;
     let mut kbuf = [0u8; GETRANDOM_CHUNK_SIZE];
     let mut written = 0;
     while written < len {
         let chunk_len = (len - written).min(kbuf.len());
-        let read = file.read_at(&mut kbuf[..chunk_len], 0)?;
+        // getrandom is independent of chroot, mount namespaces and /dev nodes.
+        let read = crate::pseudofs::dev::read_random(&mut kbuf[..chunk_len])?;
         if read == 0 {
             break;
         }

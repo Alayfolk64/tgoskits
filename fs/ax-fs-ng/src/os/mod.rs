@@ -5,6 +5,7 @@ pub mod memory;
 pub mod sync;
 pub mod task;
 pub mod time;
+pub(crate) mod waiters;
 
 pub use dma::{dma_op, has_dma_op, install_dma_op};
 pub use entropy::{FsEntropyProvider, fill_entropy, has_entropy_provider, set_entropy_provider};

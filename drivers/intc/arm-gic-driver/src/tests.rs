@@ -33,14 +33,14 @@ fn test_v4_rd() {
 #[should_panic]
 fn test_sgi() {
     let id = IntId::sgi(40);
-    assert_eq!(id.is_sgi(), true);
+    assert!(id.is_sgi());
 }
 
 #[test]
 #[should_panic]
 fn test_ppi() {
     let id = IntId::ppi(17);
-    assert_eq!(id.is_private(), true);
+    assert!(id.is_private());
 }
 
 #[test]

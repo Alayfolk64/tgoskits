@@ -1,0 +1,14 @@
+# Match the package's 8-vCPU QEMU contract, without changing other board limits.
+features = [
+  "ax-driver/nvme",
+  "ax-driver/virtio-net",
+  "ax-driver/virtio-gpu",
+  "ax-driver/virtio-input",
+  "ax-driver/virtio-socket",
+  "ax-runtime/input",
+  "ax-runtime/vsock",
+  "starry-kernel/ext4",
+]
+max_cpu_num = 8
+log = "Warn"
+target = "aarch64-unknown-none-softfloat"

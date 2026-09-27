@@ -66,13 +66,20 @@ keeps architecture choices below the shared CPU-local and runtime APIs.
 
 On a CPU-owned preemption architecture, the exclusion covering a raw context
 switch belongs to the CPU where each side executes. If a suspended context
-resumes on another CPU, the runtime uses the hidden
-`handoff_preemption_after_context_switch` operation to consume its old linear
-proof and adopt the equivalent switch depth left on the resumed CPU. A context
+resumes on another CPU, `finish_current_preemption` consumes its old linear
+proof and adopts the equivalent switch depth left on the resumed CPU before
+finishing it. The explicit pinned `handoff_preemption_after_context_switch`
+operation remains available to other switch owners. A context
 running for the first time has no suspended caller, so its first-entry tail uses
 the hidden `release_initial_context_preemption` operation. Context-owned
 architectures keep the original token owner, start the new header enabled, and
 perform neither CPU-owner transfer nor initial release.
+
+Runtime request events publish pending work before ordinary guard exits need
+to inspect it. A nested or non-pending current exit needs no CPU pin on a
+context-owned architecture. Pending results retain the final exclusion until
+the runtime masks IRQs and claims its safe point; IRQ policy stays outside this
+crate. See `docs/design/event-driven-preemption.md` in the workspace.
 
 `CpuPin` can only be created by the higher-ranked `with_cpu_pin` boundary and
 cannot escape its migration guard. `ExclusiveCpu` additionally represents

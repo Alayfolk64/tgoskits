@@ -10,8 +10,11 @@ use core::{
 
 use ax_lazyinit::LazyInit;
 use ax_runtime::{
-    hal::{self, cpu::trap::{InterruptedContext as TrapContext, InterruptedPrivilege}},
     diagnostics::ProfileEvent,
+    hal::{
+        self,
+        cpu::trap::{InterruptedContext as TrapContext, InterruptedPrivilege},
+    },
 };
 
 use crate::sync::IrqMutex;
@@ -24,7 +27,7 @@ const SAMPLE_PERIOD_NS: u64 = 100_000_000;
 const EXT4_SAMPLE_RATE: u32 = 16;
 const PAGE_CACHE_SAMPLE_RATE: u32 = 32;
 const OFFCPU_SAMPLE_RATE: u32 = 8;
-const EVENT_COUNT: usize = 8;
+const EVENT_COUNT: usize = ProfileEvent::BlockFlush as usize + 1;
 const USER_SPACE_FRAME: usize = usize::MAX;
 const TASK_NAME_LEN: usize = 16;
 
@@ -462,7 +465,9 @@ fn profile_wait_begin(event: ProfileEvent, _object: usize) -> u64 {
 
     let stack = capture_current_stack();
     let started_ns = hal::time::monotonic_time_nanos();
-    let task_id = ax_runtime::task::thread::current::current_thread_id().map(|id| id.as_u64()).unwrap_or(0);
+    let task_id = ax_runtime::task::thread::current::current_thread_id()
+        .map(|id| id.as_u64())
+        .unwrap_or(0);
     let mut state = profile.state.lock();
     for offset in 0..PENDING_SIZE {
         let index = (state.next_pending + offset) % PENDING_SIZE;
@@ -506,7 +511,10 @@ fn profile_wait_end(token: u64) {
     let pending = state.pending[index];
     if !pending.active
         || pending.generation != generation
-        || pending.task_id != ax_runtime::task::thread::current::current_thread_id().map(|id| id.as_u64()).unwrap_or(0)
+        || pending.task_id
+            != ax_runtime::task::thread::current::current_thread_id()
+                .map(|id| id.as_u64())
+                .unwrap_or(0)
     {
         return;
     }
@@ -612,8 +620,9 @@ pub fn snapshot() -> String {
 
     let mut output = format!(
         "STARRY_PROFILE_V1 sample_hz=10 ext4_sample_rate={} page_cache_sample_rate={} \
-         offcpu_sample_rate={} enabled={} phase={} prebuild_ns={} dropped_cpu={} dropped_wait={} \
-         dropped_pending={} skipped_cpu={}\n",
+         offcpu_sample_rate={} ext4_hold_sample_rate=1 block_flush_sample_rate=1 enabled={} \
+         phase={} prebuild_ns={} dropped_cpu={} dropped_wait={} dropped_pending={} \
+         skipped_cpu={}\n",
         EXT4_SAMPLE_RATE,
         PAGE_CACHE_SAMPLE_RATE,
         OFFCPU_SAMPLE_RATE,
@@ -628,11 +637,12 @@ pub fn snapshot() -> String {
     output.push_str(
         "STARRY_PHASE 1 prebuild\nSTARRY_EVENT 1 mutex_wait\nSTARRY_EVENT 2 ext4\nSTARRY_EVENT 3 \
          page_cache\nSTARRY_EVENT 4 block_read\nSTARRY_EVENT 5 block_write\nSTARRY_EVENT 6 \
-         offcpu\nSTARRY_EVENT 7 ext4_lock_wait\n",
+         offcpu\nSTARRY_EVENT 7 ext4_lock_wait\nSTARRY_EVENT 8 ext4_lock_hold\nSTARRY_EVENT 9 \
+         block_flush\n",
     );
 
     if let Some(profiles) = PROFILES.get() {
-        for profile in profiles {
+        for (cpu, profile) in profiles.iter().enumerate() {
             let mut cpu_entries = Vec::with_capacity(CPU_TABLE_SIZE);
             let mut wait_entries = Vec::with_capacity(WAIT_TABLE_SIZE);
             {
@@ -643,8 +653,8 @@ pub fn snapshot() -> String {
             for entry in &cpu_entries {
                 let _ = write!(
                     output,
-                    "STARRY_CPU phase={} samples={} task=",
-                    entry.phase, entry.total
+                    "STARRY_CPU phase={} cpu={} samples={} task=",
+                    entry.phase, cpu, entry.total
                 );
                 write_task_name(&mut output, &entry.stack.task_name);
                 output.push_str(" stack=");
@@ -654,8 +664,8 @@ pub fn snapshot() -> String {
             for entry in &wait_entries {
                 let _ = write!(
                     output,
-                    "STARRY_WAIT phase={} event={} count={} total_ns={} max_ns={} task=",
-                    entry.phase, entry.event, entry.count, entry.total, entry.max
+                    "STARRY_WAIT phase={} cpu={} event={} count={} total_ns={} max_ns={} task=",
+                    entry.phase, cpu, entry.event, entry.count, entry.total, entry.max
                 );
                 write_task_name(&mut output, &entry.stack.task_name);
                 output.push_str(" stack=");

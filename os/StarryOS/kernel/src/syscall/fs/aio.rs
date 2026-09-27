@@ -765,8 +765,7 @@ fn execute_read(
 fn execute_write(target: &AioWriteTarget, offset: u64, data: &[u8]) -> StarryResult<isize> {
     match target {
         AioWriteTarget::File(file) => {
-            let file = file.inner().access(FileFlags::WRITE)?;
-            Ok(file.write_at(data, offset).map(|n| n as isize)?)
+            Ok(file.inner().write_at(data, offset).map(|n| n as isize)?)
         }
         AioWriteTarget::Memfd(memfd) => memfd.write_at(data, offset).map(|n| n as isize),
     }

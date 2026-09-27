@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 int main(void)
@@ -28,8 +29,8 @@ int main(void)
     unlink(file);
     int fd0 = open(file, O_CREAT | O_WRONLY, 0644);
     if (fd0 < 0) { perror("setup"); return 1; }
-    write(fd0, "hi", 2);
-    close(fd0);
+    if (write(fd0, "hi", 2) != 2) { perror("setup write"); close(fd0); return 1; }
+    if (close(fd0) != 0) { perror("setup close"); return 1; }
 
     int fd = open(file, O_RDONLY | O_APPEND);
     if (fd < 0) {
@@ -47,17 +48,38 @@ int main(void)
     /* write MUST fail with EBADF (RDONLY) */
     errno = 0;
     ssize_t w = write(fd, "X", 1);
-    int write_ok = (w == -1 && errno == EBADF);
+    int write_errno = errno;
+    int write_ok = (w == -1 && write_errno == EBADF);
 
     int ok = read_ok && write_ok;
-    if (ok) {
-        printf("PASS: O_RDONLY|O_APPEND fd is read-only (read works, write -> EBADF)\n");
-    } else {
+    if (!ok) {
         printf("FAIL: read=%zd (want 2 + content 'hi') write=%zd errno=%d (%s) (want -1 EBADF)\n",
-               r, w, errno, strerror(errno));
+               r, w, write_errno, strerror(write_errno));
     }
 
     close(fd);
+
+    /* A rejected append must not pre-seek to EOF, with or without sync flags.
+     * These calls exercise the raw ABI and begin at a non-EOF cursor. */
+    const int sync_flags[] = { 0, O_DSYNC, O_SYNC };
+    for (size_t i = 0; i < sizeof(sync_flags) / sizeof(sync_flags[0]); ++i) {
+        fd = syscall(SYS_openat, AT_FDCWD, file, O_RDONLY | O_APPEND | sync_flags[i], 0);
+        if (fd < 0) { perror("open readonly append sync"); ok = 0; break; }
+        errno = 0;
+        long result = syscall(SYS_write, fd, "X", 1);
+        int saved_errno = errno;
+        long position = syscall(SYS_lseek, fd, 0, SEEK_CUR);
+        if (result != -1 || saved_errno != EBADF || position != 0) {
+            printf("FAIL: append flags=%#x write=%ld errno=%d (%s) cursor=%ld; "
+                   "expected -1 EBADF and cursor=0\n", sync_flags[i], result,
+                   saved_errno, strerror(saved_errno), position);
+            ok = 0;
+        }
+        if (close(fd) != 0) { perror("close readonly append sync"); ok = 0; }
+    }
     unlink(file);
+    if (ok) {
+        printf("PASS: readonly append rejects writes without moving the cursor, including sync flags\n");
+    }
     return ok ? 0 : 1;
 }

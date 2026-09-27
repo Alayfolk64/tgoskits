@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod area;
 mod backend;
+mod gaps;
 mod set;
 
 #[cfg(test)]

@@ -1049,6 +1049,7 @@ fn axio_iobuf_extension_specialization_rules_hold() {
         let mut fixed_writer = &mut fixed[..];
         let mut reader: &[u8] = b"abcdef";
         assert_eq!(fixed_writer.read_from(&mut reader).unwrap(), 4);
+        assert_eq!(fixed_writer.remaining_mut(), 0);
         assert_eq!(reader, b"ef");
     }
     assert_eq!(&fixed, b"abcd");

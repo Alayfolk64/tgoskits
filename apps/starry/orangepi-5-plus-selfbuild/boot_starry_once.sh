@@ -71,6 +71,7 @@ ssh_args=(
 rsync -a -e "ssh -p $ssh_port" \
     "$app_dir/boot_script_is_starry.sh" \
     "$app_dir/boot_starry_once_remote.sh" \
+    "$app_dir/ensure_linux_fsck.sh" \
     "$app_dir/validate_sha256.sh" \
     "$remote:$remote_app/incoming/"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
@@ -81,6 +82,9 @@ ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/boot_starry_once_remote.sh" \
     "$remote_app/boot_starry_once_remote.sh"
+ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
+    "$remote_app/incoming/ensure_linux_fsck.sh" \
+    "$remote_app/ensure_linux_fsck.sh"
 
 set +e
 timeout --signal=TERM --kill-after=2 30 \

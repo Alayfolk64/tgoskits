@@ -1,4 +1,4 @@
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 use core::arch::asm;
 #[cfg(target_arch = "aarch64")]

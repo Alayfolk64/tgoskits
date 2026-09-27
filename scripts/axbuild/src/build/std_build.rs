@@ -442,12 +442,14 @@ pub(super) fn std_linker_wrapper_script(
     fake_lib_dir: &Path,
 ) -> anyhow::Result<String> {
     let machine = lld_machine_for_std_target(target)?;
+    let target_cc = musl_cc_for_std_target(target)?;
     Ok(format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
 fake_dir={}
 target_name={}
+target_cc={}
 lld_args=("-m" "{}")
 link_search_dirs=()
 archive_args=()
@@ -575,8 +577,7 @@ done
 
 linker_script="$(find_linker_script)"
 if [[ -z "$linker_script" ]]; then
-    echo "failed to find linker.x in current linker search dirs for $target_name" >&2
-    exit 1
+    exec "$target_cc" "$@"
 fi
 
 flush_archive_group
@@ -585,8 +586,23 @@ exec rust-lld -flavor gnu "${{lld_args[@]}}"
 "#,
         shell_single_quote(&fake_lib_dir.display().to_string()),
         shell_single_quote(target),
+        shell_single_quote(target_cc),
         machine,
     ))
+}
+
+fn musl_cc_for_std_target(target: &str) -> anyhow::Result<&'static str> {
+    if target.starts_with("x86_64-") {
+        Ok("x86_64-linux-musl-cc")
+    } else if target.starts_with("aarch64-") {
+        Ok("aarch64-linux-musl-cc")
+    } else if target.starts_with("riscv64") {
+        Ok("riscv64-linux-musl-cc")
+    } else if target.starts_with("loongarch64-") {
+        Ok("loongarch64-linux-musl-cc")
+    } else {
+        bail!("unsupported ArceOS std linker target `{target}`")
+    }
 }
 
 pub(super) fn lld_machine_for_std_target(target: &str) -> anyhow::Result<&'static str> {

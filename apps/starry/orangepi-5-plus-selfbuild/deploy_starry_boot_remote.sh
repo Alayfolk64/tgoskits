@@ -58,8 +58,11 @@ esac
 root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
 [ "$root_partuuid" = "$expected_root_partuuid" ] \
     || fail "root PARTUUID changed: $root_partuuid"
-findmnt -n -o OPTIONS / | tr ',' '\n' | grep -qx rw \
-    || fail "Linux root filesystem is not writable"
+root_options=$(findmnt -n -o OPTIONS /)
+case ",$root_options," in
+    *,rw,*) ;;
+    *) fail "Linux root filesystem is not writable" ;;
+esac
 
 grep -qx 'starry_fit=/image.fit' "$incoming/starryEnv.txt" \
     || fail "staged starryEnv.txt has an unexpected FIT path"
@@ -69,11 +72,9 @@ grep -qx "starry_root=PARTUUID=$root_partuuid" "$incoming/starryEnv.txt" \
 install -m 0644 "$incoming/image.fit" /image.fit.new
 install -m 0644 "$incoming/boot-starryos-emmc.scr" /boot/boot-starryos-emmc.scr.new
 install -m 0644 "$incoming/starryEnv.txt" /boot/starryEnv.txt.new
-printf '%s  %s\n' "$expected_fit_sha" /image.fit.new | sha256sum -c - >/dev/null
-printf '%s  %s\n' "$expected_boot_sha" /boot/boot-starryos-emmc.scr.new \
-    | sha256sum -c - >/dev/null
-printf '%s  %s\n' "$expected_env_sha" /boot/starryEnv.txt.new \
-    | sha256sum -c - >/dev/null
+sha256sum -c - <<< "$expected_fit_sha  /image.fit.new"
+sha256sum -c - <<< "$expected_boot_sha  /boot/boot-starryos-emmc.scr.new"
+sha256sum -c - <<< "$expected_env_sha  /boot/starryEnv.txt.new"
 
 # Flush every temporary file before its same-filesystem atomic rename. The
 # persistent Linux boot selector remains untouched throughout deployment.
@@ -83,11 +84,9 @@ mv -f /boot/boot-starryos-emmc.scr.new /boot/boot-starryos-emmc.scr
 mv -f /boot/starryEnv.txt.new /boot/starryEnv.txt
 sync
 
-printf '%s  %s\n' "$expected_fit_sha" /image.fit | sha256sum -c - >/dev/null
-printf '%s  %s\n' "$expected_boot_sha" /boot/boot-starryos-emmc.scr \
-    | sha256sum -c - >/dev/null
-printf '%s  %s\n' "$expected_env_sha" /boot/starryEnv.txt \
-    | sha256sum -c - >/dev/null
+sha256sum -c - <<< "$expected_fit_sha  /image.fit"
+sha256sum -c - <<< "$expected_boot_sha  /boot/boot-starryos-emmc.scr"
+sha256sum -c - <<< "$expected_env_sha  /boot/starryEnv.txt"
 cmp -s /boot/boot.scr /boot/boot.scr.tgoskits-backup \
     || fail "deployment changed the persistent Linux boot script"
 

@@ -2,7 +2,7 @@ use core::{
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering, compiler_fence},
 };
 
 use crate::{CpuLocalError, CpuPin};
@@ -125,10 +125,14 @@ impl PreemptionState {
             PREEMPT_DEPTH_MASK,
             "preemption nesting overflow"
         );
+        compiler_fence(Ordering::SeqCst);
     }
 
     #[cfg(any(test, not(target_arch = "x86_64"), feature = "host-test"))]
     fn finish(&self) -> PreemptionExit {
+        // Preemption guards protect CPU-local operations even when no lock
+        // acquisition supplies a compiler barrier of its own.
+        compiler_fence(Ordering::SeqCst);
         loop {
             let state = self.0.load(Ordering::Relaxed);
             let depth = state & PREEMPT_DEPTH_MASK;
@@ -314,6 +318,7 @@ pub fn enter_preemption() -> PreemptionToken {
         // Increment through GS before resolving the token owner. Once the
         // increment is visible this execution cannot migrate away from it.
         unsafe { crate::register::enter_x86_preemption() };
+        compiler_fence(Ordering::SeqCst);
         PreemptionToken::new_current()
     }
 
@@ -528,6 +533,51 @@ mod tests {
         pending.release();
         assert_eq!(state.snapshot().depth(), 0);
         assert!(state.snapshot().is_pending());
+    }
+
+    #[test]
+    fn current_exit_preserves_a_request_across_nested_irq_exclusions() {
+        let state = PreemptionState::new();
+        let task = enter_on(&state);
+        let irq = enter_on(&state);
+        state.set_pending();
+        let nested = enter_on(&state);
+
+        assert!(matches!(finish_preemption(nested), PreemptionExit::Nested));
+        assert!(matches!(finish_preemption(irq), PreemptionExit::Nested));
+        let PreemptionExit::Pending(pending) = finish_preemption(task) else {
+            panic!("the outer task must retain the IRQ's request");
+        };
+
+        // Model another interrupt after the pending result but before the
+        // runtime masks IRQs and claims its scheduler baton.
+        let irq = enter_on(&state);
+        state.set_pending();
+        assert!(matches!(finish_preemption(irq), PreemptionExit::Nested));
+        assert_eq!(state.snapshot().depth(), 1);
+        pending.release();
+        assert_eq!(state.snapshot().depth(), 0);
+        assert!(state.snapshot().is_pending());
+    }
+
+    #[test]
+    fn a_deferred_request_is_seen_by_the_next_outer_exit() {
+        let state = PreemptionState::new();
+        state.set_pending();
+        let token = enter_on(&state);
+        let PreemptionExit::Pending(pending) = finish_preemption(token) else {
+            panic!("request must be pending before IRQ-disabled release");
+        };
+        pending.release();
+
+        let token = enter_on(&state);
+        let PreemptionExit::Pending(pending) = finish_preemption(token) else {
+            panic!("IRQ-disabled release must not clear the request");
+        };
+        pending.release();
+        state.clear_pending();
+        let token = enter_on(&state);
+        assert!(matches!(finish_preemption(token), PreemptionExit::Enabled));
     }
 
     #[test]

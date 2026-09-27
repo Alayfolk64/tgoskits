@@ -18,6 +18,9 @@ pub use nmi::*;
 use crate::version::{IrqVecReadable, IrqVecWriteable};
 pub use crate::{IntId, VirtAddr, define::Trigger, sys_reg::*};
 
+/// Required physical alignment of each GICR LPI pending table.
+pub const LPI_PENDING_TABLE_ALIGNMENT: usize = 64 * 1024;
+
 /// SGI target specification for GICv3.
 ///
 /// Defines how to target CPUs when sending Software Generated Interrupts (SGIs).
@@ -505,6 +508,25 @@ impl Gic {
         pending_table_phys_base: u64,
         pending_table_stride: usize,
     ) -> Result<(), &'static str> {
+        // PENDBASER encodes address bits 51:16. Validate every table before
+        // enabling any redistributor; rounding a per-CPU address aliases state.
+        if pending_table_stride == 0
+            || !pending_table_stride.is_multiple_of(LPI_PENDING_TABLE_ALIGNMENT)
+            || !pending_table_phys_base.is_multiple_of(LPI_PENDING_TABLE_ALIGNMENT as u64)
+        {
+            return Err("LPI pending table base and stride must be 64 KiB aligned");
+        }
+        let last_offset = self
+            .redistributor_count()
+            .saturating_sub(1)
+            .checked_mul(pending_table_stride)
+            .ok_or("LPI pending table range overflows")?;
+        let last_address = pending_table_phys_base
+            .checked_add(last_offset as u64)
+            .ok_or("LPI pending table range overflows")?;
+        if last_address >= 1 << 52 {
+            return Err("LPI pending table address exceeds PENDBASER range");
+        }
         for (idx, rd) in self.rd_slice().iter().enumerate() {
             let pending = pending_table_phys_base + (idx * pending_table_stride) as u64;
             unsafe { rd.as_ref() }.lpi.configure_lpi_tables(
@@ -1295,3 +1317,6 @@ pub fn send_sgi(sgi_id: IntId, target: SGITarget) {
     }
     arch::isb();
 }
+
+#[cfg(test)]
+mod lpi_tests;

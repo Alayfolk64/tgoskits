@@ -33,6 +33,21 @@ pub enum NetError {
     /// A path-backed socket operation would cross filesystem devices.
     #[error("socket path operation crosses devices")]
     CrossesDevices,
+    /// A path-backed filesystem attribute is missing.
+    #[error("socket path attribute is missing")]
+    DataMissing,
+    /// The filesystem containing a socket path is corrupted.
+    #[error("socket path filesystem is corrupted")]
+    FilesystemCorrupted,
+    /// The filesystem quota for a socket path has been exhausted.
+    #[error("socket path filesystem quota exceeded")]
+    QuotaExceeded,
+    /// The socket path operation exceeds the filesystem link limit.
+    #[error("socket path has too many links")]
+    TooManyLinks,
+    /// Socket path metadata cannot fit the requested representation.
+    #[error("socket path metadata value overflow")]
+    ValueOverflow,
     /// A directory involved in a socket path operation is not empty.
     #[error("socket path directory is not empty")]
     DirectoryNotEmpty,
@@ -150,6 +165,10 @@ impl From<NetError> for IoError {
             NetError::ConnectionRefused => Self::ConnectionRefused,
             NetError::ConnectionReset => Self::ConnectionReset,
             NetError::CrossesDevices => Self::CrossesDevices,
+            NetError::DataMissing | NetError::FilesystemCorrupted => Self::InvalidData,
+            NetError::QuotaExceeded => Self::StorageFull,
+            NetError::TooManyLinks => Self::Io,
+            NetError::ValueOverflow => Self::OutOfRange,
             NetError::DirectoryNotEmpty => Self::DirectoryNotEmpty,
             NetError::DestAddrRequired => Self::DestAddrRequired,
             NetError::FilesystemLoop => Self::FilesystemLoop,
