@@ -3927,24 +3927,39 @@ mod tests {
             AddrSpace::new_empty(start, PAGE_SIZE_4K * 6).unwrap(),
         ));
         let parent_owner = MmHandle::from_arc(parent.clone()).unwrap();
+        let operation = super::MappingOperation::new_cow(
+            start,
+            PAGE_SIZE_4K,
+            FileBackend::Cached(cache.clone()),
+            0,
+            None,
+            false,
+        );
+        parent
+            .lock()
+            .map(start, size, flags, false, operation.clone())
+            .unwrap();
+        let super::super::MappingOperationKind::Cow(backend) = &operation.kind else {
+            unreachable!();
+        };
+        let space_id = parent.lock().id;
+        let cancelled = backend
+            .prepare_read_cache_page(space_id, start, PAGE_SIZE_4K, MappingFlags::READ)
+            .unwrap()
+            .unwrap();
+        backend.cancel_page_publication(&cancelled).unwrap();
+        // A canceled fault still owns its prepared page until cleanup returns.
+        // A racing retry must reuse that exact cache-backed identity.
+        let retry = backend
+            .prepare_read_cache_page(space_id, start, PAGE_SIZE_4K, MappingFlags::READ)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&cancelled, &retry));
+        backend.cancel_page_publication(&retry).unwrap();
+        drop(retry);
+        drop(cancelled);
         {
             let mut aspace = parent.lock();
-            aspace
-                .map(
-                    start,
-                    size,
-                    flags,
-                    false,
-                    super::MappingOperation::new_cow(
-                        start,
-                        PAGE_SIZE_4K,
-                        FileBackend::Cached(cache.clone()),
-                        0,
-                        None,
-                        false,
-                    ),
-                )
-                .unwrap();
             aspace
                 .populate_area(start, size, MappingFlags::READ)
                 .unwrap();
