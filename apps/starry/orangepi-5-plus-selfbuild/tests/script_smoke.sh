@@ -9,6 +9,7 @@ for script in \
     boot_starry_once.sh \
     boot_starry_once_remote.sh \
     build_seed.sh \
+    connect_serial.sh \
     deploy_starry_boot_remote.sh \
     fetch_artifacts.sh \
     guest-selfbuild.sh \
@@ -30,6 +31,7 @@ done
 for entrypoint in \
     boot_starry_once.sh \
     build_seed.sh \
+    connect_serial.sh \
     fetch_artifacts.sh \
     provision_rootfs.sh \
     run_linux_baseline.sh \
@@ -57,5 +59,6 @@ PY
 bash "$app_dir/tests/boot_script_identity.sh"
 bash "$app_dir/tests/guest_clock.sh"
 bash "$app_dir/tests/selfbuild_contract.sh"
+python3 "$app_dir/tests/serial_console.py"
 
 echo "orangepi5plus_selfbuild_script_smoke=PASS"
