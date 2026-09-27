@@ -168,4 +168,35 @@ Linux 对照运行 `linux-frozen81-kernel-cold-20260927` 使用相同实体板�
 
 为避免使用不同锁文件的历史对照，本轮随后在同板 Linux 上运行相同归档、工具链、任务工具、锁文件和 `fat` 配置。先将 Starry 构建目录保留为 `target-after-complete-current-starry-cold-20260928`，执行 `sync` 和 Linux 页缓存清理，再用相同正式 guest 脚本进行无 target 的构建。`linux-current-complete-cold-20260928` 的 Cargo 时间为 5 分 21 秒，完整构建 327 秒，即 5 分 27 秒，退出 0；产物校验及取回均通过。Linux ELF SHA-256 为 `842dc297d0e94735232738e4c45349de8ba356b917aeade6fea5caf10976d56f`，BIN 为 `e471fb2572e82120ef426aca2b87a846b07d7c61a49112e85cf3b3c97779a1d1`。Starry 完整构建耗时约为此对照的 5.70 倍；Linux 与 Starry 的调频策略和送达频率仍未完全对齐，不能将全部差距归因于单个软件机制。原始日志为 `linux-current-complete-cold.log`。
 
-在保留默认 `fat` 结果与仓库配置的前提下，另启动 `performance-current-old-lto-cold-20260928`，通过现有 Cargo 环境参数 `CARGO_PROFILE_RELEASE_LTO=false` 临时采用旧分支构建设置。源码和工具链保持相同，Linux target 已移走保留，正式脚本再次确认冷构建。该轮是构建配置对照，不是新性能优化；结果不能计作默认 `fat` 的 17 分钟验收。当前仍在运行，尚无成功耗时。
+在保留默认 `fat` 结果与仓库配置的前提下，另运行 `performance-current-old-lto-cold-20260928`，通过现有 Cargo 环境参数 `CARGO_PROFILE_RELEASE_LTO=false` 临时采用旧分支构建设置。源码和工具链保持相同，Linux target 已移走保留，正式脚本再次确认冷构建。Cargo 用时 19 分 31 秒，完整构建用时 1,221 秒，即 20 分 21 秒，返回 0，产物与运行器均输出 PASS，仍未达到 17 分钟。两个 `fat` 构建的 Cargo profile 哈希均为 `17647372896918672692`，该轮为 `854319013279132213`；同一源码和工具链的构建记录确认环境设置已生效。该轮是构建配置对照，不是新性能优化，不能计作默认 `fat` 的 17 分钟验收。
+
+该轮 ELF SHA-256 为 `95f18f6acb63aa09db20db63c0df960f3d95b2ed2b865ae862de3ab44875175f`，BIN 为 `20cb208e8ca41c6edaa446a2ae2534911e096490934efcaa2072522f0e36da81`；取回后校验通过，匹配 LLVM 的完整转换再次逐字节一致。正常返回 Linux 后 boot ID 为 `d29fad0e-af7b-465e-a60b-8413a47f29ba`，启动脚本与 Linux 备份哈希仍相同。fsck 重放日志、优化 extent tree，返回 1 并正常启动；该轮没有 bitmap padding 修复。原始构建、恢复与 profile 记录为 `performance-current-old-lto-cold-20260928.serial.log`、`linux-after-current-old-lto.log` 和 `reference-workload-cold-preparation.log`。
+
+### 2.5 原始固定工作量
+
+截图使用 `b609e4f8…` 归档与 nightly-2026-07-15，和当前源码、锁文件及 nightly-2026-09-04 不同。板上保存的 `tgoskits-src.tar` 全量 SHA-256 与该归档一致；已从该归档重新解包正式板端源码，保留原目录及其 target，确认新目录没有 target。旧锁文件 SHA-256 为 `e05882da57abb9d874c2d49d4ac38441ddd10241ee3718c4ab4831372c551306`，原始 `release.lto=false` 保持不变，离线依赖及 LLVM 22.1.8 工具预检通过。没有将旧源码的性能实现部署为运行内核。
+
+固定输入对照使用与 2.4 节相同的迁移后 FIT，仅更换被编译的输入，以核对原始工作量的耗时。它不能替代最新源码自编的 17 分钟验收；结果与当前源码分别记录。预检日志为 `reference-workload-inventory.log`、`reference-workload-cold-preparation.log` 和 `reference-workload-offline-preflight.log`。
+
+首次 `performance-reference-b609-cold-20260928` 在 9 秒后失败，未开始 Rust 编译：当前任务工具请求旧源码不存在的 `scripts/targets/bare/aarch64-unknown-none-softfloat.json`，Cargo 返回 101，任务工具与运行器返回 1。该时间不能计作自编成功或性能结果。板子随后正常返回 Linux，fsck 重放日志并完成五遍检查，返回 1，没有 extent 优化或 bitmap padding 修复。
+
+板上保存的旧工具 `tg-xtask-nightly-20260715` SHA-256 为 `d68bb3780d4537c9b06a3bb96357d91db631bf2ed0668c70774ae261f965e6e9`，与原始旧源码对照记录完全相同。已保留当前工具 `c2130b54…` 的副本，临时恢复兼容工具；没有给旧源码添加新 target 配置。`performance-reference-b609-cold-20260928-2` 再次确认 target 不存在、锁文件不变后启动。Cargo 用时 17 分 22 秒，完整构建 1,072 秒，即 17 分 52 秒，返回 0；310 个编译单元启动，产物与串口运行器均输出 PASS。该轮距 17 分钟仍差 52 秒，不能记作目标通过。
+
+ELF SHA-256 为 `ba21135d9861303aad9dafeecfe5fabb8428660e98e4bbf004d51a4709d6a611`，BIN 为 `474dc99ecb1139f75c97464c58324b9fb49b9ce2a2128695692e0dafce955f87`。正式取回入口再次校验全部 SHA256SUMS；宿主机使用匹配的 LLVM 22.1.8 完整转换 ELF，生成的 BIN 与板上 BIN 逐字节一致。源码元数据仍为原始 `048c1dda…` 的 dirty 归档，锁文件哈希未变；不能将该固定输入称为最新迁移源码。原始日志为 `performance-reference-b609-cold-20260928-2.serial.log` 和 `fetch-reference-complete.log`。
+
+正常返回 Linux 后，boot ID 为 `db8f0f0b-5776-404e-95a7-856ca6ca6566`，SSH 可用，Linux 启动脚本与备份哈希相同。fsck 重放日志、优化 extent tree，并修复 inode bitmap 尾部 padding，返回 1 后正常启动；不能记作无修复的文件系统状态。本轮有 31 条周期写回 `ResourceBusy` 日志，没有造成构建失败。恢复记录为 `return-linux-after-reference-complete.serial.log` 和 `linux-after-reference-complete.log`。
+
+取回证据后，正式 `install_source_link.sh` 已将板端 `/opt/tgoskits` 恢复到 `2dae544e…` 当前迁移源码，任务工具恢复为 `c2130b54…`。之前当前源码的 LTO 对照 target 已改名保存为 `target-after-current-old-lto-cold-20260928`，当前 target 不存在；原始固定源码及其产物继续保留。`restore-current-inputs-after-reference.log` 记录源码、锁文件、任务工具哈希及 `CURRENT_INPUTS_RESTORED=PASS`。本轮没有新增 Rust 代码或性能优化。
+
+### 2.6 当前验收状态
+
+原定十二组优化的生产消费者、旧模块对应关系和迁移故障回归已记录在第一章。默认编译策略、旧编译策略对照和原始固定工作量均已得到完整成功结果，但没有一轮达到 17 分钟；这些结果不能互相替代。
+
+| 被编译输入 | 系统与 release LTO | Cargo 用时 | 完整构建用时 | 构建终态 | 17 分钟目标 |
+| --- | --- | --- | --- | --- | --- |
+| 当前 `2dae544e…` / nightly-2026-09-04 | StarryOS / `fat` | 29m58s | 31m03s | PASS | 未达到 |
+| 相同当前输入 | Linux / `fat` | 5m21s | 5m27s | PASS | 仅为 Linux 对照 |
+| 相同当前输入 | StarryOS / 临时 `false` | 19m31s | 20m21s | PASS | 未达到 |
+| 原始 `b609e4f8…` / nightly-2026-07-15 | StarryOS / 原始 `false` | 17m22s | 17m52s | PASS | 未达到 |
+
+本轮核对没有发现新的消费者迁移遗漏，也没有依据将剩余耗时归因于一个已定位的迁移错误。用户要求只迁移原性能分支，不增加新的性能优化；因此没有改调频、增加调度策略或降低默认构建工作量。17 分钟验收和后续 PR 拆分尚未完成，未推送或创建 PR。
