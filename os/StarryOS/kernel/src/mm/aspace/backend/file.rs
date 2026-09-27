@@ -253,14 +253,13 @@ impl FilePageIndex {
         }
         let pin = pins.pop().ok_or(StarryError::BadState)?;
         if pins.is_empty() {
-            if page.mapping_refs() == 0 {
-                self.pages.remove(&page_number);
-            } else {
-                *entry = FilePageEntry::Published {
-                    file_epoch: *file_epoch,
-                    page: Arc::downgrade(page),
-                };
-            }
+            // A canceled materialization still retains its PageObject until
+            // cleanup returns. Preserve its canonical identity for a racing
+            // retry without retaining either a frame owner or a cache pin.
+            *entry = FilePageEntry::Published {
+                file_epoch: *file_epoch,
+                page: Arc::downgrade(page),
+            };
         }
         Ok(Some(pin))
     }
