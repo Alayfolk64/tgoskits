@@ -30,12 +30,18 @@ struct WritebackPages<'a> {
 impl CachedFileShared {
     /// Runs after the writer publishes its current stable page and releases
     /// io_lock. Concurrent writeback may temporarily exceed the soft target.
-    pub(super) fn balance_dirty_pages(&self) -> VfsResult<()> {
-        let dirty_count = self.dirty_page_count();
+    pub(super) fn balance_dirty_pages(&self, growing: bool) -> VfsResult<()> {
         let over_capacity = {
             let cache = self.page_cache.lock();
             cache.len() > cache.cap().get()
         };
+        // Growth already extends the bounded retention target before page
+        // publication. Keep those bytes cached instead of applying the fixed
+        // overwrite watermarks; explicit and periodic sync still flush them.
+        if growing && !over_capacity {
+            return Ok(());
+        }
+        let dirty_count = self.dirty_page_count();
         let flush_to_low_watermark = dirty_count >= DIRTY_PAGE_BACKGROUND_WATERMARK;
         #[cfg(feature = "vfs")]
         let flush_to_low_watermark = if flush_to_low_watermark {

@@ -622,7 +622,7 @@ fn repeated_large_file_reads_reuse_cached_pages() {
 }
 
 #[test]
-fn disk_cache_capacity_is_bounded_without_allocating_data_pages() {
+fn disk_cache_retention_tracks_growth_without_forcing_writeback() {
     with_test_page_provider(true, |provider| {
         for (len, expected_pages) in [(0, 512), (4 * 1024 * 1024, 1024), (u64::MAX, 65536)] {
             let backing = FileNode::new(Arc::new(CacheTestFile::new(Vec::new())));
@@ -983,9 +983,9 @@ fn writeback_merges_contiguous_pages_with_a_bounded_snapshot() {
         assert_eq!(state.physical_data, data);
         drop(state);
         let write_lengths = backing.write_lengths();
-        assert_eq!(write_lengths.len(), PAGE_COUNT.div_ceil(16));
+        assert_eq!(write_lengths.len(), PAGE_COUNT.div_ceil(256));
         assert_eq!(write_lengths.iter().sum::<usize>(), data.len());
-        assert!(write_lengths.iter().all(|len| *len <= 16 * PAGE_SIZE));
+        assert!(write_lengths.iter().all(|len| *len <= 256 * PAGE_SIZE));
     });
 }
 
@@ -995,7 +995,7 @@ fn background_watermark_defers_writeback_to_the_worker() {
     const BACKGROUND: usize = DIRTY_PAGE_BACKGROUND_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; BACKGROUND * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let data = vec![0x4d; BACKGROUND * PAGE_SIZE];
 
@@ -1025,7 +1025,7 @@ fn real_worker_scans_registry_and_writes_to_low_watermark() {
     const WRITEBACK_PAGES: usize = BACKGROUND - DIRTY_PAGE_LOW_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; BACKGROUND * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let endpoint =
             install_shared_test_endpoint(&cached.shared, |_| CacheMappingResult::Protected);
@@ -1038,11 +1038,10 @@ fn real_worker_scans_registry_and_writes_to_low_watermark() {
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let completed = Arc::new(Barrier::new(2));
-        let completions = Arc::new(AtomicUsize::new(0));
         let observed_entered = Arc::clone(&entered);
         let observed_release = Arc::clone(&release);
         let observed_completed = Arc::clone(&completed);
-        let observed_completions = Arc::clone(&completions);
+        let observed_backing = Arc::clone(&backing);
         let first_write = Arc::new(AtomicBool::new(true));
         let observed_first = Arc::clone(&first_write);
         backing.set_write_observer(Some(Arc::new(move |finished| {
@@ -1051,8 +1050,8 @@ fn real_worker_scans_registry_and_writes_to_low_watermark() {
                 observed_release.wait();
             }
             if finished
-                && observed_completions.fetch_add(1, Ordering::AcqRel) + 1
-                    == WRITEBACK_PAGES.div_ceil(16)
+                && observed_backing.write_lengths().iter().sum::<usize>()
+                    == WRITEBACK_PAGES * PAGE_SIZE
             {
                 observed_completed.wait();
             }
@@ -1089,7 +1088,7 @@ fn non_vfs_background_watermark_stays_synchronous() {
     const LOW: usize = DIRTY_PAGE_LOW_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; BACKGROUND * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let data = vec![0x4d; BACKGROUND * PAGE_SIZE];
 
@@ -1109,7 +1108,7 @@ fn failed_dirty_watermark_writeback_keeps_pages_dirty() {
     const BACKGROUND: usize = DIRTY_PAGE_BACKGROUND_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; BACKGROUND * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let data = vec![0x7a; BACKGROUND * PAGE_SIZE];
         backing.fail_next_write();
@@ -1139,7 +1138,7 @@ fn hard_watermark_makes_the_unmapped_writer_assist_to_low_watermark() {
     const HARD: usize = DIRTY_PAGE_HARD_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; HARD * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let data = vec![0x71; HARD * PAGE_SIZE];
 
@@ -1161,7 +1160,7 @@ fn failed_background_writeback_waits_for_a_new_request() {
     const HIGH: usize = DISK_PAGE_CACHE_CAP * 3 / 4;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; HIGH * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let endpoint =
             install_shared_test_endpoint(&cached.shared, |_| CacheMappingResult::Protected);
@@ -1198,7 +1197,7 @@ fn background_writeback_skips_a_retired_registry_snapshot() {
     const HIGH: usize = DISK_PAGE_CACHE_CAP * 3 / 4;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; HIGH * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let endpoint =
             install_shared_test_endpoint(&cached.shared, |_| CacheMappingResult::Protected);
@@ -1397,7 +1396,7 @@ fn dirty_watermark_writeback_skips_files_with_mapping_endpoint() {
     const HARD: usize = DIRTY_PAGE_HARD_WATERMARK;
 
     with_test_page_provider(true, |_| {
-        let backing = Arc::new(CacheTestFile::new(Vec::new()));
+        let backing = Arc::new(CacheTestFile::new(vec![0; HARD * PAGE_SIZE]));
         let cached = reopen_cached_file(backing.clone());
         let protections = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&protections);

@@ -1167,7 +1167,7 @@ impl CachedFile {
                 }
             })?;
             if !self.in_memory {
-                update.without_io(|| self.shared.balance_dirty_pages())?;
+                update.without_io(|| self.shared.balance_dirty_pages(end > old_len))?;
             }
 
             written += n;

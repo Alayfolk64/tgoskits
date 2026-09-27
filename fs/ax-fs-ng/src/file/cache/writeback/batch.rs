@@ -2,7 +2,7 @@
 
 use super::*;
 
-const MAX_BATCH_PAGES: usize = 16;
+const MAX_BATCH_PAGES: usize = 256;
 
 struct WritebackBatch {
     offset: u64,
