@@ -82,6 +82,78 @@ static void cleanup(const char *base, const char *old_path, const char *new_path
     remove_path(base);
 }
 
+static int rename_growing_directory(unsigned int mode)
+{
+    char directory[80];
+    char source[256];
+    char destination[256];
+    char suffix[97];
+    char payload[64];
+    char contents[64];
+    struct stat before;
+    struct stat after;
+
+    memset(suffix, 'x', sizeof(suffix) - 1);
+    suffix[sizeof(suffix) - 1] = '\0';
+    snprintf(directory, sizeof(directory), "/rename-growth-%ld-%u",
+             (long)getpid(), mode);
+    if (mkdir(directory, 0700) != 0) {
+        goto failed;
+    }
+    for (unsigned int index = 0; index < 128; index++) {
+        snprintf(source, sizeof(source), "%s/%04u-%s.pending", directory,
+                 index, suffix);
+        snprintf(destination, sizeof(destination), "%s/%04u-%s.data",
+                 directory, index, suffix);
+        snprintf(payload, sizeof(payload), "rename payload %u", index);
+        if (write_file(source, payload) != 0 || stat(source, &before) != 0) {
+            goto failed;
+        }
+        int result;
+#ifdef SYS_renameat
+        if (mode == 0) {
+            result = (int)syscall(SYS_renameat, AT_FDCWD, source, AT_FDCWD,
+                                  destination);
+        } else
+#endif
+        {
+            result = renameat2_sys(source, destination,
+                                  mode == 1 ? 0 : RENAME_NOREPLACE);
+        }
+        if (result != 0) {
+            goto failed;
+        }
+        errno = 0;
+        if (stat(source, &after) != -1 || errno != ENOENT) {
+            errno = EIO;
+            goto failed;
+        }
+        if (stat(destination, &after) != 0 ||
+            before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+            read_file_string(destination, contents, sizeof(contents)) != 0 ||
+            strcmp(contents, payload) != 0) {
+            errno = EIO;
+            goto failed;
+        }
+    }
+    for (unsigned int index = 0; index < 128; index++) {
+        snprintf(destination, sizeof(destination), "%s/%04u-%s.data",
+                 directory, index, suffix);
+        if (unlink(destination) != 0) {
+            goto failed;
+        }
+    }
+    if (rmdir(directory) != 0) {
+        goto failed;
+    }
+    return 0;
+
+failed:
+    printf("rename directory growth failed: mode=%u errno=%d (%s)\n", mode,
+           errno, strerror(errno));
+    return -1;
+}
+
 int main(void)
 {
     const char *base = "/tmp/bug_renameat2_noreplace_flags";
@@ -213,6 +285,15 @@ int main(void)
           "flags=0 replacement writes source content to destination");
 
     cleanup(base, old_path, new_path, target_path);
+
+#ifdef SYS_renameat
+    CHECK(rename_growing_directory(0) == 0,
+          "renameat preserves source identity and content across directory growth");
+#endif
+    CHECK(rename_growing_directory(1) == 0,
+          "renameat2 flags=0 preserves source identity and content across directory growth");
+    CHECK(rename_growing_directory(2) == 0,
+          "renameat2 NOREPLACE preserves source identity and content across directory growth");
 
     printf("\n=== result: %d passed, %d failed ===\n", passed, failed);
     if (failed == 0) {

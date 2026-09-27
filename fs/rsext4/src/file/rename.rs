@@ -322,12 +322,32 @@ fn rename_replace<B: BlockIo>(
     };
 
     replace_or_add_destination(fs, device, request, source, &new_parent_inode, destination)?;
+    let (source_parent, source_entry) =
+        if request.old_parent == request.new_parent && destination.is_none() {
+            // Adding the destination can convert a linear directory or split
+            // an HTree leaf. Reload both the mapping and the source location
+            // under the same namespace exclusion and metadata transaction.
+            let parent = fs.get_inode_by_num(device, request.old_parent)?;
+            let entry = find_named_entry_in_parent(
+                fs,
+                device,
+                request.old_parent,
+                &parent,
+                request.old_name.as_bytes(),
+            )?;
+            if entry.ino != source.ino {
+                return Err(Ext4Error::corrupted().with_operation("rename:source_identity"));
+            }
+            (parent, entry)
+        } else {
+            (old_parent_inode, source)
+        };
     remove_named_entry_at(
         fs,
         device,
         request.old_parent,
-        &old_parent_inode,
-        source,
+        &source_parent,
+        source_entry,
         request.old_name.as_bytes(),
     )?;
     fs.touch_parent_dir_for_entry_change(device, request.old_parent)?;

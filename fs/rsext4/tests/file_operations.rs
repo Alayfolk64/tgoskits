@@ -384,7 +384,7 @@ mod file_functional_tests {
             let contents = format!("rename payload {index}").into_bytes();
             mkfile(&mut jbd2_dev, &mut fs, &source, Some(&contents), None)
                 .expect("create source before directory growth");
-            rename(
+            let outcome = rename(
                 &mut jbd2_dev,
                 &mut fs,
                 &source,
@@ -392,6 +392,7 @@ mod file_functional_tests {
                 RenameOptions::REPLACE,
             )
             .expect("rename must survive relocation of its source record");
+            assert!(outcome.replaced.is_none());
             assert_eq!(
                 read_file(&mut jbd2_dev, &mut fs, &source)
                     .expect_err("source name must disappear after directory growth")
