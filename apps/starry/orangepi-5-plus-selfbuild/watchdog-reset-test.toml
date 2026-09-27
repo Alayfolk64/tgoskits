@@ -2,6 +2,7 @@
 # so normal Starry app discovery continues to select the self-build config.
 target = "aarch64-unknown-none-softfloat"
 features = [
+  "legacy-board-init",
   "ax-driver/list-pci-devices",
   "ax-driver/rk3588-pcie",
   "ax-driver/realtek-rtl8125",
@@ -12,9 +13,7 @@ features = [
   "ax-driver/rockchip-dwmmc",
   "ax-driver/rk3588-cpufreq",
   "rknpu",
-  "rk3588-pwm",
   "selfbuild-watchdog-reset-test",
-  "smp",
 ]
 log = "Info"
 max_cpu_num = 8

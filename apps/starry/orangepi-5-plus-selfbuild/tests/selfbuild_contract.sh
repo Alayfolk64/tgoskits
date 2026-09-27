@@ -4,6 +4,29 @@ set -euo pipefail
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repo_root="$(cd "$app_dir/../../.." && pwd)"
 
+# Resolve the maintained board configurations with Cargo itself so package
+# feature migrations cannot leave either deployment entrypoint unbuildable.
+python3 - "$repo_root" "$app_dir" <<'PY'
+import pathlib
+import subprocess
+import sys
+import tomllib
+
+repo_root, app_dir = map(pathlib.Path, sys.argv[1:])
+for name in ["build-aarch64-unknown-none-softfloat.toml", "watchdog-reset-test.toml"]:
+    config = tomllib.loads((app_dir / name).read_text(encoding="utf-8"))
+    print(f"selfbuild feature resolution: {name}", flush=True)
+    result = subprocess.run([
+        "cargo", "tree", "--locked", "--offline",
+        "--manifest-path", str(repo_root / "os/StarryOS/starryos/Cargo.toml"),
+        "--no-default-features", "--features", ",".join(config["features"]),
+        "--target", str(repo_root / "scripts/targets/bare" / (config["target"] + ".json")),
+        "-Z", "json-target-spec", "--depth", "0",
+    ], cwd=repo_root)
+    if result.returncode:
+        sys.exit(result.returncode)
+PY
+
 fail() {
     echo "selfbuild contract: $*" >&2
     exit 1
