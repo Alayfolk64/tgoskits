@@ -113,7 +113,7 @@ x86_64 修复前日志为 `/tmp/starry-ltp-next-evidence/` 中本轮基线输出
 
 `bug-getcwd-syscall-return` 替换为 [getcwd01.c](https://github.com/linux-test-project/ltp/blob/3a64d78f58bdceba93ed321e91215fb969a047ed/testcases/kernel/syscalls/getcwd/getcwd01.c), [getcwd02.c](https://github.com/linux-test-project/ltp/blob/3a64d78f58bdceba93ed321e91215fb969a047ed/testcases/kernel/syscalls/getcwd/getcwd02.c)。承接行为：raw getcwd坏地址EFAULT、零/短缓冲ERANGE、NULL短缓冲的ERANGE优先；libc getcwd返回当前路径。
 
-未承接：raw成功返回strlen(path)+1的精确数值；固定/tmp返回路径及长度恰好为strlen(/tmp)的NULL短缓冲输入。本项是部分替代，原程序及专属 CMake 清理。
+未承接：raw成功返回strlen(path)+1的精确数值；固定/tmp返回路径及长度恰好为strlen(/tmp)的NULL短缓冲输入；chroot 后相对进程 root 的路径。本项是部分替代，原程序及专属 CMake 清理。
 
 四架构03-candidates-<arch>.log实际通过；getcwd01=5 TPASS,getcwd02=3 TPASS；未修改内核或上游测试；最终累计集合另验。提交主题为 `test(starry): migrate getcwd buffer regression to LTP`。
 
