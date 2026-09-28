@@ -48,8 +48,11 @@ PY
 
 bash "$app_dir/tests/boot_script_identity.sh"
 bash "$app_dir/tests/guest_clock.sh"
+bash "$app_dir/tests/install_source_link.sh"
 bash "$app_dir/tests/linux_recovery.sh"
+bash "$app_dir/tests/provision_rootfs.sh"
 bash "$app_dir/tests/selfbuild_contract.sh"
+bash "$app_dir/tests/validate_sha256.sh"
 python3 "$app_dir/tests/serial_console.py"
 
 echo "orangepi5plus_selfbuild_script_smoke=PASS"
