@@ -37,6 +37,38 @@ fn sealed_commit_does_not_consume_later_running_updates() {
 }
 
 #[test]
+fn synchronous_commit_waits_for_sealed_transaction() {
+    for background in [false, true] {
+        let mut journal = journal();
+        if background {
+            journal.enable_background_commits().unwrap();
+        }
+        write_image(&mut journal, 0x31);
+        let batch = journal.prepare_commit().unwrap();
+        let ticket = batch.ticket();
+        assert!(!journal.ticket_is_durable(&ticket).unwrap());
+
+        for error in [
+            journal.commit().unwrap_err(),
+            journal.commit_for_filesystem_sync().unwrap_err(),
+        ] {
+            if background {
+                assert!(error.requires_journal_progress());
+            } else {
+                assert_eq!(error.kind(), Ext4ErrorKind::Busy);
+            }
+            assert!(!journal.ticket_is_durable(&ticket).unwrap());
+        }
+
+        let mut receipt = batch.execute();
+        journal.finish_commit(&mut receipt).unwrap();
+        assert!(journal.ticket_is_durable(&ticket).unwrap());
+        journal.commit().unwrap();
+        journal.commit_for_filesystem_sync().unwrap();
+    }
+}
+
+#[test]
 fn foreign_receipt_remains_publishable_to_its_origin() {
     let mut origin = journal();
     let mut other = journal();
