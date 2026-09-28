@@ -37,6 +37,11 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     ) -> PagingResult {
         self.validate_mapping(vaddr, paddr, T::PAGE_SIZE)?;
         let entry = T::P::new_page(paddr, config, false);
+        if entry.unused() {
+            return Err(PagingError::invalid_range(
+                "Mapping encodes an unused page-table entry",
+            ));
+        }
         install_entry(&mut self.root, vaddr, entry, Frame::<T, A>::PT_LEVEL)?;
         T::publish_new_mapping(vaddr);
         Ok(())

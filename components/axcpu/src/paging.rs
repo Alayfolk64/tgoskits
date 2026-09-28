@@ -90,7 +90,13 @@ impl TableMeta for ArchPagingMeta {
     fn flush_batch(vaddrs: &[VirtAddr]) {
         #[cfg(target_arch = "aarch64")]
         crate::asm::flush_tlb_batch(vaddrs);
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "riscv64")]
+        if !vaddrs.is_empty() {
+            // A batch may unlink a non-leaf PTE. SFENCE.VMA with a virtual
+            // address only orders leaf PTE changes on RISC-V.
+            Self::flush(None);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
         for &vaddr in vaddrs {
             Self::flush(Some(vaddr));
         }
@@ -102,7 +108,14 @@ impl TableMeta for ArchPagingMeta {
             let _ = vaddr;
             crate::asm::publish_new_mapping();
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "riscv64")]
+        {
+            let _ = vaddr;
+            // An absent install can publish a complete new branch through a
+            // formerly invalid non-leaf PTE, which requires rs1=x0.
+            Self::flush(None);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
         Self::flush_batch(core::slice::from_ref(&vaddr));
     }
 }
