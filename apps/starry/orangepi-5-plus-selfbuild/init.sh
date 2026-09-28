@@ -6,11 +6,14 @@ run_config="$root/etc/starry-selfbuild/run.conf"
 guest=/opt/tgoskits/apps/starry/orangepi-5-plus-selfbuild/guest-selfbuild.sh
 guest_timeout=21600
 restore_boot=/opt/starry-orangepi5plus-selfbuild/restore_linux_boot.sh
+boot_restored=0
 
 fail() {
     echo "===${marker}-FAIL reason=$1==="
-    sync 2>/dev/null || true
-    reboot -f 2>/dev/null || true
+    if [ "$boot_restored" = 1 ]; then
+        sync 2>/dev/null || true
+        reboot -f 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -19,6 +22,7 @@ fail() {
 # this StarryOS image.
 [ -x "$restore_boot" ] || fail linux-boot-restore-script-missing
 "$restore_boot" || fail linux-boot-restore
+boot_restored=1
 
 command -v chroot >/dev/null 2>&1 || fail chroot-missing
 command -v mount >/dev/null 2>&1 || fail mount-missing

@@ -1,7 +1,7 @@
 board_type = "OrangePi-5-Plus"
 shell_prefix = "root@starry:/root #"
 success_regex = [
-  '(?m)^===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=[A-Za-z0-9._-]+ jobs=[0-9]+ elapsed=[0-9]+===$',
+  '(?m)^===STARRY-ORANGEPI5PLUS-SELFBUILD-PASS run=[A-Za-z0-9._-]+ parallelism=system-default(?: profile=(?:stat|record))? elapsed=[0-9]+===$',
 ]
 fail_regex = [
   '(?m)^===STARRY-ORANGEPI5PLUS-SELFBUILD-FAIL(?: .*)?===$',

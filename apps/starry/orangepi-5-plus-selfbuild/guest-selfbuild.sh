@@ -211,6 +211,7 @@ if [ "$xtask_rc" != "0" ]; then
 fi
 [ -x "$xtask_bin" ] || fail tg-xtask-artifact-missing
 
+export CARGO_TARGET_DIR="$kernel_target_dir"
 build_command=("$xtask_bin" starry build --config "$build_config")
 command=("${build_command[@]}")
 
