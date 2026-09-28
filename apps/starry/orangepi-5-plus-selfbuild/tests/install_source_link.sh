@@ -2,7 +2,9 @@
 set -euo pipefail
 
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d -p "${TMPDIR:-$app_dir/../../../../tmp}" source-link.XXXXXX)"
+repo_root="$(cd "$app_dir/../../.." && pwd)"
+mkdir -p "$repo_root/tmp"
+test_root="$(mktemp -d -p "$repo_root/tmp" source-link.XXXXXX)"
 source_sha=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 cleanup() {
