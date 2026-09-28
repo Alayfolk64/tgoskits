@@ -17,6 +17,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
             return Err(Ext4Error::busy().with_operation("jbd2:commit_with_active_handle"));
         }
 
+        self.commits.require_published_commit()?;
         self.commit_pending_transaction()?;
         Ok(())
     }
@@ -39,6 +40,7 @@ impl<B: BlockIo> Jbd2Dev<B> {
             return Err(Ext4Error::busy().with_operation("jbd2:sync_with_active_handle"));
         }
 
+        self.commits.require_published_commit()?;
         if self.commit_pending_transaction()? {
             Ok(())
         } else {

@@ -68,6 +68,15 @@ impl CommitLedger {
         }
     }
 
+    /// An empty running owner does not make the older sealed owner durable.
+    pub(super) fn require_published_commit(&mut self) -> Ext4Result<()> {
+        if self.pending.is_some() {
+            self.request_external_progress()?;
+            self.ensure_idle()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn reserved_records(&self) -> usize {
         self.pending
             .as_ref()
