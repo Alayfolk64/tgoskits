@@ -1549,6 +1549,7 @@ mod tests {
             thread::{SwitchReason, ThreadExtension, ThreadExtensionOps, ThreadHandle, ThreadId},
         },
     };
+    use ax_std::time::{Duration, Instant};
     use axpoll::{ExclusiveConsumer, PollRegistrar, PollSource, Pollable, RegistrationMode};
     use ringbuf::traits::Consumer;
 
@@ -1560,6 +1561,15 @@ mod tests {
     static DIRECT_WAIT_ARMED: AtomicBool = AtomicBool::new(false);
     static DIRECT_BLOCKED: AtomicBool = AtomicBool::new(false);
     static DIRECT_WOKEN: AtomicBool = AtomicBool::new(false);
+
+    fn yield_until(flag: &AtomicBool, message: &str) {
+        let started = Instant::now();
+        while !flag.load(Ordering::Acquire) {
+            assert!(started.elapsed() < Duration::from_secs(10), "{message}");
+            scheduler::thread::current::yield_current_cpu()
+                .expect("wait-set lock owner must remain schedulable");
+        }
+    }
 
     unsafe extern "Rust" fn ignore_switch_in(
         _data: usize,
@@ -1910,16 +1920,9 @@ mod tests {
                 })
                 .expect("failed to spawn pipe wait-set lock contender");
 
-        for _ in 0..32 {
-            scheduler::thread::current::yield_current_cpu()
-                .expect("Linux RT waitqueue lock must remain schedulable while held");
-            if attempted.load(Ordering::Acquire) {
-                break;
-            }
-        }
-        assert!(
-            attempted.load(Ordering::Acquire),
-            "same-CPU contender did not attempt the held wait-set lock"
+        yield_until(
+            &attempted,
+            "same-CPU contender did not attempt the held wait-set lock",
         );
         assert!(
             !acquired.load(Ordering::Acquire),
@@ -1971,17 +1974,7 @@ mod tests {
                 })
                 .expect("failed to spawn pipe wait registration task");
 
-        for _ in 0..32 {
-            scheduler::thread::current::yield_current_cpu()
-                .expect("wait-set lock owner must remain schedulable");
-            if waiter_started.load(Ordering::Acquire) {
-                break;
-            }
-        }
-        assert!(
-            waiter_started.load(Ordering::Acquire),
-            "pipe waiter did not attempt registration"
-        );
+        yield_until(&waiter_started, "pipe waiter did not attempt registration");
         drop(state);
         ready.store(true, Ordering::Release);
         waiters.wake_all(IoEvents::IN);
