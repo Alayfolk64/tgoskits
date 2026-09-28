@@ -218,6 +218,25 @@ fn invalid_addresses_are_rejected_before_allocation_or_publication() {
 }
 
 #[test]
+fn absent_install_rejects_an_entry_encoded_as_unused() {
+    let allocator = TrackingAllocator::default();
+    let mut table = new_table(allocator.clone());
+    let address = VirtAddr::from_usize(0x20_0000);
+    // SAFETY: no hardware uses this host fixture and mutations are serialized.
+    let result = unsafe {
+        table.install_absent_page(
+            address,
+            PhysAddr::from_usize(0),
+            MappingFlags::empty().into(),
+        )
+    };
+    assert!(matches!(result, Err(PagingError::InvalidRange { .. })));
+    assert_eq!(allocator.live(), 1);
+    assert!(root_entries(&table).iter().all(PageTableEntry::unused));
+    assert!(take_events().is_empty());
+}
+
+#[test]
 fn unconfigured_metadata_keeps_invalidation_and_extended_root_geometry() {
     let allocator = TrackingAllocator::default();
     let mut table = PageTable::<ExtendedRootMeta, _>::new(allocator.clone()).unwrap();
