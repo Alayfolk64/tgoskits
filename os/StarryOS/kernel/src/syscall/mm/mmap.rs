@@ -6,6 +6,7 @@ use ax_memory_set::MappingError;
 use ax_runtime::hal::paging::MappingFlags;
 use linux_raw_sys::general::*;
 
+use super::placement::find_mapping_start;
 use crate::{
     StarryError, StarryResult,
     file::get_file_like,
@@ -372,10 +373,9 @@ pub fn sys_mmap(
             .as_usize()
             .saturating_sub(STACK_GUARD_GAP);
         let limit = VirtAddrRange::new(aspace.base(), VirtAddr::from(upper));
-        aspace
-            .find_free_area(VirtAddr::from(aligned), length, limit, align)
-            .or(aspace.find_free_area(aspace.base(), length, limit, align))
-            .ok_or(StarryError::NoMemory)?
+        find_mapping_start(VirtAddr::from(aligned), aspace.base(), |hint| {
+            aspace.find_free_area(hint, length, limit, align)
+        })?
     };
 
     // IonBufferFile 特殊处理：直接线性映射物理地址，跳过通用 file_mmap/device_mmap 路径。
