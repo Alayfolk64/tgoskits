@@ -224,15 +224,15 @@ pub fn run() -> crate::TestResult {
     pin_current_to_cpu(1);
     sched_idle_makes_progress_against_normal_current();
 
-    for synchronous in [false, true] {
-        fair_wake_placement(cpu_count, synchronous);
-    }
+    fair_wake_placement(cpu_count, false, false);
+    fair_wake_placement(cpu_count, false, true);
+    fair_wake_placement(cpu_count, true, true);
     set_current_thread_affinity(CpuSet::all(cpu_count))
         .expect("test owner must restore full affinity");
     Ok(())
 }
 
-fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
+fn fair_wake_placement(cpu_count: usize, synchronous: bool, has_idle_sibling: bool) {
     READY.store(false, Ordering::Release);
     GO.store(false, Ordering::Release);
     DONE.store(false, Ordering::Release);
@@ -243,11 +243,11 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
         .stack_size(TEST_STACK_SIZE)
         .spawn(move || {
             pin_current_to_cpu(0);
-            let affinity = if synchronous {
+            let affinity = if has_idle_sibling {
                 CpuSet::all(cpu_count)
             } else {
-                // Both eligible CPUs stay runnable, so idle-pull cannot
-                // obscure the ordinary wake-placement decision.
+                // No idle sibling is eligible, so the previous CPU must
+                // retain cache affinity instead of moving to the waker.
                 let mut affinity = CpuSet::empty(cpu_count);
                 assert!(affinity.insert(CpuId::new(0)));
                 assert!(affinity.insert(CpuId::new(1)));
@@ -306,11 +306,19 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
     if !synchronous {
         // Check the wake transaction before this CPU yields: a later idle
         // pull may migrate the runnable wakee without changing its placement.
-        assert_eq!(
-            wakee.assigned_cpu().map(|cpu| cpu.as_usize()),
-            Some(0),
-            "ordinary Fair wake must retain its previous CPU"
-        );
+        let selected = wakee.assigned_cpu().map(|cpu| cpu.as_usize());
+        if has_idle_sibling {
+            assert!(
+                selected.is_some_and(|cpu| (2..cpu_count).contains(&cpu)),
+                "ordinary Fair wake selected {selected:?} instead of an idle sibling"
+            );
+        } else {
+            assert_eq!(
+                selected,
+                Some(0),
+                "ordinary Fair wake must retain its previous CPU when no idle sibling is eligible"
+            );
+        }
     }
     wait_until(
         || DONE.load(Ordering::Acquire),
