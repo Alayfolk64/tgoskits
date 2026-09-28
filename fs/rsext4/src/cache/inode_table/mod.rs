@@ -1,6 +1,18 @@
-//! Inode table cache helpers.
+//! Canonical inode-table state, shared only through a read-only capability.
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+mod demand;
+mod reader;
+mod writeback;
+use alloc::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::AtomicBool;
+
+pub(crate) use demand::InodeLoadVersion;
+pub use reader::InodeCacheReader;
+use reader::SharedInodes;
 
 use crate::{
     blockdev::*,
@@ -68,21 +80,22 @@ pub struct InodeHandle {
 }
 
 /// Inode cache owned exclusively by one mounted filesystem.
-#[derive(Clone)]
 pub struct InodeCache {
-    cache: BTreeMap<InodeCacheKey, CachedInode>,
+    cache: Arc<SharedInodes>,
     max_entries: usize,
     access_counter: u64,
     inode_size: usize,
+    pending_reads: BTreeMap<InodeNumber, Weak<AtomicBool>>,
 }
 
 impl InodeCache {
     pub fn new(max_entries: usize, inode_size: usize) -> Self {
         Self {
-            cache: BTreeMap::new(),
+            cache: Arc::new(SharedInodes::new(BTreeMap::new())),
             max_entries,
             access_counter: 0,
             inode_size,
+            pending_reads: BTreeMap::new(),
         }
     }
 
@@ -134,6 +147,8 @@ impl InodeCache {
         self.ensure_loaded(block_dev, inode_num, block_num, offset)?;
         self.touch(inode_num);
         self.cache
+            .entries
+            .lock()
             .get(&inode_num)
             .cloned()
             .ok_or(Ext4Error::corrupted())
@@ -146,7 +161,7 @@ impl InodeCache {
         block_num: AbsoluteBN,
         offset: usize,
     ) -> Ext4Result<()> {
-        if self.cache.contains_key(&inode_num) {
+        if self.cache.entries.lock().contains_key(&inode_num) {
             return Ok(());
         }
 
@@ -155,19 +170,18 @@ impl InodeCache {
 
         self.make_room(block_dev)?;
 
-        self.cache.insert(
-            inode_num,
-            CachedInode::new(inode, raw_inode, inode_num, block_num, offset),
-        );
+        let cached = CachedInode::new(inode, raw_inode, inode_num, block_num, offset);
+        self.cache.entries.lock().insert(inode_num, cached);
         Ok(())
     }
 
     fn make_room<B: BlockIo>(&mut self, block_dev: &mut Jbd2Dev<B>) -> Ext4Result<()> {
-        if self.cache.len() >= self.max_entries
-            && let Some(victim_num) = self.lru_inode()
-        {
+        let full = self.cache.entries.lock().len() >= self.max_entries;
+        if full && let Some(victim_num) = self.lru_inode() {
             let victim = self
                 .cache
+                .entries
+                .lock()
                 .get(&victim_num)
                 .cloned()
                 .ok_or(Ext4Error::corrupted())?;
@@ -179,7 +193,7 @@ impl InodeCache {
                     &victim.raw_inode,
                 )?;
             }
-            self.cache.remove(&victim_num);
+            self.cache.entries.lock().remove(&victim_num);
         }
 
         Ok(())
@@ -194,8 +208,11 @@ impl InodeCache {
         block_num: AbsoluteBN,
         offset: usize,
     ) -> Ext4Result<()> {
+        self.invalidate_read(inode_num);
         if self
             .cache
+            .entries
+            .lock()
             .get(&inode_num)
             .is_some_and(|cached| cached.dirty)
         {
@@ -207,24 +224,24 @@ impl InodeCache {
         if end > block_dev.block_size() as usize {
             return Err(Ext4Error::corrupted().with_operation("inode_cache:initialize_range"));
         }
-        self.cache.remove(&inode_num);
+        self.cache.entries.lock().remove(&inode_num);
         self.make_room(block_dev)?;
 
-        self.cache.insert(
+        let cached = CachedInode::new(
+            Ext4Inode::default(),
+            alloc::vec![0; self.inode_size],
             inode_num,
-            CachedInode::new(
-                Ext4Inode::default(),
-                alloc::vec![0; self.inode_size],
-                inode_num,
-                block_num,
-                offset,
-            ),
+            block_num,
+            offset,
         );
+        self.cache.entries.lock().insert(inode_num, cached);
         Ok(())
     }
 
     fn lru_inode(&self) -> Option<InodeNumber> {
         self.cache
+            .entries
+            .lock()
             .iter()
             .min_by_key(|(_, cached)| cached.last_access)
             .map(|(inode_num, _)| *inode_num)
@@ -232,23 +249,24 @@ impl InodeCache {
 
     fn touch(&mut self, inode_num: InodeNumber) {
         self.access_counter = self.access_counter.saturating_add(1);
-        if let Some(cached) = self.cache.get_mut(&inode_num) {
+        if let Some(cached) = self.cache.entries.lock().get_mut(&inode_num) {
             cached.last_access = self.access_counter;
             cached.generation = cached.generation.saturating_add(1);
         }
     }
 
     pub fn get(&self, inode_num: InodeNumber) -> Option<CachedInode> {
-        self.cache.get(&inode_num).cloned()
+        self.cache.entries.lock().get(&inode_num).cloned()
     }
 
     pub fn get_mut(&mut self, inode_num: InodeNumber) -> Option<CachedInode> {
         self.touch(inode_num);
-        self.cache.get(&inode_num).cloned()
+        self.cache.entries.lock().get(&inode_num).cloned()
     }
 
     pub fn mark_dirty(&mut self, inode_num: InodeNumber) {
-        if let Some(cached) = self.cache.get_mut(&inode_num) {
+        self.invalidate_read(inode_num);
+        if let Some(cached) = self.cache.entries.lock().get_mut(&inode_num) {
             cached.mark_dirty();
             cached.generation = cached.generation.saturating_add(1);
         }
@@ -266,35 +284,33 @@ impl InodeCache {
         B: BlockIo,
         F: FnOnce(&mut Ext4Inode, &mut [u8]) -> Ext4Result<()>,
     {
+        self.invalidate_read(inode_num);
         self.ensure_loaded(block_dev, inode_num, block_num, offset)?;
         self.touch(inode_num);
 
-        let cached = self
+        let mut cached = self
             .cache
-            .get_mut(&inode_num)
+            .entries
+            .lock()
+            .get(&inode_num)
+            .cloned()
             .ok_or(Ext4Error::corrupted())?;
-        let previous_inode = cached.inode;
-        let previous_raw_inode = cached.raw_inode.clone();
-        if let Err(error) = f(
+        f(
             &mut cached.inode,
             Arc::make_mut(&mut cached.raw_inode).as_mut_slice(),
-        ) {
-            cached.inode = previous_inode;
-            cached.raw_inode = previous_raw_inode;
-            return Err(error);
-        }
+        )?;
         cached.mark_dirty();
         cached.generation = cached.generation.saturating_add(1);
+        let previous = self.cache.entries.lock().insert(inode_num, cached.clone());
+        drop(previous);
 
         if !USE_MULTILEVEL_CACHE {
             let block_num = cached.block_num;
             let offset = cached.offset_in_block;
             let data = cached.raw_inode.clone();
             Self::write_inode_bytes_static(block_dev, block_num, offset, &data)?;
-            let cached = self
-                .cache
-                .get_mut(&inode_num)
-                .ok_or(Ext4Error::corrupted())?;
+            let mut entries = self.cache.entries.lock();
+            let cached = entries.get_mut(&inode_num).ok_or(Ext4Error::corrupted())?;
             cached.dirty = false;
             cached.generation = cached.generation.saturating_add(1);
         }
@@ -321,7 +337,8 @@ impl InodeCache {
         block_dev: &mut Jbd2Dev<B>,
         inode_num: InodeNumber,
     ) -> Ext4Result<()> {
-        let Some(cached) = self.cache.get(&inode_num).cloned() else {
+        self.invalidate_read(inode_num);
+        let Some(cached) = self.cache.entries.lock().get(&inode_num).cloned() else {
             return Ok(());
         };
         if cached.dirty {
@@ -332,15 +349,56 @@ impl InodeCache {
                 &cached.raw_inode,
             )?;
         }
-        self.cache.remove(&inode_num);
+        self.cache.entries.lock().remove(&inode_num);
         Ok(())
     }
 
     pub fn flush_all<B: BlockIo>(&mut self, block_dev: &mut Jbd2Dev<B>) -> Ext4Result<()> {
+        self.flush_selected(block_dev, None)
+    }
+
+    pub(crate) fn dirty_blocks(&self) -> Vec<AbsoluteBN> {
+        let mut blocks: Vec<_> = self
+            .cache
+            .entries
+            .lock()
+            .values()
+            .filter(|cached| cached.dirty)
+            .map(|cached| cached.block_num)
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        blocks
+    }
+
+    /// The caller validates the read epoch before allowing these home bytes
+    /// to participate in journal assembly. Only current dirty records merge.
+    pub(crate) fn flush_pre_read<B: BlockIo>(
+        &mut self,
+        block_dev: &mut Jbd2Dev<B>,
+        blocks: &[(AbsoluteBN, Vec<u8>)],
+    ) -> Ext4Result<()> {
+        self.flush_selected(block_dev, Some(blocks))
+    }
+
+    fn flush_selected<B: BlockIo>(
+        &mut self,
+        block_dev: &mut Jbd2Dev<B>,
+        blocks: Option<&[(AbsoluteBN, Vec<u8>)]>,
+    ) -> Ext4Result<()> {
         let mut dirty = self
             .cache
+            .entries
+            .lock()
             .iter()
-            .filter(|(_, cached)| cached.dirty)
+            .filter(|(_, cached)| {
+                cached.dirty
+                    && blocks.is_none_or(|blocks| {
+                        blocks
+                            .binary_search_by_key(&cached.block_num, |(block, _)| *block)
+                            .is_ok()
+                    })
+            })
             .map(|(inode_num, cached)| {
                 (
                     *inode_num,
@@ -351,10 +409,10 @@ impl InodeCache {
             })
             .collect::<Vec<_>>();
         dirty.sort_by_key(|(_, block_num, offset, _)| (*block_num, *offset));
-        Self::write_dirty_inode_blocks(block_dev, &dirty)?;
+        Self::write_dirty_inode_blocks(block_dev, &dirty, blocks)?;
 
         for (inode_num, ..) in dirty {
-            if let Some(cached) = self.cache.get_mut(&inode_num) {
+            if let Some(cached) = self.cache.entries.lock().get_mut(&inode_num) {
                 cached.dirty = false;
                 cached.generation = cached.generation.saturating_add(1);
             }
@@ -367,7 +425,7 @@ impl InodeCache {
         block_dev: &mut Jbd2Dev<B>,
         inode_num: InodeNumber,
     ) -> Ext4Result<()> {
-        let Some(cached) = self.cache.get(&inode_num).cloned() else {
+        let Some(cached) = self.cache.entries.lock().get(&inode_num).cloned() else {
             return Ok(());
         };
         if cached.dirty {
@@ -377,10 +435,8 @@ impl InodeCache {
                 cached.offset_in_block,
                 &cached.raw_inode,
             )?;
-            let cached = self
-                .cache
-                .get_mut(&inode_num)
-                .ok_or(Ext4Error::corrupted())?;
+            let mut entries = self.cache.entries.lock();
+            let cached = entries.get_mut(&inode_num).ok_or(Ext4Error::corrupted())?;
             cached.dirty = false;
             cached.generation = cached.generation.saturating_add(1);
         }
@@ -388,55 +444,18 @@ impl InodeCache {
     }
 
     pub fn clear(&mut self) {
-        self.cache.clear();
+        self.invalidate_all_reads();
+        let previous = core::mem::take(&mut *self.cache.entries.lock());
+        drop(previous);
     }
 
     pub fn stats(&self) -> InodeCacheStats {
+        let entries = self.cache.entries.lock();
         InodeCacheStats {
-            total_entries: self.cache.len(),
-            dirty_entries: self.cache.values().filter(|cached| cached.dirty).count(),
+            total_entries: entries.len(),
+            dirty_entries: entries.values().filter(|cached| cached.dirty).count(),
             max_entries: self.max_entries,
         }
-    }
-
-    fn write_inode_bytes_static<B: BlockIo>(
-        block_dev: &mut Jbd2Dev<B>,
-        block_num: AbsoluteBN,
-        offset: usize,
-        data: &[u8],
-    ) -> Ext4Result<()> {
-        let mut buffer = alloc::vec![0u8; block_dev.block_size() as usize];
-        block_dev.read_blocks(&mut buffer, block_num, 1)?;
-        let end = offset
-            .checked_add(data.len())
-            .ok_or(Ext4Error::corrupted())?;
-        let dst = buffer.get_mut(offset..end).ok_or(Ext4Error::corrupted())?;
-        dst.copy_from_slice(data);
-        block_dev.write_blocks(&buffer, block_num, 1, true)
-    }
-
-    fn write_dirty_inode_blocks<B: BlockIo>(
-        block_dev: &mut Jbd2Dev<B>,
-        dirty: &[(InodeNumber, AbsoluteBN, usize, Arc<Vec<u8>>)],
-    ) -> Ext4Result<()> {
-        let mut index = 0;
-        while index < dirty.len() {
-            let block_num = dirty[index].1;
-            let mut buffer = alloc::vec![0u8; block_dev.block_size() as usize];
-            block_dev.read_blocks(&mut buffer, block_num, 1)?;
-
-            while index < dirty.len() && dirty[index].1 == block_num {
-                let (_, _, offset, data) = &dirty[index];
-                let end = offset
-                    .checked_add(data.len())
-                    .ok_or(Ext4Error::corrupted())?;
-                let dst = buffer.get_mut(*offset..end).ok_or(Ext4Error::corrupted())?;
-                dst.copy_from_slice(data);
-                index += 1;
-            }
-            block_dev.write_blocks(&buffer, block_num, 1, true)?;
-        }
-        Ok(())
     }
 }
 
@@ -448,38 +467,4 @@ pub struct InodeCacheStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_inode_location_calc() {
-        let cache = InodeCache::default(DEFAULT_INODE_SIZE);
-        let inodes_per_group = 128;
-        let inode_table_start = AbsoluteBN::new(100);
-
-        let (block, offset, group) = cache
-            .calc_inode_location(
-                InodeNumber::new(1).unwrap(),
-                inodes_per_group,
-                inode_table_start,
-                BLOCK_SIZE,
-            )
-            .unwrap();
-        assert_eq!(block, inode_table_start);
-        assert_eq!(offset, 0);
-        assert_eq!(group, BGIndex::new(0));
-
-        let inodes_per_block = (BLOCK_SIZE / DEFAULT_INODE_SIZE as usize) as u32;
-        let (block, offset, group) = cache
-            .calc_inode_location(
-                InodeNumber::new(inodes_per_block + 1).unwrap(),
-                inodes_per_group,
-                inode_table_start,
-                BLOCK_SIZE,
-            )
-            .unwrap();
-        assert_eq!(block, AbsoluteBN::new(101));
-        assert_eq!(offset, 0);
-        assert_eq!(group, BGIndex::new(0));
-    }
-}
+mod tests;
