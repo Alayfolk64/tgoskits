@@ -303,6 +303,15 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
         WAKEE_WAIT.notify_one()
     };
     assert!(delivered, "the Fair wake must claim the parked waiter");
+    if !synchronous {
+        // Check the wake transaction before this CPU yields: a later idle
+        // pull may migrate the runnable wakee without changing its placement.
+        assert_eq!(
+            wakee.assigned_cpu().map(|cpu| cpu.as_usize()),
+            Some(0),
+            "ordinary Fair wake must retain its previous CPU"
+        );
+    }
     wait_until(
         || DONE.load(Ordering::Acquire),
         "the Fair wakee did not make bounded progress",
@@ -313,11 +322,6 @@ fn fair_wake_placement(cpu_count: usize, synchronous: bool) {
         assert!(
             (2..cpu_count).contains(&wake_cpu),
             "synchronous Fair wake selected busy CPU{wake_cpu} instead of an idle sibling"
-        );
-    } else {
-        assert_eq!(
-            wake_cpu, 0,
-            "ordinary Fair wake must retain its previous CPU"
         );
     }
 
