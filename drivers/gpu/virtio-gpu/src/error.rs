@@ -4,9 +4,9 @@ use thiserror::Error as ThisError;
 
 /// Error type of the VirtIO GPU protocol core.
 ///
-/// Domain failures that callers can act on are named directly; anything else
-/// from the underlying virtio transport or driver is kept as
-/// [`Error::VirtIo`] so no information is lost.
+/// Domain failures that callers can act on are named directly. Transport
+/// errors are retained as [`Error::VirtIo`] unless command completion is
+/// ambiguous and the device must be reset.
 #[derive(Debug, ThisError)]
 #[non_exhaustive]
 pub enum Error {
@@ -16,12 +16,18 @@ pub enum Error {
     /// The device is not in a state that supports the requested operation.
     #[error("the device is not ready")]
     NotReady,
+    /// The device was reset because a command's completion could not be confirmed.
+    #[error("the device was lost after an unconfirmed command")]
+    DeviceLost,
     /// A parameter supplied by the caller is invalid.
     #[error("invalid parameter")]
     InvalidParam,
     /// The device answered with something other than the expected response.
     #[error("unexpected response from the device")]
     InvalidResponse,
+    /// The device explicitly rejected a command with this VirtIO GPU response code.
+    #[error("device rejected command with response code {0:#x}")]
+    DeviceRejected(u32),
     /// The response does not fit into the receive buffer.
     #[error("the device response does not fit into the receive buffer")]
     ResponseTooLarge,

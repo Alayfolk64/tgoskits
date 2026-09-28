@@ -52,6 +52,16 @@ fn probe_fdt(probe: rdrive::register::ProbeFdt<'_>) -> Result<(), rdrive::probe:
     if device_type == DeviceType::Socket {
         return vsock::register_fdt_transport(&info, platform_device, transport);
     }
+    #[cfg(feature = "virtio-gpu")]
+    if device_type == DeviceType::GPU {
+        let binding = crate::binding_info_from_fdt(&info)?;
+        return display::register_transport_with_info(
+            platform_device,
+            transport,
+            binding,
+            crate::binding_resolver::dma_coherency_from_fdt(&info),
+        );
+    }
     register_static_transport(platform_device, device_type, transport)
 }
 
@@ -138,7 +148,7 @@ pub fn register_static_mmio(
     feature = "virtio-input",
     feature = "virtio-socket",
 ))]
-pub fn register_static_transport<T: Transport + 'static>(
+pub fn register_static_transport<T: Transport + Send + 'static>(
     _plat_dev: rdrive::PlatformDevice,
     ty: DeviceType,
     _transport: T,

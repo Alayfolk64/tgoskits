@@ -14,15 +14,15 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
     BLOB_FLAG_USE_CROSS_DEVICE, BLOB_FLAG_USE_MASK, BLOB_MEM_GUEST, BLOB_MEM_HOST3D,
-    BLOB_MEM_HOST3D_GUEST, CapsetInfo, Error, IrqEvent, Rect, ResourceCreate3d, ResourceCreateBlob,
-    Transfer3d,
+    BLOB_MEM_HOST3D_GUEST, BlobMemory, CapsetInfo, Error, IrqEvent, OutputInfo, Rect,
+    Resource2dFormat, ResourceCreate3d, ResourceCreateBlob, Transfer3d,
     dma::Dma,
     wire::{
         CmdCtxCreate, CmdCtxResource, CmdGetCapset, CmdGetCapsetInfo, CmdResourceCreate3D,
         CmdResourceCreateBlob, CmdSubmit3D, CmdTransferHost3D, Command, Config, CtrlHeader,
-        Features, Format, MemEntry, ResourceAttachBacking, ResourceCreate2D, ResourceDetachBacking,
-        ResourceFlush, ResourceUnref, RespCapsetInfo, RespDisplayInfo, SUPPORTED_FEATURES,
-        SetScanout, TransferToHost2D, VIRTIO_GPU_EVENT_DISPLAY,
+        Features, GPU_FLAG_FENCE, MemEntry, ResourceAttachBacking, ResourceCreate2D,
+        ResourceDetachBacking, ResourceFlush, ResourceUnref, RespCapsetInfo, RespDisplayInfo,
+        SUPPORTED_FEATURES, SetScanout, SetScanoutBlob, TransferToHost2D, VIRTIO_GPU_EVENT_DISPLAY,
     },
 };
 
@@ -74,12 +74,16 @@ pub struct VirtIoGpu<H: Hal, T: Transport> {
     /// by-value request that would go out of scope while the device still reads
     /// it. See [`VirtIoGpu::request_with_len`].
     queue_buf_send: Box<[u8]>,
+    next_fence: u64,
     /// Whether the VIRGL 3D feature was negotiated.
     has_virgl: bool,
     /// Whether `VIRTIO_GPU_F_RESOURCE_BLOB` was negotiated.
     has_resource_blob: bool,
     /// Whether `VIRTIO_GPU_F_CONTEXT_INIT` was negotiated.
     has_context_init: bool,
+    /// Device-advertised scanouts, capped to the protocol's sixteen entries.
+    num_scanouts: u32,
+    reset_done: bool,
 }
 
 impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
@@ -120,9 +124,51 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             control_queue,
             queue_buf_recv,
             queue_buf_send,
+            next_fence: 1,
             has_virgl,
             has_resource_blob,
             has_context_init,
+            num_scanouts: num_scanouts.min(16),
+            reset_done: false,
+        })
+    }
+
+    /// Number of output slots exposed by this device.
+    pub fn output_count(&self) -> u32 {
+        self.num_scanouts
+    }
+
+    /// Stops all host DMA before an adapter releases backing after an
+    /// ambiguous transport failure. The device must not be used again.
+    pub fn reset(&mut self) {
+        if self.reset_done {
+            return;
+        }
+        self.transport.set_status(DeviceStatus::empty());
+        // VirtIO requires reading status 0 before the driver may release
+        // queue memory or any backing the device could still access.
+        while !self.transport.get_status().is_empty() {
+            core::hint::spin_loop();
+        }
+        self.transport.queue_unset(CONTROL_QUEUE);
+        self.reset_done = true;
+    }
+
+    #[cfg(feature = "rdif")]
+    pub(crate) fn is_reset(&self) -> bool {
+        self.reset_done
+    }
+
+    /// Reads the current connection and preferred rectangle for an output.
+    pub fn output_info(&mut self, index: u32) -> Result<OutputInfo, Error> {
+        if index >= self.num_scanouts {
+            return Err(Error::InvalidParam);
+        }
+        let info = self.display_info()?;
+        let mode = info.pmodes[index as usize];
+        Ok(OutputInfo {
+            rect: mode.rect,
+            enabled: mode.enabled != 0,
         })
     }
 
@@ -172,7 +218,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
 
     /// Returns the device's current display resolution in pixels.
     pub fn resolution(&mut self) -> Result<(u32, u32), Error> {
-        let info = self.display_info()?;
+        let info = self.output_info(0)?;
         Ok((info.rect.width, info.rect.height))
     }
 
@@ -181,7 +227,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     /// See [`VirtIoGpu::change_resolution`] for the validity of the returned
     /// slice.
     pub fn setup_framebuffer(&mut self) -> Result<&mut [u8], Error> {
-        let info = self.display_info()?;
+        let info = self.output_info(0)?;
         self.change_resolution(info.rect.width, info.rect.height)
     }
 
@@ -223,7 +269,12 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
 
         // Create the resource. If this fails the DMA drops here (the device has
         // never seen it) and there is nothing to roll back.
-        self.resource_create_2d(FRAMEBUFFER_RESOURCE_ID, width, height)?;
+        self.resource_create_2d(
+            FRAMEBUFFER_RESOURCE_ID,
+            width,
+            height,
+            Resource2dFormat::B8G8R8X8Unorm,
+        )?;
 
         // SAFETY: `frame_buffer_dma` owns a live, zeroed, at least `size` byte
         // DMA region (the allocation is rounded up to whole pages). On the
@@ -305,17 +356,18 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
 
     // --- 2D resource and scanout commands ---
 
-    /// Creates a 2D resource in `B8G8R8A8_UNORM` format.
+    /// Creates a 2D resource in the requested device format.
     pub fn resource_create_2d(
         &mut self,
         resource_id: u32,
         width: u32,
         height: u32,
+        format: Resource2dFormat,
     ) -> Result<(), Error> {
         let response: CtrlHeader = self.request(ResourceCreate2D {
             header: CtrlHeader::with_type(Command::RESOURCE_CREATE_2D),
             resource_id,
-            format: Format::B8G8R8A8Unorm,
+            format,
             width,
             height,
         })?;
@@ -334,6 +386,34 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             rect,
             scanout_id,
             resource_id,
+        })?;
+        response.check_type(Command::OK_NODATA)
+    }
+
+    /// Binds a blob resource to a scanout with one packed pixel plane.
+    pub fn set_scanout_blob(
+        &mut self,
+        rect: Rect,
+        scanout_id: u32,
+        resource_id: u32,
+        format: u32,
+        stride: u32,
+        offset: u32,
+    ) -> Result<(), Error> {
+        if !self.has_resource_blob {
+            return Err(Error::Unsupported);
+        }
+        let response: CtrlHeader = self.request(SetScanoutBlob {
+            header: CtrlHeader::with_type(Command::SET_SCANOUT_BLOB),
+            rect,
+            scanout_id,
+            resource_id,
+            width: rect.width,
+            height: rect.height,
+            format,
+            _padding: 0,
+            strides: [stride, 0, 0, 0],
+            offsets: [offset, 0, 0, 0],
         })?;
         response.check_type(Command::OK_NODATA)
     }
@@ -392,22 +472,59 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         paddr: u64,
         length: u32,
     ) -> Result<(), Error> {
-        if length == 0 {
+        // SAFETY: the caller promises this one range remains valid until
+        // detach or unref, exactly as required by the multi-entry method.
+        unsafe {
+            self.resource_attach_backing_segments(resource_id, &[BlobMemory { paddr, length }])
+        }
+    }
+
+    /// Attaches device-visible ranges to a resource in their supplied order.
+    ///
+    /// # Safety
+    ///
+    /// Every range must remain mapped, allocated and free of conflicting CPU
+    /// access until the device confirms detach or unref. The caller must own
+    /// all ranges for the entire attachment lifetime.
+    pub unsafe fn resource_attach_backing_segments(
+        &mut self,
+        resource_id: u32,
+        segments: &[BlobMemory],
+    ) -> Result<(), Error> {
+        if segments.is_empty() {
             return Err(Error::InvalidParam);
         }
-        // The device walks `paddr..paddr + length`; a wrapped extent would hand
-        // it a range that has nothing to do with the caller's allocation.
-        paddr
-            .checked_add(u64::from(length))
+        let nr_entries = u32::try_from(segments.len()).map_err(|_| Error::Overflow)?;
+        let capacity = segments
+            .len()
+            .checked_mul(size_of::<MemEntry>())
             .ok_or(Error::Overflow)?;
-        let response: CtrlHeader = self.request(ResourceAttachBacking {
-            header: CtrlHeader::with_type(Command::RESOURCE_ATTACH_BACKING),
-            resource_id,
-            nr_entries: 1,
-            addr: paddr,
-            length,
-            _padding: 0,
-        })?;
+        let mut data = Vec::with_capacity(capacity);
+        for segment in segments {
+            if segment.length == 0 {
+                return Err(Error::InvalidParam);
+            }
+            segment
+                .paddr
+                .checked_add(u64::from(segment.length))
+                .ok_or(Error::Overflow)?;
+            data.extend_from_slice(
+                MemEntry {
+                    addr: segment.paddr,
+                    length: segment.length,
+                    padding: 0,
+                }
+                .as_bytes(),
+            );
+        }
+        let response: CtrlHeader = self.request_with_data(
+            ResourceAttachBacking {
+                header: CtrlHeader::with_type(Command::RESOURCE_ATTACH_BACKING),
+                resource_id,
+                nr_entries,
+            },
+            &data,
+        )?;
         response.check_type(Command::OK_NODATA)
     }
 
@@ -415,7 +532,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     ///
     /// After this returns, the device no longer reads or writes the ranges that
     /// were attached.
-    fn resource_detach_backing(&mut self, resource_id: u32) -> Result<(), Error> {
+    pub fn resource_detach_backing(&mut self, resource_id: u32) -> Result<(), Error> {
         let response: CtrlHeader = self.request(ResourceDetachBacking {
             header: CtrlHeader::with_type(Command::RESOURCE_DETACH_BACKING),
             resource_id,
@@ -643,10 +760,10 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     ///
     /// `cmds` is the encoded stream produced by the Mesa virgl Gallium driver
     /// in userspace and is sent as a second buffer next to the `SUBMIT_3D`
-    /// header. `fence_id` is assigned by the caller; the host signals that fence
-    /// once the stream has been processed. The stream length must be a multiple
+    /// header. The control queue assigns a fence and waits until the host
+    /// processes the stream. The stream length must be a multiple
     /// of four, because the host passes `size / 4` dwords to virglrenderer.
-    pub fn submit_3d(&mut self, ctx_id: u32, fence_id: u64, cmds: &[u8]) -> Result<(), Error> {
+    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8]) -> Result<(), Error> {
         self.require_virgl()?;
         if !cmds.len().is_multiple_of(size_of::<u32>()) {
             return Err(Error::InvalidParam);
@@ -654,7 +771,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         let size = u32::try_from(cmds.len()).map_err(|_| Error::Overflow)?;
         let response: CtrlHeader = self.request_with_data(
             CmdSubmit3D {
-                header: CtrlHeader::with_fence(Command::SUBMIT_3D, ctx_id, fence_id),
+                header: CtrlHeader::with_type_and_ctx(Command::SUBMIT_3D, ctx_id),
                 size,
                 _padding: 0,
             },
@@ -814,13 +931,22 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         Req: IntoBytes + Immutable,
         Rsp: FromBytes,
     {
-        let req_len = copy_request_into(&mut self.queue_buf_send, &req)?;
+        let (req_len, fence_id) = self.prepare_request(&req)?;
         let used_len = self.control_queue.add_notify_wait_pop(
             &[&self.queue_buf_send[..req_len]],
             &mut [&mut self.queue_buf_recv],
             &mut self.transport,
-        )? as usize;
-        let response = self.parse_response(used_len)?;
+        );
+        let used_len = match used_len {
+            Ok(length) => length as usize,
+            Err(_) => {
+                // Submission may have reached the device. Stop DMA before
+                // callers can drop backing after this ambiguous completion.
+                self.reset();
+                return Err(Error::DeviceLost);
+            }
+        };
+        let response = self.finish_request(used_len, fence_id)?;
         Ok((response, used_len))
     }
 
@@ -837,7 +963,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         Req: IntoBytes + Immutable,
         Rsp: FromBytes,
     {
-        let req_len = copy_request_into(&mut self.queue_buf_send, &req)?;
+        let (req_len, fence_id) = self.prepare_request(&req)?;
         let inputs: &[&[u8]] = if data.is_empty() {
             &[&self.queue_buf_send[..req_len]]
         } else {
@@ -847,8 +973,68 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             inputs,
             &mut [&mut self.queue_buf_recv],
             &mut self.transport,
-        )? as usize;
+        );
+        let used_len = match used_len {
+            Ok(length) => length as usize,
+            Err(_) => {
+                self.reset();
+                return Err(Error::DeviceLost);
+            }
+        };
+        self.finish_request(used_len, fence_id)
+    }
+
+    fn finish_request<Rsp: FromBytes>(
+        &mut self,
+        used_len: usize,
+        fence_id: u64,
+    ) -> Result<Rsp, Error> {
+        let header = match self.check_fence_response(used_len, fence_id) {
+            Ok(header) => header,
+            Err(_) => {
+                // A used descriptor alone does not prove that a control
+                // command has stopped accessing its backing.
+                self.reset();
+                return Err(Error::DeviceLost);
+            }
+        };
+        if let Some(error) = header.rejection() {
+            return Err(error);
+        }
         self.parse_response(used_len)
+    }
+
+    fn prepare_request<Req: IntoBytes + Immutable>(
+        &mut self,
+        req: &Req,
+    ) -> Result<(usize, u64), Error> {
+        if self.reset_done {
+            return Err(Error::DeviceLost);
+        }
+        let req_len = copy_request_into(&mut self.queue_buf_send, req)?;
+        if req_len < size_of::<CtrlHeader>() {
+            return Err(Error::InvalidParam);
+        }
+        let fence_id = self.next_fence;
+        self.next_fence = fence_id.checked_add(1).ok_or(Error::Overflow)?;
+        // Every public operation reports synchronous completion. VirtIO GPU
+        // may otherwise return a used response before host processing ends.
+        self.queue_buf_send[4..8].copy_from_slice(&GPU_FLAG_FENCE.to_le_bytes());
+        self.queue_buf_send[8..16].copy_from_slice(&fence_id.to_le_bytes());
+        Ok((req_len, fence_id))
+    }
+
+    fn check_fence_response(&self, used_len: usize, fence_id: u64) -> Result<CtrlHeader, Error> {
+        if used_len > self.queue_buf_recv.len() {
+            return Err(Error::ResponseTooLarge);
+        }
+        if used_len < size_of::<CtrlHeader>() {
+            return Err(Error::InvalidResponse);
+        }
+        let (header, _) = CtrlHeader::read_from_prefix(&self.queue_buf_recv[..used_len])
+            .map_err(|_| Error::InvalidResponse)?;
+        header.check_fence(fence_id)?;
+        Ok(header)
     }
 
     /// Validates the response length and parses `Rsp` from exactly the bytes the
@@ -881,19 +1067,9 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
 
 impl<H: Hal, T: Transport> Drop for VirtIoGpu<H, T> {
     fn drop(&mut self) {
-        // Reset the device before any field is released. Writing an empty
-        // status tells the device to drop its driver state, which stops the
-        // scanout and tears down the host-side resource backing, so the device
-        // stops issuing DMA. Without this the device could keep scanning out of
-        // (or writing into) the framebuffer DMA that `frame_buffer_dma` frees
-        // when the fields below are dropped, a use-after-free from the device's
-        // point of view. A status write is a single register or PCI capability
-        // write, so it cannot block on the control queue; no control command is
-        // sent here.
-        self.transport.set_status(DeviceStatus::empty());
-        // Clear the queue registration so the device cannot keep reading the
-        // descriptor rings after the transport and its DMA are released.
-        self.transport.queue_unset(CONTROL_QUEUE);
+        // Confirm that the device stopped DMA before dropping queue memory
+        // and any backing retained by the RDIF owner.
+        self.reset();
     }
 }
 
