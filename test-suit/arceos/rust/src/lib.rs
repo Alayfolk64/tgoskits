@@ -316,7 +316,7 @@ const SELECTED_TESTS: &[TestCase] = &[
     #[cfg(feature = "task-fair-wake-idle-sibling")]
     TestCase::new(
         "task-fair-wake-idle-sibling",
-        "Fair wake selects an idle sibling",
+        "Fair wake placement respects wake intent",
         run_task_fair_wake_idle_sibling,
     ),
     #[cfg(feature = "task-ipi")]
