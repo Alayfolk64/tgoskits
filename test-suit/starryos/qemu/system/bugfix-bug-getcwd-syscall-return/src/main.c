@@ -6,6 +6,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+/* LTP getcwd01/02 cover invalid buffers and libc path results. These checks
+ * cover the raw syscall return length and paths relative to a chroot. */
 static int passed;
 static int failed;
 
@@ -48,58 +50,6 @@ static void expect_raw_getcwd_length(void)
              "ret=%ld errno=%d (%s) buf='%s', expected ret=%ld buf='/tmp'",
              ret, errno, strerror(errno), buf, expected);
     note_fail("raw getcwd length", detail);
-}
-
-static void expect_small_buffer_erange(void)
-{
-    char buf[2];
-    errno = 0;
-    long ret = getcwd_raw(buf, sizeof(buf));
-    int saved_errno = errno;
-    if (ret == -1 && saved_errno == ERANGE) {
-        note_pass("raw getcwd rejects too-small buffer with ERANGE");
-        return;
-    }
-
-    char detail[160];
-    snprintf(detail, sizeof(detail),
-             "ret=%ld errno=%d (%s), expected -1/ERANGE",
-             ret, saved_errno, strerror(saved_errno));
-    note_fail("raw getcwd small buffer", detail);
-}
-
-static void expect_null_small_buffer_erange(void)
-{
-    errno = 0;
-    long ret = getcwd_raw(NULL, strlen("/tmp"));
-    int saved_errno = errno;
-    if (ret == -1 && saved_errno == ERANGE) {
-        note_pass("raw getcwd rejects null too-small buffer with ERANGE");
-        return;
-    }
-
-    char detail[160];
-    snprintf(detail, sizeof(detail),
-             "ret=%ld errno=%d (%s), expected -1/ERANGE",
-             ret, saved_errno, strerror(saved_errno));
-    note_fail("raw getcwd null small buffer", detail);
-}
-
-static void expect_null_buffer_efault(void)
-{
-    errno = 0;
-    long ret = getcwd_raw(NULL, 32);
-    int saved_errno = errno;
-    if (ret == -1 && saved_errno == EFAULT) {
-        note_pass("raw getcwd rejects null buffer with EFAULT");
-        return;
-    }
-
-    char detail[160];
-    snprintf(detail, sizeof(detail),
-             "ret=%ld errno=%d (%s), expected -1/EFAULT",
-             ret, saved_errno, strerror(saved_errno));
-    note_fail("raw getcwd null buffer", detail);
 }
 
 static void expect_getcwd_relative_to_chroot(void)
@@ -147,9 +97,6 @@ int main(void)
     printf("=== bug-getcwd-syscall-return ===\n");
 
     expect_raw_getcwd_length();
-    expect_small_buffer_erange();
-    expect_null_small_buffer_erange();
-    expect_null_buffer_efault();
     expect_getcwd_relative_to_chroot();
 
     printf("=== Results: %d passed, %d failed ===\n", passed, failed);
