@@ -410,7 +410,15 @@ where
         if is_huge || level == 1 {
             let page_size = Self::level_size(level);
             let aligned_paddr = PhysAddr::from_usize(paddr.as_usize() & !(page_size - 1));
-            self.as_slice_mut()[index] = T::P::new_page(aligned_paddr, config, is_huge);
+            let replacement = T::P::new_page(aligned_paddr, config, is_huge);
+            if entry.paddr(is_dir) != aligned_paddr {
+                // Construct before breaking the old mapping: no fallible step
+                // may strand an absent leaf. Its table remains attached, and
+                // the caller retains both physical owners across completion.
+                self.as_slice_mut()[index].clear();
+                T::flush_batch(&[vaddr]);
+            }
+            self.as_slice_mut()[index] = replacement;
             return Ok(page_size);
         }
         if !entry.present() {

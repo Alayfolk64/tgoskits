@@ -14,7 +14,8 @@ core::cfg_select! {
 }
 use ax_memory_addr::PAGE_SIZE_4K;
 pub use page_table_generic::{
-    FrameAllocator, MapConfig, PageTableEntry, PageTableOp, PagingError, PagingResult, TableMeta,
+    FrameAllocator, MapConfig, MappedLeaf, PageTableEntry, PageTableOp, PagingError, PagingResult,
+    TableMeta,
 };
 
 use crate::mem::{phys_to_virt, virt_to_phys};
@@ -80,3 +81,7 @@ pub type HugeSplitApplyError =
     page_table_generic::HugeSplitApplyError<ArchPagingMeta, PagingAllocator>;
 /// Receipt for a child table installed by consuming a [`HugeSplitDeposit`].
 pub type InstalledHugeSplit = page_table_generic::InstalledHugeSplit<ArchPagingMeta>;
+
+/// A scoped unmap operation using the kernel table allocator and flush capability.
+pub type UnmapSession<'a, O, R> =
+    page_table_generic::UnmapSession<'a, ArchPagingMeta, PagingAllocator, O, R>;

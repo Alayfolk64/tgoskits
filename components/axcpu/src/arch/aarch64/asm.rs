@@ -177,6 +177,49 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     super::mmu::El1::flush_tlb(vaddr);
 }
 
+/// Completes EL1 inner-shareable invalidation for changed page/table descriptors.
+///
+/// Unlike the local full-flush helper, this operation covers remote hardware
+/// walkers before the caller can recycle physical pages. Small batches retain
+/// targeted invalidation; large batches use all-entry broadcast, without
+/// requiring FEAT_TLBIRANGE on baseline ARMv8 CPUs.
+pub fn flush_tlb_batch(vaddrs: &[VirtAddr]) {
+    if vaddrs.is_empty() {
+        return;
+    }
+    // SAFETY: Runtime executes at its configured EL. The leading barrier makes
+    // prior PTE stores visible before TLBI; the trailing barrier completes the
+    // broadcast before any caller can reuse a detached table or mapped page.
+    unsafe {
+        asm!("dsb ishst", options(nostack, preserves_flags));
+        if vaddrs.len() > 32 {
+            asm!("tlbi vmalle1is", options(nostack, preserves_flags));
+        } else {
+            for vaddr in vaddrs {
+                let operand = (vaddr.as_usize() >> 12) & ((1usize << 44) - 1);
+                asm!("tlbi vaae1is, {}", in(reg) operand, options(nostack, preserves_flags));
+            }
+        }
+        asm!("dsb ish; isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Completes descriptor publication for a previously absent mapping.
+///
+/// Previous valid translations must already have been invalidated on all
+/// hardware users. Translation-fault results are not cached in AArch64 TLBs;
+/// only publication and context synchronization are required here. This must
+/// not replace invalidation for remapping, permission changes or retirement.
+#[inline]
+pub fn publish_new_mapping() {
+    // SAFETY: runtime executes at its configured privileged EL. The store
+    // barrier completes prior table writes; ISB synchronizes subsequent local
+    // accesses with the new translation without broadcasting a TLBI.
+    unsafe {
+        asm!("dsb ishst; isb", options(nostack, preserves_flags));
+    }
+}
+
 /// Makes a page-table entry installed by the local page-fault handler visible
 /// before retrying the faulting instruction.
 ///

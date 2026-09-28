@@ -4,14 +4,17 @@ use core::fmt::Debug;
 
 mod def;
 pub mod frame;
+mod install;
 mod map;
 mod table;
+mod unmap;
 mod walk;
 
 pub use def::*;
 pub use frame::{DetachedPageTableFrame, Frame};
 pub use map::*;
 pub use table::*;
+pub use unmap::{MappedLeaf, UnmapSession};
 pub use walk::*;
 
 pub type PagingResult<T = ()> = Result<T, PagingError>;
@@ -79,6 +82,33 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
 
     /// 刷新TLB
     fn flush(vaddr: Option<VirtAddr>);
+
+    /// Completes invalidation for a batch of changed mapping/table descriptors.
+    ///
+    /// The caller has already published the descriptor updates. Before this
+    /// method returns, stale translations and walks through those descriptors
+    /// must be unusable by every CPU allowed to access this table. Implementors
+    /// must supply the publication and completion barriers for their format.
+    /// The default preserves the scope of `flush(Some(address))`; metadata with
+    /// only local invalidation must restrict table use accordingly.
+    fn flush_batch(vaddrs: &[VirtAddr]) {
+        for &vaddr in vaddrs {
+            Self::flush(Some(vaddr));
+        }
+    }
+
+    /// Completes publication of a newly installed, previously absent mapping.
+    ///
+    /// The caller has excluded software mutation and completed any previous
+    /// removal of this address on all hardware users. This is not sufficient
+    /// for replacing a mapped page, revoking permissions or retiring a table.
+    /// Implementations may omit invalidation only when their architecture
+    /// cannot retain the formerly absent translation. Descriptor stores must
+    /// become visible before the faulting instruction is retried.
+    /// The default retains the existing batch invalidation scope.
+    fn publish_new_mapping(vaddr: VirtAddr) {
+        Self::flush_batch(core::slice::from_ref(&vaddr));
+    }
 }
 
 pub trait PageTableEntry: Debug + Sync + Send + Clone + Copy + Sized + 'static {
