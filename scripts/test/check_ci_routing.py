@@ -175,7 +175,7 @@ def main() -> int:
                 "push run recheck must return its current lifecycle state",
             ),
             (
-                "queued|in_progress|waiting|requested)",
+                "queued|pending|in_progress|waiting|requested)",
                 "only known unfinished push states may suppress pull request CI",
             ),
             (

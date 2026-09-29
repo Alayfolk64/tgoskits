@@ -204,8 +204,8 @@ class DuplicateEventRoutingTests(unittest.TestCase):
             any("actions/runs/101/jobs" in call for call in result.gh_calls)
         )
 
-    def test_waiting_and_requested_pushes_suppress_pull_request(self) -> None:
-        for status in ("waiting", "requested"):
+    def test_pending_waiting_and_requested_pushes_suppress_pull_request(self) -> None:
+        for status in ("pending", "waiting", "requested"):
             with self.subTest(status=status):
                 result = run_route(
                     event_name="pull_request",

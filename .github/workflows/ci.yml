@@ -157,7 +157,7 @@ jobs:
                 # Push routing is canonical, so an unfinished matching run owns
                 # validation before GitHub materializes its matrix jobs.
                 case "$current_status" in
-                  queued|in_progress|waiting|requested)
+                  queued|pending|in_progress|waiting|requested)
                     ;;
                   completed)
                     if ! active_matrix_jobs="$(
