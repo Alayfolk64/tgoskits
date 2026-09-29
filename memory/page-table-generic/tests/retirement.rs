@@ -18,7 +18,7 @@ fn huge_page_conflict_reports_existing_physical_address() {
 }
 
 #[test]
-fn detached_tables_are_invalidated_before_allocator_reuse() {
+fn single_leaf_unmap_retains_intermediate_tables_for_remote_walkers() {
     let mut table =
         PageTable::<RetirementMeta, RetirementAllocator>::new(RetirementAllocator).unwrap();
     table
@@ -28,24 +28,10 @@ fn detached_tables_are_invalidated_before_allocator_reuse() {
 
     table.unmap_page(0x20_0000.into()).unwrap();
 
+    assert_eq!(table.query(0x20_0000.into()), Err(PagingError::NotMapped));
     EVENTS.with_borrow(|events| {
-        let mut pending_clear = false;
-        let mut frees = 0;
-        for event in events {
-            match event {
-                Event::Clear => pending_clear = true,
-                Event::Flush => pending_clear = false,
-                Event::Batch(_) => {}
-                Event::Free => {
-                    assert!(
-                        !pending_clear,
-                        "table freed before its unlink was invalidated: {events:?}"
-                    );
-                    frees += 1;
-                }
-            }
-        }
-        assert_eq!(frees, 3, "all child tables must be reclaimed");
+        assert!(events.iter().any(|event| matches!(event, Event::Flush)));
+        assert!(!events.iter().any(|event| matches!(event, Event::Free)));
     });
 }
 
