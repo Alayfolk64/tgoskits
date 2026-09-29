@@ -382,3 +382,29 @@ AArch64 客户机向量中的致命宿主异常通过 `ax_cpu::trap::fatal::Fata
 Starry 的可执行文件页、COW 拷贝及预填充由 `PageObject::prepare_executable_mapping` 在可执行 PTE 发布前完成缓存同步，mprotect 同样先同步被保留的叶子页。AArch64 使用直接映射别名清理 D-cache 到 PoU，再以 `ic ialluis; dsb ish; isb` 完成 Inner Shareable 指令缓存失效；远端 CPU 的用户异常返回提供 context synchronization。只执行 TLBI、加原子屏障或只在首次进入用户态清缓存不能覆盖后续缺页。
 
 对照 Linux `8cd9520d35a6c38db6567e97dd93b1f11f185dc6` 的 `__set_ptes_anysz -> __sync_cache_and_tags -> __sync_icache_dcache`。用 `cargo xtask starry test board --board orangepi-5-plus --test-case exec-cache` 验证文件页内核写入后的重新取指；QEMU 只作为执行路径检查，不作为 I-cache/D-cache 实机红绿证明。完整所有权与证据见 `docs/design/user-executable-cache-coherence.md`。
+## 宿主 initramfs
+
+宿主归档的构建、交接、预留、解包、根选择与回收顺序见
+[`docs/design/host-initramfs.md`](../../../../docs/design/host-initramfs.md)。
+诊断 QEMU `-initrd`、FIT ramdisk 或 UEFI/HTTP Boot 时，先区分宿主归档与
+Axvisor Linux guest 的 `ramdisk_path`。FDT `linux,initrd-start/end` 必须在
+页分配器启动前预留，按页扩展的范围也必须位于 RAM。UEFI 与 FDT 同时存在时，
+UEFI 内存图负责 RAM 分类，FDT 只补充保留区；LoongArch UEFI 入口不能再次清零
+已保存交接状态的 `.bss`。可回收归档属于物理 RAM，但在解包完成前仍须排除在
+启动分配器之外。UEFI/HTTP 镜像必须在 `ExitBootServices` 前完成读取和校验。
+UEFI 配置表和 ESP cmdline 含内部 NUL 时必须拒绝，不能静默截断启动参数。
+内置归档通过同一解包器，但不能代替外部传输验证。
+QEMU 定向回归使用 `cargo xtask starry test qemu --arch aarch64 --test-case
+qemu/host-initramfs`、`qemu/host-initramfs-disk-fallback`，以及 `cargo xtask
+axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-host-initramfs`。
+axbuild 读取 case 下的 `host-initramfs.toml` 生成归档，内存根用例不接磁盘，
+磁盘回退用例保留主 rootfs drive。ArceOS 的内建和外部镜像测试命令见设计文档。
+Axvisor 宿主 archive 可以与明确命名的 guest drive 并存；判断是否准备宿主根盘时
+只把 `disk0`、匿名或直连盘视为宿主接线。检查 `root=` 时同时查看 ostool
+`cmdline` 和原始 QEMU `-append`，显式磁盘根没有可识别的宿主根盘应在配置阶段失败。
+补盘器同时接受 `-drive ...` 和 `-drive=...`，`-device` 亦然。
+没有 `disk0` 接线时，`replace_drive_arg()` 仅改写唯一匿名文件后端；
+多个匿名后端必须显式指定宿主 `disk0`，不能任意选择其中一个。
+宿主根盘若使用 `-blockdev`，axbuild 当前不能改写其链式后端，应明确报错并改用
+`-drive id=disk0`；不要让补盘器再插入一个同名 `-drive`。`-hda`、`-sd` 等
+直连盘别名也不能改写，补盘器会明确报错。

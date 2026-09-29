@@ -146,13 +146,27 @@ impl Axvisor {
         // embedded VM configuration, so a later build would otherwise replace
         // the executable belonging to an earlier group.
         for (index, build_group) in build_groups.iter_mut().enumerate() {
-            rootfs::ensure_qemu_assets_ready(
-                &build_group.request,
-                self.app.workspace_root(),
-                self.app.target_dir(),
-                None,
-            )
-            .await?;
+            let diskless_host_only = build_group
+                .group
+                .cases
+                .iter()
+                .all(|case| rootfs::diskless_explicit_qemu(&case.qemu, true, false));
+            if diskless_host_only {
+                rootfs::ensure_guest_image_bundles(
+                    &build_group.request,
+                    self.app.workspace_root(),
+                    self.app.target_dir(),
+                )
+                .await?;
+            } else {
+                rootfs::ensure_qemu_assets_ready(
+                    &build_group.request,
+                    self.app.workspace_root(),
+                    self.app.target_dir(),
+                    None,
+                )
+                .await?;
+            }
             build_group.cargo =
                 build::load_cargo_config(&build_group.request, self.app.workspace_context())?;
             prepare_configured_busybox_initramfs(
@@ -250,7 +264,7 @@ impl Axvisor {
                 &mut cargo_by_build_config,
                 self.app.workspace_context(),
             )?;
-            let qemu = self
+            let mut qemu = self
                 .app
                 .read_qemu_config_from_path_for_cargo(&cargo, &case.case.qemu_config_path)
                 .await
@@ -260,6 +274,13 @@ impl Axvisor {
                         case.case.display_name
                     )
                 })?;
+            test_qemu::prepare_host_initramfs(
+                self.app.workspace_root(),
+                self.app.target_dir(),
+                &case.case.case_dir,
+                &request.arch,
+                &mut qemu,
+            )?;
             prepared.push(PreparedAxvisorQemuCase { case, qemu });
         }
 
@@ -333,11 +354,13 @@ impl Axvisor {
             asset_config.clone(),
         )
         .await?;
-        rootfs::patch_qemu_rootfs_path(
-            &mut qemu,
-            &prepared_assets.rootfs_path,
-            crate::rootfs::qemu::RootfsWritePolicy::Discard,
-        )?;
+        if !rootfs::diskless_explicit_qemu(&qemu, true, false) {
+            rootfs::patch_qemu_rootfs_path(
+                &mut qemu,
+                &prepared_assets.rootfs_path,
+                crate::rootfs::qemu::RootfsWritePolicy::Discard,
+            )?;
+        }
         Ok((qemu, prepared_assets))
     }
 

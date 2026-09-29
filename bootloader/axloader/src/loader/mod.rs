@@ -4,6 +4,7 @@ pub mod elf_loader;
 pub mod entry;
 pub mod http;
 pub mod network;
+pub mod payload;
 pub mod smbios;
 
 use httpboot_protocol::LoaderStatusPhase;
@@ -81,6 +82,22 @@ fn fetch_control_offer(failed_boot_id: Option<&str>) -> BootAttempt {
                 offer.entry_symbol.as_deref(),
             ) {
                 Ok(elf) => {
+                    let prepared_payload = match payload::prepare(
+                        network_boot.interface.handle(),
+                        &offer.initramfs,
+                        offer.cmdline.as_deref(),
+                        elf.handoff,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            logln!("host_payload_error: {err}");
+                            let _ = network_boot.report_status(LoaderStatusPhase::Failed {
+                                code: "host_payload_failed".into(),
+                                message: alloc::format!("{err}"),
+                            });
+                            return BootAttempt::Failed(Some(offer.boot_id.clone()));
+                        }
+                    };
                     if let Err(err) = network_boot.report_status(LoaderStatusPhase::Verified) {
                         logln!("loader_status_error: {err:?}");
                         return BootAttempt::DiscoveryFailed;
@@ -93,6 +110,17 @@ fn fetch_control_offer(failed_boot_id: Option<&str>) -> BootAttempt {
                         elf.entry_point,
                         elf.handoff
                     );
+                    let published_payload = match prepared_payload.publish() {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            logln!("host_payload_error: {err}");
+                            let _ = network_boot.report_status(LoaderStatusPhase::Failed {
+                                code: "host_payload_failed".into(),
+                                message: alloc::format!("{err}"),
+                            });
+                            return BootAttempt::Failed(Some(offer.boot_id.clone()));
+                        }
+                    };
                     if let Err(err) = network_boot.report_status(LoaderStatusPhase::ReadyToHandoff)
                     {
                         logln!("loader_status_error: {err:?}");
@@ -107,6 +135,7 @@ fn fetch_control_offer(failed_boot_id: Option<&str>) -> BootAttempt {
                         }
                         elf_loader::EntryHandoff::Uefi => entry::jump_to_uefi_entry(entry_point),
                     };
+                    drop(published_payload);
                     match jump_result {
                         Ok(()) => logln!("jump_error: entry returned unexpectedly"),
                         Err(err) => logln!("jump_error: {err:?}"),
