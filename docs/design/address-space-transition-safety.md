@@ -210,10 +210,19 @@ PTE 的 frame 必须进入 gather。
 `DeferredPageTableFrames`，不执行 shootdown；ax-mm/Starry gather 接管 token，确认后才调用
 `reclaim()`。token 未确认即 Drop 时只记录诊断并泄漏，禁止把超时降级为 table-page UAF。
 普通 `unmap_page()` 只完成调用域内的 leaf flush，并保留空中间表供后续复用或 root 安全销毁，
-不会在远端 walker 仍可能访问时立即释放子表。generic 的范围入口 `unmap()`/
-`unmap_with_config()` 仍按调用域失效并即时回收空中间表，供独占硬件使用权的页表或 Axvisor
-stage-2 使用；不能把 stage-1 的远端确认策略反向强加给这些调用方。所有 published stage-1
-调用点必须显式选择 deferred API，不能依赖 generic 层的本地 flush 推断远端 CPU 已经失效。
+不会在远端 walker 仍可能访问时立即释放子表。`virtualization/axvm/src/npt.rs` 的
+`LeveledPageTable::unmap()` 当前调用此单页入口，因此同一个 VM 在不同 2 MiB 区域反复映射、
+解映射 4 KiB 页时，每个曾使用的区域最多可保留一个空的末级表，祖先表也会保留到 root 销毁；
+这不是脱离 root 的泄漏，但页表帧占用可能随曾访问的稀疏地址范围增长。需要通过 Axvisor 的
+`PagingHandler::alloc_frame()`/`dealloc_frame()` 观察这类负载的页表帧余额与 VM 析构后的回落，
+不能只观察当前仍映射的页数。
+
+generic 的范围入口 `unmap()`/`unmap_with_config()` 仍按调用域失效并即时回收空中间表；
+`LeveledPageTable::unmap_region()` 调用该入口。只有调用方已独占相应硬件 walker 的使用权，
+或已完成覆盖它们的失效确认，才能依赖这种即时回收。Axvisor 若要为单页高 churn 路径恢复
+即时回收，应先把这一前提落实为可检查的调用契约和对应测试，再选择范围入口或专用 API；
+不能把 stage-1 的远端确认策略反向强加给所有调用方。所有 published stage-1 调用点必须
+显式选择 deferred API，不能依赖 generic 层的本地 flush 推断远端 CPU 已经失效。
 尚未发布的多页 map 失败前缀仍可由 generic rollback 立即回收，因为没有 CPU 或 hardware walker
 能够观察该临时层级。
 
