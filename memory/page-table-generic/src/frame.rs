@@ -247,6 +247,7 @@ where
                 self.as_slice_mut()[index].clear();
                 if let Err(error) = T::flush_before_make(vaddr, page_size) {
                     self.as_slice_mut()[index] = entry;
+                    T::publish_new_mapping(vaddr);
                     return Err(error);
                 }
             }
@@ -355,6 +356,7 @@ where
             self.as_slice_mut()[index].clear();
             if let Err(error) = T::flush_before_make(vaddr, Self::level_size(level)) {
                 self.as_slice_mut()[index] = entry;
+                T::publish_new_mapping(vaddr);
                 return Err(error);
             }
             self.as_slice_mut()[index] = T::P::new_table(reserved.paddr);
@@ -399,6 +401,7 @@ where
             self.as_slice_mut()[index].clear();
             if let Err(error) = T::flush_before_make(block_vaddr, block_size) {
                 self.as_slice_mut()[index] = entry;
+                T::publish_new_mapping(block_vaddr);
                 return Err(error);
             }
             self.as_slice_mut()[index] = T::P::new_page(block_paddr, block_config, true);
@@ -447,6 +450,7 @@ where
                 self.as_slice_mut()[index].clear();
                 if let Err(error) = T::flush_before_make(vaddr, page_size) {
                     self.as_slice_mut()[index] = entry;
+                    T::publish_new_mapping(vaddr);
                     return Err(error);
                 }
             }
