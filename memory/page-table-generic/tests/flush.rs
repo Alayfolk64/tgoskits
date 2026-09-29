@@ -188,6 +188,8 @@ fn memory_attribute_change_breaks_the_old_mapping_before_make() {
 #[derive(Clone, Copy)]
 struct FailedPreMakeMeta;
 
+static FAILED_PRE_MAKE_RESTORES: AtomicUsize = AtomicUsize::new(0);
+
 impl TableMeta for FailedPreMakeMeta {
     type P = PteImpl;
 
@@ -200,10 +202,14 @@ impl TableMeta for FailedPreMakeMeta {
     fn flush_before_make(_vaddr: VirtAddr, _page_size: usize) -> PagingResult {
         Err(PagingError::BreakBeforeMakeShootdownFailed)
     }
+
+    fn publish_new_mapping(_vaddr: VirtAddr) {
+        FAILED_PRE_MAKE_RESTORES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[test]
-fn failed_pre_make_sync_keeps_the_old_mapping() {
+fn failed_pre_make_sync_republishes_the_old_mapping() {
     let mut page_table = PageTable::<FailedPreMakeMeta, Fram4k>::new(Fram4k).unwrap();
     let address = VirtAddr::from_usize(0x20_0000);
     let original = PhysAddr::from_usize(0x40_0000);
@@ -212,12 +218,14 @@ fn failed_pre_make_sync_keeps_the_old_mapping() {
         .map_page(address, original, FailedPreMakeMeta::PAGE_SIZE, read)
         .unwrap();
     let original_mapping = page_table.query(address).unwrap();
+    FAILED_PRE_MAKE_RESTORES.store(0, Ordering::Relaxed);
 
     assert!(matches!(
         page_table.remap_page(address, PhysAddr::from_usize(0x50_0000), read),
         Err(PagingError::BreakBeforeMakeShootdownFailed)
     ));
     assert_eq!(page_table.query(address).unwrap(), original_mapping);
+    assert_eq!(FAILED_PRE_MAKE_RESTORES.load(Ordering::Relaxed), 1);
 
     assert!(matches!(
         page_table.protect_page(
@@ -227,4 +235,5 @@ fn failed_pre_make_sync_keeps_the_old_mapping() {
         Err(PagingError::BreakBeforeMakeShootdownFailed)
     ));
     assert_eq!(page_table.query(address).unwrap(), original_mapping);
+    assert_eq!(FAILED_PRE_MAKE_RESTORES.load(Ordering::Relaxed), 2);
 }
