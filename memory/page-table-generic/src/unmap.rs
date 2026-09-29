@@ -278,7 +278,11 @@ impl<T: TableMeta, A: FrameAllocator, O, R: FnMut(O)> Retirement<T, A, O, R> {
         if self.addresses.is_empty() {
             return;
         }
-        T::flush_batch(&self.addresses);
+        if self.tables.is_empty() {
+            T::flush_leaf_batch(&self.addresses);
+        } else {
+            T::flush_batch(&self.addresses);
+        }
         self.addresses.clear();
         while let Some(table) = self.tables.pop() {
             self.allocator.dealloc_frame(table);

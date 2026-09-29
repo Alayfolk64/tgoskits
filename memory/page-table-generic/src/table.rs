@@ -1922,7 +1922,7 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         let page_size = self
             .root
             .protect_recursive(vaddr, config, Frame::<T, A>::PT_LEVEL)?;
-        T::flush_batch(&[vaddr]);
+        T::flush_leaf_batch(&[vaddr]);
         Ok(page_size)
     }
 
@@ -1989,10 +1989,14 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         paddr: PhysAddr,
         config: PteConfigOf<T>,
     ) -> PagingResult<usize> {
-        let page_size = self
-            .root
-            .remap_recursive(vaddr, paddr, config, Frame::<T, A>::PT_LEVEL)?;
-        T::flush_batch(&[vaddr]);
+        let (page_size, replaced) =
+            self.root
+                .remap_recursive(vaddr, paddr, config, Frame::<T, A>::PT_LEVEL)?;
+        if replaced {
+            T::complete_replaced_leaf(vaddr);
+        } else {
+            T::flush_leaf_batch(&[vaddr]);
+        }
         Ok(page_size)
     }
 

@@ -97,6 +97,23 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
         }
     }
 
+    /// Completes invalidation after changes confined to leaf descriptors.
+    ///
+    /// No parent entry may have been linked or detached in this batch. The
+    /// default retains the invalidation scope of [`Self::flush_batch`].
+    fn flush_leaf_batch(vaddrs: &[VirtAddr]) {
+        Self::flush_batch(vaddrs);
+    }
+
+    /// Completes publication of a replacement leaf after break-before-make.
+    ///
+    /// The old leaf must already have been cleared and invalidated before the
+    /// new descriptor was written. Architectures that can cache a translation
+    /// fault still need to invalidate that cached result after the write.
+    fn complete_replaced_leaf(vaddr: VirtAddr) {
+        Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
+    }
+
     /// Completes publication of a newly installed, previously absent mapping.
     ///
     /// The caller has excluded software mutation and completed any previous

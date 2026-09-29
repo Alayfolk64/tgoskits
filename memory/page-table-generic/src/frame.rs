@@ -399,7 +399,7 @@ where
         paddr: PhysAddr,
         config: PteConfigOf<T>,
         level: usize,
-    ) -> PagingResult<usize> {
+    ) -> PagingResult<(usize, bool)> {
         let index = Self::virt_to_index(vaddr, level);
         let entry = self.as_slice()[index];
         if entry.unused() {
@@ -411,15 +411,16 @@ where
             let page_size = Self::level_size(level);
             let aligned_paddr = PhysAddr::from_usize(paddr.as_usize() & !(page_size - 1));
             let replacement = T::P::new_page(aligned_paddr, config, is_huge);
-            if entry.paddr(is_dir) != aligned_paddr {
+            let replaced = entry.paddr(is_dir) != aligned_paddr;
+            if replaced {
                 // Construct before breaking the old mapping: no fallible step
                 // may strand an absent leaf. Its table remains attached, and
                 // the caller retains both physical owners across completion.
                 self.as_slice_mut()[index].clear();
-                T::flush_batch(&[vaddr]);
+                T::flush_leaf_batch(&[vaddr]);
             }
             self.as_slice_mut()[index] = replacement;
-            return Ok(page_size);
+            return Ok((page_size, replaced));
         }
         if !entry.present() {
             return Err(PagingError::not_mapped());

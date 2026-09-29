@@ -102,6 +102,22 @@ impl TableMeta for ArchPagingMeta {
         }
     }
 
+    fn flush_leaf_batch(vaddrs: &[VirtAddr]) {
+        #[cfg(target_arch = "riscv64")]
+        for &vaddr in vaddrs {
+            Self::flush(Some(vaddr));
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        Self::flush_batch(vaddrs);
+    }
+
+    fn complete_replaced_leaf(vaddr: VirtAddr) {
+        #[cfg(target_arch = "aarch64")]
+        Self::publish_new_mapping(vaddr);
+        #[cfg(not(target_arch = "aarch64"))]
+        Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
+    }
+
     fn publish_new_mapping(vaddr: VirtAddr) {
         #[cfg(target_arch = "aarch64")]
         {
