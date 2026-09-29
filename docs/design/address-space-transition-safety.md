@@ -206,11 +206,13 @@ PTE 的 frame 必须进入 gather。
 
 数据 frame 之外，中间页表 frame 也属于同一回收屏障。清除最后一个 leaf 后，远端 CPU 可能仍
 持有旧 translation 或 page-walk cache；因此不能在 IPI ACK 前释放变空的下级页表。generic 层的
-`unmap_page_deferred()` 只负责清 leaf 并返回 move-only `DeferredPageTableFrames`，不执行 shootdown；
-ax-mm/Starry gather 接管 token，确认后才调用 `reclaim()`。token 未确认即 Drop 时只记录诊断并泄漏，
-禁止把超时降级为 table-page UAF。generic 原有 `unmap_page()`/range unmap 继续按其调用域完成本地
-flush 并即时回收空中间表，供 Axvisor stage-2 和单 owner 页表使用；不能把 stage-1 的远端确认策略
-反向强加给这些调用方，导致反复 map/unmap 时页表帧累积到 root teardown。所有 published stage-1
+`unmap_page_deferred()` 复用 `unmap_range_deferred()` 的范围遍历，清除 leaf 并返回 move-only
+`DeferredPageTableFrames`，不执行 shootdown；ax-mm/Starry gather 接管 token，确认后才调用
+`reclaim()`。token 未确认即 Drop 时只记录诊断并泄漏，禁止把超时降级为 table-page UAF。
+普通 `unmap_page()` 只完成调用域内的 leaf flush，并保留空中间表供后续复用或 root 安全销毁，
+不会在远端 walker 仍可能访问时立即释放子表。generic 的范围入口 `unmap()`/
+`unmap_with_config()` 仍按调用域失效并即时回收空中间表，供独占硬件使用权的页表或 Axvisor
+stage-2 使用；不能把 stage-1 的远端确认策略反向强加给这些调用方。所有 published stage-1
 调用点必须显式选择 deferred API，不能依赖 generic 层的本地 flush 推断远端 CPU 已经失效。
 尚未发布的多页 map 失败前缀仍可由 generic rollback 立即回收，因为没有 CPU 或 hardware walker
 能够观察该临时层级。
@@ -399,8 +401,9 @@ TGOSKits 不照搬 Linux 的散布式 C 宏和隐式约定，而是保留其语�
 
 - ax-mm：shootdown 失败时 frame 不 reclaim，重试确认后才 reclaim；partial populate rollback 中
   已发布 frame 同样 deferred；DMA alias 的 confirmed unmap 失败必须阻止原物理页回到 allocator；
-  page-table-generic 的 red/green 回归证明普通 leaf/range unmap 和未发布 map rollback 不积累空表，
-  同时 deferred leaf 删除在确认前不释放变空的中间页表；AArch64 源级合同固定发起 CPU 的
+  page-table-generic 的 red/green 回归证明普通 range unmap 和未发布 map rollback 不积累空表，
+  普通单页 unmap 保留空子表供后续复用或 root 销毁，deferred leaf 删除在确认前也不释放
+  变空的中间页表；AArch64 源级合同固定发起 CPU 的
   `dsb ishst` 早于任何
   目标失效，并固定本地 `dsb nshst → TLBI → dsb nsh → isb` 顺序，ax-hal 模型同时证明即使发起
   CPU 不在 active mask 中，写入发布仍早于第一条远端 IPI；
