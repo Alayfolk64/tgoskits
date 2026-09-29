@@ -3,7 +3,7 @@ use core::fmt;
 
 use ax_memory_addr::{AddrRange, MemoryAddr};
 
-use crate::{MappingBackend, MappingError, MappingResult, MemoryArea};
+use crate::{MappingBackend, MappingError, MappingResult, MemoryArea, gaps::GapIndex};
 
 /// Reinstalls the portions of a preimage that were removed by an overlapping
 /// map.  This is deliberately backend-driven: `MemorySet` does not assume
@@ -45,6 +45,7 @@ fn restore_overlapped_mappings<B: MappingBackend>(
 #[derive(Clone)]
 pub struct MemorySet<B: MappingBackend> {
     areas: BTreeMap<B::Addr, MemoryArea<B>>,
+    gaps: GapIndex,
 }
 
 impl<B: MappingBackend> MemorySet<B> {
@@ -52,6 +53,7 @@ impl<B: MappingBackend> MemorySet<B> {
     pub const fn new() -> Self {
         Self {
             areas: BTreeMap::new(),
+            gaps: GapIndex::new(),
         }
     }
 
@@ -68,6 +70,23 @@ impl<B: MappingBackend> MemorySet<B> {
     /// Returns the iterator over all memory areas.
     pub fn iter(&self) -> impl Iterator<Item = &MemoryArea<B>> {
         self.areas.values()
+    }
+
+    /// Iterates over whole areas overlapping a half-open range in address order.
+    pub fn iter_overlapping(
+        &self,
+        range: AddrRange<B::Addr>,
+    ) -> impl Iterator<Item = &MemoryArea<B>> {
+        let first = if range.is_empty() {
+            range.start
+        } else {
+            self.areas
+                .range(..range.start)
+                .next_back()
+                .filter(|(_, area)| area.end() > range.start)
+                .map_or(range.start, |(&start, _)| start)
+        };
+        self.areas.range(first..range.end).map(|(_, area)| area)
     }
 
     /// Restores a metadata preimage after the caller has reverted every
@@ -123,60 +142,9 @@ impl<B: MappingBackend> MemorySet<B> {
         limit: AddrRange<B::Addr>,
         align: usize,
     ) -> Option<B::Addr> {
-        // `MemoryAddr::align_up` is intentionally a low-level, infallible
-        // primitive.  This public allocator-facing API must reject malformed
-        // alignment values before calling it; otherwise `align == 0` underflows
-        // and an address near `usize::MAX` can wrap into the search range.
-        if align == 0 || !align.is_power_of_two() || size == 0 || limit.start >= limit.end {
-            return None;
-        }
-        if !size.is_multiple_of(align) {
-            // size must be a multiple of align.
-            return None;
-        }
-        // brute force: try each area's end address as the start.
-        let align_up = |address: B::Addr| {
-            address
-                .into()
-                .checked_add(align - 1)
-                .map(|value| B::Addr::from(value & !(align - 1)))
-        };
-        let mut last_end: <B as MappingBackend>::Addr = align_up(hint.max(limit.start))?;
-        if last_end < limit.start || last_end >= limit.end {
-            return None;
-        }
-        if let Some((_, area)) = self.areas.range(..last_end).last() {
-            last_end = align_up(last_end.max(area.end()))?;
-            if last_end >= limit.end {
-                return None;
-            }
-        }
-        for (&addr, area) in self.areas.range(last_end..) {
-            if addr >= limit.end {
-                break;
-            }
-            if last_end.checked_add(size).is_some_and(|end| end <= addr) {
-                if last_end
-                    .checked_add(size)
-                    .is_some_and(|end| end <= limit.end)
-                {
-                    return Some(last_end);
-                }
-                return None;
-            }
-            last_end = align_up(area.end().max(limit.start))?;
-            if last_end >= limit.end {
-                return None;
-            }
-        }
-        if last_end
-            .checked_add(size)
-            .is_some_and(|end| end <= limit.end)
-        {
-            Some(last_end)
-        } else {
-            None
-        }
+        self.gaps
+            .find(hint.max(limit.start).into(), limit.end.into(), size, align)
+            .map(B::Addr::from)
     }
 
     /// Grows the area containing `addr` by `additional_size` at its end.
@@ -215,6 +183,7 @@ impl<B: MappingBackend> MemorySet<B> {
             .get_mut(&area_start)
             .ok_or(MappingError::BadState)?
             .grow_right(additional_size, context, page_table)?;
+        self.gaps.occupy(area_end.into()..new_end.into());
         Ok(())
     }
 
@@ -260,7 +229,10 @@ impl<B: MappingBackend> MemorySet<B> {
             .get_mut(&area_start)
             .ok_or(MappingError::BadState)?;
         let old_size = area.size();
-        area.shrink_right_metadata(old_size - additional_size)
+        let old_end = area.end();
+        area.shrink_right_metadata(old_size - additional_size)?;
+        self.gaps.release(suffix_start.into()..old_end.into());
+        Ok(())
     }
 
     /// Add a new memory mapping.
@@ -283,7 +255,7 @@ impl<B: MappingBackend> MemorySet<B> {
         }
 
         let overlaps = self.overlaps(area.va_range());
-        let backup = overlaps.then(|| self.areas.clone());
+        let backup = overlaps.then(|| self.clone());
         if overlaps {
             if unmap_overlap {
                 self.unmap(area.start(), area.size(), context, page_table)?;
@@ -308,16 +280,16 @@ impl<B: MappingBackend> MemorySet<B> {
             // returning an ordinary error with a dangling PTE.
             let reverted_new = area_backend.unmap(area_start, area_size, context, page_table);
             let restored_old = backup.as_ref().is_none_or(|old| {
-                restore_overlapped_mappings(old, area.va_range(), context, page_table)
+                restore_overlapped_mappings(&old.areas, area.va_range(), context, page_table)
             });
             if !reverted_new || !restored_old {
                 if let Some(old) = backup {
-                    self.areas = old;
+                    *self = old;
                 }
                 return Err(MappingError::NeedsRepair);
             }
             if let Some(old) = backup {
-                self.areas = old;
+                *self = old;
             }
             return Err(error);
         }
@@ -330,14 +302,14 @@ impl<B: MappingBackend> MemorySet<B> {
             let reverted_new = area_backend.unmap(area_start, area_size, context, page_table);
             let restored_old = backup.as_ref().is_none_or(|old| {
                 restore_overlapped_mappings(
-                    old,
+                    &old.areas,
                     AddrRange::from_start_size(area_start, area_size),
                     context,
                     page_table,
                 )
             });
             if let Some(old) = backup {
-                self.areas = old;
+                *self = old;
             }
             return Err(if reverted_new && restored_old {
                 MappingError::BadState
@@ -345,6 +317,13 @@ impl<B: MappingBackend> MemorySet<B> {
                 MappingError::NeedsRepair
             });
         }
+        self.gaps.occupy(
+            area_start.into()
+                ..area_start
+                    .checked_add(area_size)
+                    .ok_or(MappingError::InvalidParam)?
+                    .into(),
+        );
         Ok(())
     }
 
@@ -367,9 +346,11 @@ impl<B: MappingBackend> MemorySet<B> {
         if self.overlaps(area.va_range()) {
             return Err(MappingError::AlreadyExists);
         }
+        let range = area.va_range();
         if self.areas.insert(area.start(), area).is_some() {
             return Err(MappingError::BadState);
         }
+        self.gaps.occupy(range.start.into()..range.end.into());
         Ok(())
     }
 
@@ -422,7 +403,9 @@ impl<B: MappingBackend> MemorySet<B> {
         if !backend.unmap(start, size, context, page_table) {
             return Err(MappingError::BadState);
         }
-        self.areas.remove(&start).ok_or(MappingError::BadState)
+        let area = self.areas.remove(&start).ok_or(MappingError::BadState)?;
+        self.gaps.release(start.into()..end.into());
+        Ok(area)
     }
 
     /// Remove memory mappings within the given address range.
@@ -460,6 +443,7 @@ impl<B: MappingBackend> MemorySet<B> {
         // mutation. Publish the prepared ownership tree only after every
         // backend accepted the detach.
         self.areas = prepared;
+        self.gaps.release(range.start.into()..range.end.into());
         Ok(())
     }
 
@@ -495,13 +479,12 @@ impl<B: MappingBackend> MemorySet<B> {
         range: AddrRange<B::Addr>,
         mut visit: impl FnMut(&MemoryArea<B>, B::Addr, usize) -> MappingResult,
     ) -> MappingResult {
-        for area in self.areas.values() {
-            if area.start() >= range.end {
-                break;
-            }
-            if area.end() <= range.start {
-                continue;
-            }
+        if let Some(area) = self.find(range.start)
+            && area.end() >= range.end
+        {
+            return visit(area, range.start, range.size());
+        }
+        for area in self.iter_overlapping(range) {
             let unmap_start = area.start().max(range.start);
             let unmap_end = area.end().min(range.end);
             visit(area, unmap_start, unmap_end.sub_addr(unmap_start))?;
@@ -521,6 +504,7 @@ impl<B: MappingBackend> MemorySet<B> {
         }
 
         self.areas = self.prepare_unmap_metadata(range)?;
+        self.gaps.release(range.start.into()..range.end.into());
         Ok(())
     }
 
@@ -533,7 +517,14 @@ impl<B: MappingBackend> MemorySet<B> {
         let mut areas = self.areas.clone();
         let start = range.start;
         let end = range.end;
-        areas.retain(|_, area| !area.va_range().contained_in(range));
+        // Keep the unpublished preimage contract, but search only mappings
+        // whose start lies in this mutation. Unrelated VMAs need no comparison.
+        while let Some((&area_start, area)) = areas.range(start..end).next() {
+            if area.end() > end {
+                break;
+            }
+            areas.remove(&area_start);
+        }
 
         if let Some((&before_start, before)) = areas.range_mut(..start).last() {
             let before_end = before.end();
@@ -641,6 +632,7 @@ impl<B: MappingBackend> MemorySet<B> {
             }
         }
         self.areas.clear();
+        self.gaps = GapIndex::new();
         Ok(())
     }
 
