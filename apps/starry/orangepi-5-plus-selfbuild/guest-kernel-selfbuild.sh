@@ -22,8 +22,8 @@ esac
 [ -f "$source_dir/$build_config" ] || fail build-config-missing
 [ -x "$xtask" ] || fail prepared-xtask-missing
 [ ! -e "$source_dir/target" ] || fail kernel-target-not-cold
-[ ! -e "$run_dir" ] || fail run-directory-already-exists
-mkdir -p "$run_dir"
+mkdir -p -- "${run_dir%/*}"
+mkdir -- "$run_dir" || fail run-directory-already-exists
 exec > >(tee "$run_dir/run.log") 2>&1
 
 export CARGO_HOME=/root/.cargo

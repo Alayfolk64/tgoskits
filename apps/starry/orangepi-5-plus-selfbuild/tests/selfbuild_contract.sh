@@ -116,6 +116,33 @@ grep -q 'PROGRESS phase=' "$app_dir/guest-selfbuild.sh" \
     || fail "guest does not emit periodic compile-unit progress markers"
 grep -q 'kernel-target-not-cold' "$app_dir/guest-selfbuild.sh" \
     || fail "guest does not reject a warm StarryOS target directory"
+grep -q 'check_cold_run.sh' "$app_dir/guest-selfbuild.sh" \
+    || fail "guest does not use the cold-run path guard"
+
+mkdir -p "$repo_root/tmp"
+cold_run_test_dir="$(mktemp -d -p "$repo_root/tmp" cold-run-contract.XXXXXX)"
+trap 'rm -r -- "$cold_run_test_dir"' EXIT
+cold_run_guard="$app_dir/check_cold_run.sh"
+bash "$cold_run_guard" "$cold_run_test_dir/new-run" \
+    "$cold_run_test_dir/new-target" SELFBUILD-CONTRACT \
+    || fail "cold-run guard rejected unused directories"
+mkdir "$cold_run_test_dir/used-run" "$cold_run_test_dir/used-target"
+if bash "$cold_run_guard" "$cold_run_test_dir/used-run" \
+    "$cold_run_test_dir/new-target" SELFBUILD-CONTRACT \
+    > "$cold_run_test_dir/run-output"; then
+    fail "cold-run guard accepted a duplicate run id"
+fi
+grep -Fxq '===SELFBUILD-CONTRACT-FAIL reason=run-directory-already-exists===' \
+    "$cold_run_test_dir/run-output" \
+    || fail "duplicate run id did not report the expected reason"
+if bash "$cold_run_guard" "$cold_run_test_dir/another-new-run" \
+    "$cold_run_test_dir/used-target" SELFBUILD-CONTRACT \
+    > "$cold_run_test_dir/target-output"; then
+    fail "cold-run guard accepted an existing target"
+fi
+grep -Fxq '===SELFBUILD-CONTRACT-FAIL reason=target-directory-already-exists===' \
+    "$cold_run_test_dir/target-output" \
+    || fail "existing target did not report the expected reason"
 grep -q 'kernel_target_dir/\$build_target/release/starryos' \
     "$app_dir/guest-selfbuild.sh" \
     || fail "guest does not collect the tg-xtask StarryOS artifact"

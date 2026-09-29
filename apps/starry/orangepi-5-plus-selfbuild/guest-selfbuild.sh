@@ -127,8 +127,9 @@ esac
 [ -f "$source_dir/$build_config" ] || fail build-config-missing
 [ ! -e "$kernel_target_dir" ] || fail kernel-target-not-cold
 
-mkdir -p "$run_dir" "$target_dir"
-exec > >(tee -a "$run_log") 2>&1
+bash "$source_dir/apps/starry/orangepi-5-plus-selfbuild/check_cold_run.sh" \
+    "$run_dir" "$target_dir" "$marker"
+exec > >(tee "$run_log") 2>&1
 trap stop_progress_sampler EXIT
 
 export HOME=/root
