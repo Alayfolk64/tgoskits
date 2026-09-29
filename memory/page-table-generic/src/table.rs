@@ -1242,9 +1242,11 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
 
     /// Unmaps one page and returns its physical address, flags, and page size.
     ///
-    /// Descriptor publication and invalidation complete before returning, even
-    /// when adjacent mappings retain the containing table. The caller keeps
-    /// the mapped physical owner alive until this operation returns.
+    /// Descriptor publication and invalidation complete in the metadata's
+    /// flush domain before returning. Empty child tables are reclaimed here,
+    /// so a table shared with remote hardware users requires the deferred
+    /// unmap path and external shootdown instead. The caller keeps the mapped
+    /// physical owner alive until all hardware users have invalidated it.
     pub fn unmap_page(
         &mut self,
         vaddr: VirtAddr,
@@ -1916,8 +1918,9 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     }
 
     /// Changes one existing mapping's flags and returns its page size.
-    /// Descriptor publication and invalidation complete before the caller may
-    /// rely on revoked access, such as sharing a read-only COW source.
+    /// Descriptor publication and invalidation complete in the metadata's
+    /// flush domain. A shared table needs external shootdown before the caller
+    /// may rely on access being revoked for every hardware user.
     pub fn protect_page(&mut self, vaddr: VirtAddr, config: PteConfigOf<T>) -> PagingResult<usize> {
         let page_size = self
             .root
@@ -1981,8 +1984,9 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     /// Remaps one existing mapping and returns its page size.
     ///
     /// Changed physical backing is invalidated before publishing the replacement.
-    /// The caller must retain both physical owners until this operation completes;
-    /// the metadata's batch invalidation must cover every hardware user.
+    /// The caller must retain both physical owners until this operation completes
+    /// in the metadata's flush domain. A shared table needs external shootdown
+    /// before the old owner can be reclaimed or globally revoked.
     pub fn remap_page(
         &mut self,
         vaddr: VirtAddr,

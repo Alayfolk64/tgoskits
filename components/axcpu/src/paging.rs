@@ -88,15 +88,15 @@ impl TableMeta for ArchPagingMeta {
     }
 
     fn flush_batch(vaddrs: &[VirtAddr]) {
-        #[cfg(target_arch = "aarch64")]
-        crate::asm::flush_tlb_batch(vaddrs);
         #[cfg(target_arch = "riscv64")]
         if !vaddrs.is_empty() {
             // A batch may unlink a non-leaf PTE. SFENCE.VMA with a virtual
             // address only orders leaf PTE changes on RISC-V.
             Self::flush(None);
         }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+        // Remote stage-1 shootdown and its completion receipt belong to the
+        // runtime, not to architecture metadata's local flush operation.
+        #[cfg(not(target_arch = "riscv64"))]
         for &vaddr in vaddrs {
             Self::flush(Some(vaddr));
         }
@@ -109,6 +109,25 @@ impl TableMeta for ArchPagingMeta {
         }
         #[cfg(not(target_arch = "riscv64"))]
         Self::flush_batch(vaddrs);
+    }
+
+    fn flush_before_make(vaddr: VirtAddr, page_size: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // A new valid descriptor must not become visible until every PE
+            // in the shareable stage-one domain has discarded the old one.
+            // A block-to-table replacement can leave multiple cached child
+            // translations, so invalidate the whole regime in that case.
+            crate::mmu::El1::flush_tlb_inner_shareable(
+                (page_size == Self::PAGE_SIZE).then_some(vaddr),
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        if page_size > Self::PAGE_SIZE {
+            Self::flush(None);
+        } else {
+            Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
+        }
     }
 
     fn complete_replaced_leaf(vaddr: VirtAddr) {

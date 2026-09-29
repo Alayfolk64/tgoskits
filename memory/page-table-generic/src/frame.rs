@@ -331,12 +331,13 @@ where
                 }
             }
 
-            // The caller serializes the page-table structure. Clearing before
-            // the local invalidation prevents a walker from observing both the
-            // old block descriptor and the new table descriptor.
+            // The caller serializes the page-table structure. Invalidate the
+            // old block throughout the metadata's break-before-make domain
+            // before a walker can observe the new table descriptor.
             self.as_slice_mut()[index].clear();
-            T::flush(Some(vaddr));
+            T::flush_before_make(vaddr, Self::level_size(level));
             self.as_slice_mut()[index] = T::P::new_table(reserved.paddr);
+            T::publish_new_mapping(vaddr);
             return Ok((block_paddr, block_config, Self::level_size(level)));
         }
         if level == 1 || !entry.present() {
@@ -374,8 +375,9 @@ where
 
             let child = Self::from_paddr(child_table_paddr, self.allocator.clone());
             self.as_slice_mut()[index].clear();
-            T::flush(Some(block_vaddr));
+            T::flush_before_make(block_vaddr, block_size);
             self.as_slice_mut()[index] = T::P::new_page(block_paddr, block_config, true);
+            T::publish_new_mapping(block_vaddr);
             return Ok(child);
         }
 
@@ -417,7 +419,7 @@ where
                 // may strand an absent leaf. Its table remains attached, and
                 // the caller retains both physical owners across completion.
                 self.as_slice_mut()[index].clear();
-                T::flush_leaf_batch(&[vaddr]);
+                T::flush_before_make(vaddr, page_size);
             }
             self.as_slice_mut()[index] = replacement;
             return Ok((page_size, replaced));

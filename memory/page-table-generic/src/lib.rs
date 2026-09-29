@@ -83,14 +83,15 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
     /// 刷新TLB
     fn flush(vaddr: Option<VirtAddr>);
 
-    /// Completes invalidation for a batch of changed mapping/table descriptors.
+    /// Completes invalidation for changed mapping/table descriptors in this
+    /// metadata implementation's flush domain.
     ///
-    /// The caller has already published the descriptor updates. Before this
-    /// method returns, stale translations and walks through those descriptors
-    /// must be unusable by every CPU allowed to access this table. Implementors
-    /// must supply the publication and completion barriers for their format.
-    /// The default preserves the scope of `flush(Some(address))`; metadata with
-    /// only local invalidation must restrict table use accordingly.
+    /// Implementors supply the descriptor-publication and completion barriers
+    /// required by their architecture. The default preserves the scope of
+    /// `flush(Some(address))`; a local flush does not confirm remote CPUs.
+    /// Immediate table-frame reclamation therefore requires exclusive hardware
+    /// use of the table or an implementation covering every active user. Shared
+    /// stage-1 tables must use deferred reclamation and an external shootdown.
     fn flush_batch(vaddrs: &[VirtAddr]) {
         for &vaddr in vaddrs {
             Self::flush(Some(vaddr));
@@ -105,24 +106,41 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
         Self::flush_batch(vaddrs);
     }
 
+    /// Completes invalidation after clearing an old descriptor and before
+    /// installing its replacement.
+    ///
+    /// The implementation must satisfy its architecture's pre-make ordering
+    /// in the required flush domain before this call returns. AArch64 shared
+    /// stage-1 tables require inner-shareable invalidation here; the default
+    /// preserves the metadata's local flush domain. Reclaiming the old physical
+    /// owner still requires the owner's separate shootdown confirmation.
+    fn flush_before_make(vaddr: VirtAddr, page_size: usize) {
+        if page_size > Self::PAGE_SIZE {
+            Self::flush(None);
+        } else {
+            Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
+        }
+    }
+
     /// Completes publication of a replacement leaf after break-before-make.
     ///
-    /// The old leaf must already have been cleared and invalidated before the
-    /// new descriptor was written. Architectures that can cache a translation
-    /// fault still need to invalidate that cached result after the write.
+    /// The old leaf must already have been cleared and invalidated through
+    /// [`Self::flush_before_make`] before the new descriptor was written.
+    /// Architectures that can cache a translation fault still need to
+    /// invalidate that cached result after the write.
     fn complete_replaced_leaf(vaddr: VirtAddr) {
         Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
     }
 
-    /// Completes publication of a newly installed, previously absent mapping.
+    /// Completes publication of a newly installed descriptor.
     ///
-    /// The caller has excluded software mutation and completed any previous
-    /// removal of this address on all hardware users. This is not sufficient
-    /// for replacing a mapped page, revoking permissions or retiring a table.
-    /// Implementations may omit invalidation only when their architecture
-    /// cannot retain the formerly absent translation. Descriptor stores must
-    /// become visible before the faulting instruction is retried.
-    /// The default retains the existing batch invalidation scope.
+    /// The caller has excluded concurrent software mutation. For a replacement,
+    /// [`Self::flush_before_make`] has completed the required pre-make ordering;
+    /// this hook then publishes the new descriptor. Architectures that can
+    /// retain an invalid translation must also invalidate it after the write.
+    /// This does not confirm remote revocation or permit owner reclamation;
+    /// those still require the caller's shootdown. The default retains the
+    /// metadata's batch invalidation scope.
     fn publish_new_mapping(vaddr: VirtAddr) {
         Self::flush_batch(core::slice::from_ref(&vaddr));
     }

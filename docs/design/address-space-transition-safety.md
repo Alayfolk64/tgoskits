@@ -245,9 +245,16 @@ DMA coherent alias 的 release 是例外：它的调用者会在 unmap 返回成
 返回；未确认的远端仍由 quarantine 阻止 frame/VA 回收和复用。
 
 shootdown 确认之前还必须存在独立的“页表写入已发布”边。AArch64 发起 CPU 在任何本地 TLBI 或
-远端 IPI 前执行 `dsb ishst`；每个目标 CPU 只执行本地
-`dsb nshst → TLBI → dsb nsh → isb`。`ax-cpu` 因而不使用 `vaae1is/vae2is` 隐式广播，CPU mask、
-online 状态和确认统一由 ax-hal/runtime 软件 shootdown 事务拥有。若只在远端回调中执行 DSB，
+远端 IPI 前执行 `dsb ishst`；每个目标 CPU 的常规失效只执行本地
+`dsb nshst → TLBI → dsb nsh → isb`。`ArchPagingMeta::flush_batch` 和
+`El2PagingMeta::flush_batch` 保持本核语义，CPU mask、online 状态、失效确认和资源回收仍由
+ax-hal/runtime 软件 shootdown 事务拥有。唯一的预写入例外是 break-before-make：
+`Frame::remap_recursive` 更换物理页，以及 huge leaf 与子表互换时，必须先清除旧描述符，再由
+`TableMeta::flush_before_make` 在内共享域完成失效，最后才能写入新描述符；
+`TableMeta::publish_new_mapping` 再完成新项的可见性屏障。AArch64 EL1/EL2
+对单页分别使用 `vaae1is`/`vae2is`，对覆盖多个翻译的 huge 变更使用全域失效；这些同步 TLBI
+只保证新描述符不会与旧翻译并存，不提供 runtime 的目标 CPU 确认，也不能代替 owner 的
+quarantine 和最终 shootdown。若只在远端回调中执行 DSB，
 它不能排序发起 CPU 先前清除 parent PTE 的写入：远端可能在 ACK 后仍走旧 table 层级，而 gather
 随即回收并复用中间页表 frame，形成 page-walk use-after-free。CI run `33142588973` 中随后出现的
 AArch64 `IrqWaitCell::wake_registration` 无关对象损坏与这一缺口的下游表现一致；同配置 ELF 将

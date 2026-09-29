@@ -69,6 +69,7 @@ fn map_region_batches_tlb_flushes() {
 
 static LEAF_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 static TABLE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static BREAK_BEFORE_MAKE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 static REPLACEMENT_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
@@ -89,6 +90,10 @@ impl TableMeta for RoutedMeta {
 
     fn flush_leaf_batch(vaddrs: &[VirtAddr]) {
         LEAF_COMPLETIONS.fetch_add(vaddrs.len(), Ordering::Relaxed);
+    }
+
+    fn flush_before_make(_vaddr: VirtAddr, _page_size: usize) {
+        BREAK_BEFORE_MAKE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     fn complete_replaced_leaf(_vaddr: VirtAddr) {
@@ -118,6 +123,7 @@ fn leaf_updates_and_table_detach_use_their_required_completion() {
         .unwrap();
     LEAF_COMPLETIONS.store(0, Ordering::Relaxed);
     TABLE_COMPLETIONS.store(0, Ordering::Relaxed);
+    BREAK_BEFORE_MAKE_COMPLETIONS.store(0, Ordering::Relaxed);
     REPLACEMENT_COMPLETIONS.store(0, Ordering::Relaxed);
 
     page_table.protect_page(first, read).unwrap();
@@ -126,11 +132,12 @@ fn leaf_updates_and_table_detach_use_their_required_completion() {
     assert_eq!(TABLE_COMPLETIONS.load(Ordering::Relaxed), 0);
 
     page_table.remap_page(first, replacement, read).unwrap();
-    assert_eq!(LEAF_COMPLETIONS.load(Ordering::Relaxed), 3);
+    assert_eq!(LEAF_COMPLETIONS.load(Ordering::Relaxed), 2);
+    assert_eq!(BREAK_BEFORE_MAKE_COMPLETIONS.load(Ordering::Relaxed), 1);
     assert_eq!(REPLACEMENT_COMPLETIONS.load(Ordering::Relaxed), 1);
 
     page_table.unmap_page(first).unwrap();
-    assert_eq!(LEAF_COMPLETIONS.load(Ordering::Relaxed), 4);
+    assert_eq!(LEAF_COMPLETIONS.load(Ordering::Relaxed), 3);
     assert_eq!(TABLE_COMPLETIONS.load(Ordering::Relaxed), 0);
 
     page_table.unmap_page(second).unwrap();

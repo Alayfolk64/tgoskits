@@ -24,4 +24,10 @@ impl crate::paging::TableMeta for El2PagingMeta {
     fn flush(address: Option<crate::VirtAddr>) {
         super::mmu::El2::flush_tlb(address);
     }
+
+    fn flush_before_make(address: crate::VirtAddr, page_size: usize) {
+        super::mmu::El2::flush_tlb_inner_shareable(
+            (page_size == Self::PAGE_SIZE).then_some(address),
+        );
+    }
 }

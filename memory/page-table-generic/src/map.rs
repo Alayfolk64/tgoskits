@@ -337,7 +337,8 @@ where
                     // 清除指向子页表的PTE
                     pte_ref.clear();
                     // Descriptor unlink must become visible and invalidated
-                    // before allocator reuse, even when leaf flushes are deferred.
+                    // within the metadata flush domain before allocator reuse,
+                    // even when leaf flushes are deferred.
                     T::flush_batch(core::slice::from_ref(&vaddr));
                     allocator.dealloc_frame(child_paddr);
                 } else {

@@ -1,4 +1,4 @@
-//! Range walking and bounded physical-owner retirement after TLB completion.
+//! Range walking and bounded retirement within the metadata flush domain.
 
 use core::ops::Range;
 
