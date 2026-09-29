@@ -838,18 +838,6 @@ impl<T: TableMeta, A: FrameAllocator> PageTable<T, A> {
         )
     }
 
-    /// Starts an owned unmap operation spanning several virtual ranges.
-    ///
-    /// `retire` consumes each physical owner after synchronous invalidation.
-    /// It must not panic or re-enter the table. The returned session retains
-    /// exclusive table access and completes pending retirement when dropped.
-    pub fn unmap_session<O, R: FnMut(O)>(
-        &mut self,
-        retire: R,
-    ) -> crate::UnmapSession<'_, T, A, O, R> {
-        crate::UnmapSession::new(self, retire)
-    }
-
     /// Deep-copies source root entries that are absent from this page table.
     ///
     /// Leaf mappings keep referring to the same physical memory, while every
@@ -1270,41 +1258,17 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         // Reuse the same completion boundary as owned range retirement. This
         // operation returns the data owner to its caller, so only detached
         // table frames are reclaimed here.
-        self.unmap_owned::<(), PagingError>(leaf.vaddr..end.into(), |_| Ok(()), |_| {})?;
-        Ok((leaf.paddr, leaf.config, leaf.size))
-    }
-
-    /// Removes occupied leaves with bounded, invalidation-before-release ownership.
-    ///
-    /// `prepare` runs before clearing each leaf and returns its mapping owner.
-    /// It must retain the physical memory, not release it. `retire` consumes
-    /// that owner only after synchronous TLB invalidation. Neither callback may
-    /// re-enter this table or panic. Table mutation must exclude other software
-    /// walkers, and [`TableMeta::flush_batch`] must cover all hardware users.
-    ///
-    /// Missing subtrees are skipped. Non-present but occupied leaves are
-    /// included. The root frame is retained; emptied child tables are reclaimed.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed ranges and partial huge leaves. A preparation error
-    /// leaves that leaf intact. Earlier successful removals are invalidated and
-    /// retired before any error returns; this is not an all-or-nothing operation.
-    pub fn unmap_owned<O, E>(
-        &mut self,
-        range: Range<VirtAddr>,
-        prepare: impl FnMut(crate::MappedLeaf<PteConfigOf<T>>) -> Result<O, E>,
-        retire: impl FnMut(O),
-    ) -> Result<(), E>
-    where
-        E: From<PagingError>,
-    {
+        let range = leaf.vaddr..end.into();
         self.validate_owned_unmap_range(&range)?;
-        if range.is_empty() {
-            return Ok(());
-        }
         let retained = self.retained_root_entry_range();
-        crate::unmap::unmap_owned(&mut self.root, range, retained, prepare, retire)
+        crate::unmap::unmap_owned::<T, A, (), PagingError>(
+            &mut self.root,
+            range,
+            retained,
+            |_| Ok(()),
+            |_| {},
+        )?;
+        Ok((leaf.paddr, leaf.config, leaf.size))
     }
 
     pub(crate) fn retained_root_entry_range(&self) -> Option<(usize, usize)> {

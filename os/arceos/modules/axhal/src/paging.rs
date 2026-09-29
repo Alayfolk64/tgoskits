@@ -81,7 +81,3 @@ pub type HugeSplitApplyError =
     page_table_generic::HugeSplitApplyError<ArchPagingMeta, PagingAllocator>;
 /// Receipt for a child table installed by consuming a [`HugeSplitDeposit`].
 pub type InstalledHugeSplit = page_table_generic::InstalledHugeSplit<ArchPagingMeta>;
-
-/// A scoped unmap operation using the kernel table allocator and flush capability.
-pub type UnmapSession<'a, O, R> =
-    page_table_generic::UnmapSession<'a, ArchPagingMeta, PagingAllocator, O, R>;

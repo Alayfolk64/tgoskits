@@ -14,7 +14,7 @@ pub use def::*;
 pub use frame::{DetachedPageTableFrame, Frame};
 pub use map::*;
 pub use table::*;
-pub use unmap::{MappedLeaf, UnmapSession};
+pub use unmap::MappedLeaf;
 pub use walk::*;
 
 pub type PagingResult<T = ()> = Result<T, PagingError>;

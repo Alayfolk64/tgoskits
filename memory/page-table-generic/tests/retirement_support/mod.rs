@@ -26,24 +26,6 @@ pub(super) fn reset_events() {
     WALKS.set(0);
 }
 
-pub(super) fn retire_leaf(leaf: MappedLeaf<usize>) {
-    EVENTS.with_borrow_mut(|events| events.push(Event::Retire(leaf.vaddr.as_usize())));
-}
-
-pub(super) fn retired_addresses() -> Vec<usize> {
-    let mut addresses = EVENTS.with_borrow(|events| {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Retire(address) => Some(*address),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    });
-    addresses.sort_unstable();
-    addresses
-}
-
 pub(super) fn assert_retirement_order() {
     EVENTS.with_borrow(|events| {
         let mut pending = false;
@@ -51,7 +33,7 @@ pub(super) fn assert_retirement_order() {
             match event {
                 Event::Clear => pending = true,
                 Event::Flush => pending = false,
-                Event::Free | Event::Retire(_) => assert!(
+                Event::Free => assert!(
                     !pending,
                     "retirement before completed invalidation: {events:?}"
                 ),
@@ -68,7 +50,6 @@ pub(super) enum Event {
     Flush,
     Free,
     Batch(usize),
-    Retire(usize),
 }
 
 thread_local! {
