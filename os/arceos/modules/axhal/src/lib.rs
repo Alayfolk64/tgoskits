@@ -164,6 +164,8 @@ pub fn init_early(cpu_id: usize, arg: usize) {
     dtb::init(arg);
     init_cpu_traps();
     ax_plat::init::init_early(cpu_id, arg);
+    #[cfg(all(target_arch = "aarch64", feature = "paging"))]
+    paging::certify_inner_shareable_bbm();
 }
 
 /// Initializes the CPU trap vector and platform early state for a secondary CPU.

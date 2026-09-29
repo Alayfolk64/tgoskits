@@ -4,7 +4,6 @@ use core::fmt::Debug;
 
 mod def;
 pub mod frame;
-mod install;
 mod map;
 mod table;
 mod unmap;
@@ -14,7 +13,6 @@ pub use def::*;
 pub use frame::{DetachedPageTableFrame, Frame};
 pub use map::*;
 pub use table::*;
-pub use unmap::MappedLeaf;
 pub use walk::*;
 
 pub type PagingResult<T = ()> = Result<T, PagingError>;
@@ -110,16 +108,27 @@ pub trait TableMeta: Sync + Send + Clone + Copy + 'static {
     /// installing its replacement.
     ///
     /// The implementation must satisfy its architecture's pre-make ordering
-    /// in the required flush domain before this call returns. AArch64 shared
-    /// stage-1 tables require inner-shareable invalidation here; the default
-    /// preserves the metadata's local flush domain. Reclaiming the old physical
-    /// owner still requires the owner's separate shootdown confirmation.
-    fn flush_before_make(vaddr: VirtAddr, page_size: usize) {
+    /// in the required flush domain before this call returns. On failure the
+    /// caller restores the original descriptor and does not install a new one.
+    /// The default preserves the metadata's local flush domain. Reclaiming the
+    /// old physical owner still requires separate shootdown confirmation.
+    fn flush_before_make(vaddr: VirtAddr, page_size: usize) -> PagingResult {
         if page_size > Self::PAGE_SIZE {
             Self::flush(None);
         } else {
             Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
         }
+        Ok(())
+    }
+
+    /// Checks that the required pre-make invalidation domain is available.
+    ///
+    /// This runs before clearing the old descriptor, so an unsupported
+    /// platform can return an error without changing the mapping. Once it
+    /// succeeds, [`Self::flush_before_make`] still must return success before
+    /// the replacement becomes valid.
+    fn prepare_break_before_make() -> PagingResult {
+        Ok(())
     }
 
     /// Completes publication of a replacement leaf after break-before-make.
@@ -161,6 +170,16 @@ pub trait PageTableEntry: Debug + Sync + Send + Clone + Copy + Sized + 'static {
     /// `is_dir` lets formats with level-dependent layouts decode the address
     /// without exposing those layout rules to the generic walker.
     fn paddr(&self, is_dir: bool) -> PhysAddr;
+
+    /// Whether replacing this leaf needs the old descriptor cleared and
+    /// invalidated before the new descriptor is installed.
+    ///
+    /// Physical replacement requires this ordering by default. A descriptor
+    /// format may also require it for changes to memory type, shareability,
+    /// or translation scope even when the physical address stays the same.
+    fn requires_break_before_make(&self, replacement: &Self, is_dir: bool) -> bool {
+        self.paddr(is_dir) != replacement.paddr(is_dir)
+    }
 
     /// Decodes the owner-defined leaf configuration.
     fn config(&self, is_dir: bool) -> Self::PteConfig;

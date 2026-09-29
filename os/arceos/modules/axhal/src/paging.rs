@@ -14,11 +14,36 @@ core::cfg_select! {
 }
 use ax_memory_addr::PAGE_SIZE_4K;
 pub use page_table_generic::{
-    FrameAllocator, MapConfig, MappedLeaf, PageTableEntry, PageTableOp, PagingError, PagingResult,
-    TableMeta,
+    FrameAllocator, MapConfig, PageTableEntry, PageTableOp, PagingError, PagingResult, TableMeta,
 };
 
 use crate::mem::{phys_to_virt, virt_to_phys};
+
+/// Enables IRQ-safe AArch64 break-before-make only for boot targets whose
+/// stage-one walkers are covered by one Inner Shareable domain.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn certify_inner_shareable_bbm() {
+    let Some(fdt) = crate::dtb::get_fdt() else {
+        return;
+    };
+    let Some(root) = fdt.find_nodes("/").next() else {
+        return;
+    };
+    let mut qemu_virt = false;
+    let mut orange_pi_5_plus = false;
+    let mut rk3588 = false;
+    for compatible in root.compatibles() {
+        qemu_virt |= matches!(compatible, "qemu,virt" | "linux,dummy-virt");
+        orange_pi_5_plus |= compatible == "xunlong,orangepi-5-plus";
+        rk3588 |= compatible == "rockchip,rk3588";
+    }
+    if qemu_virt || (orange_pi_5_plus && rk3588) {
+        // SAFETY: QEMU virt vCPUs and RK3588 Orange Pi 5 Plus CPUs run in the
+        // platform-wide coherent Inner Shareable stage-one domain. Unknown
+        // FDT roots remain disabled and fail before changing a descriptor.
+        unsafe { ax_cpu::paging::enable_inner_shareable_stage1_bbm() };
+    }
+}
 
 /// Page-table frame allocator backed by the global kernel allocator.
 #[derive(Clone, Copy)]

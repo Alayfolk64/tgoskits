@@ -25,9 +25,18 @@ impl crate::paging::TableMeta for El2PagingMeta {
         super::mmu::El2::flush_tlb(address);
     }
 
-    fn flush_before_make(address: crate::VirtAddr, page_size: usize) {
+    fn flush_before_make(
+        address: crate::VirtAddr,
+        page_size: usize,
+    ) -> page_table_generic::PagingResult {
+        crate::paging::require_inner_shareable_stage1_bbm()?;
         super::mmu::El2::flush_tlb_inner_shareable(
             (page_size == Self::PAGE_SIZE).then_some(address),
         );
+        Ok(())
+    }
+
+    fn prepare_break_before_make() -> page_table_generic::PagingResult {
+        crate::paging::require_inner_shareable_stage1_bbm()
     }
 }

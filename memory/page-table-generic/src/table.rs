@@ -17,6 +17,19 @@ use crate::{
 const TARGETED_FLUSH_LIMIT: usize = 32;
 pub(crate) const MAX_DEFERRED_PAGE_TABLE_LEVELS: usize = 8;
 
+/// An occupied mapping snapshot, including a non-present leaf.
+#[derive(Debug)]
+pub struct MappedLeaf<C> {
+    /// Base virtual address of the complete leaf mapping.
+    pub vaddr: VirtAddr,
+    /// Base physical address retained by the mapping.
+    pub paddr: PhysAddr,
+    /// Size represented by this leaf's page-table level.
+    pub size: usize,
+    /// Opaque architecture-owned configuration.
+    pub config: C,
+}
+
 /// A bounded batch of detached intermediate page-table frames.
 ///
 /// The frames remain allocated until the stage-1 owner confirms that every
@@ -108,6 +121,7 @@ enum RegionPageSelection {
 /// during prepare.
 struct ReservedTable<T: TableMeta, A: FrameAllocator> {
     frame: Option<Frame<T, A>>,
+    retired: bool,
 }
 
 /// A detached, fully initialized page-table suffix.
@@ -253,6 +267,22 @@ impl<T: TableMeta, A: FrameAllocator> core::fmt::Debug for HugeSplitApplyError<T
 }
 
 impl<T: TableMeta, A: FrameAllocator> HugeSplitDeposit<T, A> {
+    /// Whether this child table was withdrawn from a live page-table tree.
+    pub const fn requires_tlb_confirmation(&self) -> bool {
+        self.table.retired
+    }
+
+    /// Permits reuse or release of a withdrawn table after remote completion.
+    ///
+    /// # Safety
+    ///
+    /// Every CPU that could walk the old child descriptor must have completed
+    /// a TLB invalidation covering `block_vaddr..block_vaddr + block_size`, or
+    /// have switched away from the root with an equivalent quiescence proof.
+    pub unsafe fn confirm_tlb_retirement(&mut self) {
+        self.table.retired = false;
+    }
+
     pub const fn block_vaddr(&self) -> VirtAddr {
         self.block_vaddr
     }
@@ -344,13 +374,18 @@ impl<T: TableMeta, A: FrameAllocator> ReservedTable<T, A> {
 
     fn disarm(&mut self) {
         self.frame = None;
+        self.retired = false;
     }
 }
 
 impl<T: TableMeta, A: FrameAllocator> Drop for ReservedTable<T, A> {
     fn drop(&mut self) {
         if let Some(frame) = self.frame.take() {
-            frame.allocator.dealloc_frame(frame.paddr);
+            if self.retired {
+                log::error!("leaking unconfirmed restored huge-split table");
+            } else {
+                frame.allocator.dealloc_frame(frame.paddr);
+            }
         }
     }
 }
@@ -1243,9 +1278,9 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     /// Unmaps one page and returns its physical address, flags, and page size.
     ///
     /// Descriptor publication and invalidation complete in the metadata's
-    /// flush domain before returning. Empty child tables are reclaimed here,
-    /// so a table shared with remote hardware users requires the deferred
-    /// unmap path and external shootdown instead. The caller keeps the mapped
+    /// flush domain before returning. Empty child tables remain linked for
+    /// reuse or root teardown, so this call never frees a frame that a remote
+    /// hardware walker might still reference. The caller keeps the mapped
     /// physical owner alive until all hardware users have invalidated it.
     pub fn unmap_page(
         &mut self,
@@ -1257,19 +1292,11 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
             .as_usize()
             .checked_add(leaf.size)
             .ok_or_else(|| PagingError::address_overflow("unmap_page"))?;
-        // Reuse the same completion boundary as owned range retirement. This
-        // operation returns the data owner to its caller, so only detached
-        // table frames are reclaimed here.
         let range = leaf.vaddr..end.into();
         self.validate_owned_unmap_range(&range)?;
-        let retained = self.retained_root_entry_range();
-        crate::unmap::unmap_owned::<T, A, (), PagingError>(
-            &mut self.root,
-            range,
-            retained,
-            |_| Ok(()),
-            |_| {},
-        )?;
+        self.root
+            .clear_occupied_leaf(leaf.vaddr, Frame::<T, A>::PT_LEVEL)?;
+        T::flush_leaf_batch(core::slice::from_ref(&leaf.vaddr));
         Ok((leaf.paddr, leaf.config, leaf.size))
     }
 
@@ -1301,20 +1328,20 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         &mut self,
         vaddr: VirtAddr,
     ) -> PagingResult<(PhysAddr, PteConfigOf<T>, usize, DeferredPageTableFrames<A>)> {
-        if Frame::<T, A>::PT_LEVEL > MAX_DEFERRED_PAGE_TABLE_LEVELS {
-            return Err(PagingError::hierarchy_error(
-                "Page-table depth exceeds deferred reclaim capacity",
-            ));
-        }
-        let mut deferred = DeferredPageTableFrames::new(self.root.allocator.clone());
-        let (pte, level) =
-            self.root
-                .take_occupied_leaf_deferred(vaddr, Frame::<T, A>::PT_LEVEL, &mut deferred)?;
-        let page_size = Frame::<T, A>::level_size(level);
-        let is_dir = level > 1;
-        let paddr = pte.paddr(is_dir);
-        let config = pte.config(is_dir);
-        Ok((paddr, config, page_size, deferred))
+        let leaf = self.query_occupied_leaf(vaddr)?;
+        let end = leaf
+            .vaddr
+            .as_usize()
+            .checked_add(leaf.size)
+            .ok_or_else(|| PagingError::address_overflow("unmap_page_deferred"))?;
+        let mut deferred = None;
+        let removed =
+            self.unmap_range_deferred(leaf.vaddr..VirtAddr::from_usize(end), |batch| {
+                deferred = Some(batch);
+            })?;
+        debug_assert_eq!(removed, 1);
+        let tables = deferred.expect("an occupied leaf emits one deferred batch");
+        Ok((leaf.paddr, leaf.config, leaf.size, tables))
     }
 
     /// Returns the huge block covering `vaddr` without changing the table.
@@ -1769,6 +1796,7 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
         let block_vaddr = vaddr.align_down(block_size);
         let table = ReservedTable {
             frame: Some(Frame::<T, A>::new(self.root.allocator.clone())?),
+            retired: false,
         };
         Ok(HugeSplitDeposit {
             table,
@@ -1784,6 +1812,9 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     where
         PteConfigOf<T>: PartialEq,
     {
+        if deposit.table.retired {
+            return Err(PagingError::UnconfirmedHugeSplitRetirement);
+        }
         let current = self.peek_huge_block(deposit.block_vaddr);
         if self.root_paddr() != deposit.root_paddr
             || !current.is_some_and(|(paddr, config, size)| {
@@ -1877,8 +1908,10 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     /// its receipt and returns ownership of the withdrawn child table.
     ///
     /// No allocation occurs.  The returned deposit is bound to the restored
-    /// block and can either be retained for a retry or dropped to release the
-    /// now-unpublished page-table frame.  This is the inverse of
+    /// block, but cannot be reused or dropped to release the formerly live
+    /// page-table frame until a remote TLB receipt confirms its retirement.
+    /// Dropping an unconfirmed deposit deliberately leaks that frame. This is
+    /// the inverse of
     /// [`Self::split_huge_page_with`] used by unpublished transaction aborts.
     pub fn restore_huge_split(
         &mut self,
@@ -1896,7 +1929,10 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
             Frame::<T, A>::PT_LEVEL,
         )?;
         Ok(HugeSplitDeposit {
-            table: ReservedTable { frame: Some(frame) },
+            table: ReservedTable {
+                frame: Some(frame),
+                retired: true,
+            },
             root_paddr: installed.root_paddr,
             block_vaddr: installed.block_vaddr,
             block_paddr: installed.block_paddr,
@@ -1922,10 +1958,14 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     /// flush domain. A shared table needs external shootdown before the caller
     /// may rely on access being revoked for every hardware user.
     pub fn protect_page(&mut self, vaddr: VirtAddr, config: PteConfigOf<T>) -> PagingResult<usize> {
-        let page_size = self
-            .root
-            .protect_recursive(vaddr, config, Frame::<T, A>::PT_LEVEL)?;
-        T::flush_leaf_batch(&[vaddr]);
+        let (page_size, requires_bbm) =
+            self.root
+                .protect_recursive(vaddr, config, Frame::<T, A>::PT_LEVEL)?;
+        if requires_bbm {
+            T::complete_replaced_leaf(vaddr);
+        } else {
+            T::flush_leaf_batch(&[vaddr]);
+        }
         Ok(page_size)
     }
 
