@@ -19,28 +19,13 @@ pub use page_table_generic::{
 
 use crate::mem::{phys_to_virt, virt_to_phys};
 
-/// Enables IRQ-safe AArch64 break-before-make only for boot targets whose
-/// stage-one walkers are covered by one Inner Shareable domain.
+/// Enables IRQ-safe AArch64 break-before-make only when the platform owns the
+/// Inner Shareable stage-one maintenance contract.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn certify_inner_shareable_bbm() {
-    let Some(fdt) = crate::dtb::get_fdt() else {
-        return;
-    };
-    let Some(root) = fdt.find_nodes("/").next() else {
-        return;
-    };
-    let mut qemu_virt = false;
-    let mut orange_pi_5_plus = false;
-    let mut rk3588 = false;
-    for compatible in root.compatibles() {
-        qemu_virt |= matches!(compatible, "qemu,virt" | "linux,dummy-virt");
-        orange_pi_5_plus |= compatible == "xunlong,orangepi-5-plus";
-        rk3588 |= compatible == "rockchip,rk3588";
-    }
-    if qemu_virt || (orange_pi_5_plus && rk3588) {
-        // SAFETY: QEMU virt vCPUs and RK3588 Orange Pi 5 Plus CPUs run in the
-        // platform-wide coherent Inner Shareable stage-one domain. Unknown
-        // FDT roots remain disabled and fail before changing a descriptor.
+    if ax_plat::mem::stage_one_tlb_domain() == ax_plat::mem::StageOneTlbDomain::InnerShareable {
+        // SAFETY: the platform contract covers every CPU admitted to runtime
+        // use of a shared EL1 or EL2 stage-one table for its entire lifetime.
         unsafe { ax_cpu::paging::enable_inner_shareable_stage1_bbm() };
     }
 }

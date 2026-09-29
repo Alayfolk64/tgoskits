@@ -273,6 +273,14 @@ break-before-make 完成边界；它不是按 CPU 返回的运行时回执。该
 stage-1 页表的 PE 必须属于同一域，平台配置不能仅凭 `TCR_EL1.SH0/SH1` 或
 `TCR_EL2.SH0` 设为 Inner 就推断这一点。如果平台不能保证同域，必须在写入新项前
 另行完成覆盖所有使用者的失效，例如两阶段软件 shootdown 或平台专用的更宽域操作。
+`ax-plat::mem::StageOneTlbDomain` 将这一硬件前提交给平台实现声明；
+`ax-hal::init_early` 只在平台报告 `InnerShareable` 时启用同步预写入失效，
+不再从 FDT 根兼容串推断。动态 AArch64 平台要求固件在启动任何次核前满足
+[Linux AArch64 启动协议的 coherency 要求](https://docs.kernel.org/arch/arm64/booting.html)，
+并要求所有会访问同一运行期 EL1/EL2 stage-one 页表的处理器处于同一 Inner Shareable 域。
+前者要求次核能接收维护操作，但单靠协议文本不能证明后者；每个实体板卡仍需验证
+次核入域和跨核替换。当前 CI 只在 QEMU virt 验证跨核替换；RK3588 Orange Pi 5 Plus、
+PhytiumPi、Rock 4D、ROC-RK3568-PC 及 ACPI 启动仍缺少本 PR 精确提交的实体跨核验证。
 该硬件完成边界不提供目标 CPU 的 online 状态、逐目标失败报告或 owner 回收许可；
 frame/VA/backend/page-cache owner 的释放仍依赖 ax-hal/runtime 的目标确认、失败
 quarantine 和最终 shootdown。若只在远端回调中执行 DSB，
