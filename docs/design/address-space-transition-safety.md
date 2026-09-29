@@ -253,7 +253,17 @@ ax-hal/runtime 软件 shootdown 事务拥有。唯一的预写入例外是 break
 `TableMeta::flush_before_make` 在内共享域完成失效，最后才能写入新描述符；
 `TableMeta::publish_new_mapping` 再完成新项的可见性屏障。AArch64 EL1/EL2
 对单页分别使用 `vaae1is`/`vae2is`，对覆盖多个翻译的 huge 变更使用全域失效；这些同步 TLBI
-只保证新描述符不会与旧翻译并存，不提供 runtime 的目标 CPU 确认，也不能代替 owner 的
+按 `dsb ishst → TLBI ...IS → dsb ish → isb` 完成。后一个 `dsb ish` 等待同一
+Inner Shareable 域内目标 PE 的 TLBI 完成，因此在该域内为写入新描述符提供
+break-before-make 完成边界；它不是按 CPU 返回的运行时回执。该广播范围与指令序列见
+[Arm 内存管理指南](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf)，
+`DSB ISH` 的 TLBI 完成语义见
+[Arm ARM 已知问题说明](https://documentation-service.arm.com/static/69aac74fe79f9a1d642aa91f)。所有可能同时使用这张
+stage-1 页表的 PE 必须属于同一域，平台配置不能仅凭 `TCR_EL1.SH0/SH1` 或
+`TCR_EL2.SH0` 设为 Inner 就推断这一点。如果平台不能保证同域，必须在写入新项前
+另行完成覆盖所有使用者的失效，例如两阶段软件 shootdown 或平台专用的更宽域操作。
+该硬件完成边界不提供目标 CPU 的 online 状态、逐目标失败报告或 owner 回收许可；
+frame/VA/backend/page-cache owner 的释放仍依赖 ax-hal/runtime 的目标确认、失败
 quarantine 和最终 shootdown。若只在远端回调中执行 DSB，
 它不能排序发起 CPU 先前清除 parent PTE 的写入：远端可能在 ACK 后仍走旧 table 层级，而 gather
 随即回收并复用中间页表 frame，形成 page-walk use-after-free。CI run `33142588973` 中随后出现的
