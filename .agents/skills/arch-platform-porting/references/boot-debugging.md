@@ -43,6 +43,10 @@ QEMU `hostfwd` 发 `GET /api/v1/ota/status` 才能证明客户端可访问。
 
 `prepare_guest_boot` 在体系结构固件准备和 VM 创建之前拒绝空内核；内存镜像与文件系统镜像遵循同一规则。可选初始内存文件系统及一般客户机字节写入不属于该限制。验证时同时检查空内核得到明确路径诊断、有效内核仍能启动，不能把拒绝错误输入当作已修复上游镜像。
 
+## AArch64 GICv3 ITS
+
+AArch64 GICv3 ITS 的每个 redistributor 必须拥有独立的 LPI pending table。`GicItsProvider::new` 分配逐核槽位，`Gic::init_lpi_tables` 将基址写入各自的 `GICR_PENDBASER`。该寄存器只保存物理地址的 `[51:16]` 位，因此分配基址和逐核步长都要按 64 KiB 对齐；表的实际有效长度较小时也不能缩小步长。QEMU 中遇到 LPI 重复触发、NVMe 队列完成中断出现在非预期处理器时，先从设备树确认 GICR 基址，再读取各 redistributor 的 `PENDBASER`，核对寄存器中的基址彼此不同，并对照 ITS collection 的路由。
+
 ## Axvisor 已解析设备图与客户机固件
 
 各 Axvisor 体系结构在生成最终客户机固件前，自行构建并解析设备图。共享设备图不规定跨体系结构的统一设备顺序：AArch64 仍先安装虚拟通用中断控制器，再安装中断消费者；RISC-V 保留 PLIC 硬件线程和上下文设置；x86 保留本地高级可编程中断控制器、输入输出中断控制器、可编程间隔定时器和高级可编程中断控制器访问顺序；LoongArch 保留 IOCSR、EXTIOI 与 PCH 级联。

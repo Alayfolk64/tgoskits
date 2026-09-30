@@ -27,6 +27,7 @@ const LPI_ID_BITS: u8 = 16;
 const LPI_COUNT: usize = 1 << LPI_ID_BITS;
 const LPI_PROPERTY_BYTES: usize = LPI_COUNT;
 const LPI_PENDING_BYTES_PER_RD: usize = LPI_COUNT / 8;
+const GICR_PENDBASER_ALIGNMENT: usize = 1 << 16;
 const LPI_DEFAULT_PRIORITY: u8 = 0xa0;
 const COMMAND_QUEUE_ENTRIES: usize = 256;
 const MIN_DEVICE_EVENTS: u32 = 32;
@@ -186,9 +187,14 @@ impl GicItsProvider {
         property_table.clean();
 
         let use_physical_collection_target = its.uses_physical_collection_target();
-        let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, 4096);
+        // PENDBASER stores address bits [51:16], so each redistributor needs
+        // a separate 64 KiB-aligned slot even when its table is smaller.
+        let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, GICR_PENDBASER_ALIGNMENT);
         let rd_count = with_gic(|gic| Ok(gic.redistributor_count().max(1)))?;
-        let pending_tables = AlignedMemory::new(pending_stride * rd_count, 65536)
+        let pending_bytes = pending_stride
+            .checked_mul(rd_count)
+            .ok_or_else(|| OnProbeError::other("LPI pending table size overflow"))?;
+        let pending_tables = AlignedMemory::new(pending_bytes, GICR_PENDBASER_ALIGNMENT)
             .ok_or_else(|| OnProbeError::other("failed to allocate LPI pending tables"))?;
         pending_tables.clean();
 

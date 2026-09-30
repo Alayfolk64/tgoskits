@@ -18,6 +18,8 @@ pub use nmi::*;
 use crate::version::{IrqVecReadable, IrqVecWriteable};
 pub use crate::{IntId, VirtAddr, define::Trigger, sys_reg::*};
 
+const GICR_PENDBASER_ALIGNMENT: usize = 1 << 16;
+
 /// SGI target specification for GICv3.
 ///
 /// Defines how to target CPUs when sending Software Generated Interrupts (SGIs).
@@ -505,7 +507,27 @@ impl Gic {
         pending_table_phys_base: u64,
         pending_table_stride: usize,
     ) -> Result<(), &'static str> {
-        for (idx, rd) in self.rd_slice().iter().enumerate() {
+        if pending_table_phys_base & (GICR_PENDBASER_ALIGNMENT as u64 - 1) != 0
+            || pending_table_stride < GICR_PENDBASER_ALIGNMENT
+            || pending_table_stride & (GICR_PENDBASER_ALIGNMENT - 1) != 0
+        {
+            return Err("GICR LPI pending tables must be 64 KiB aligned");
+        }
+        // Check the last slot before any register writes; all earlier slots
+        // then fit in the 52-bit PENDBASER address field as well.
+        let redistributors = self.rd_slice();
+        let last_index = redistributors.iter().count().saturating_sub(1);
+        let last_offset = last_index
+            .checked_mul(pending_table_stride)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or("GICR LPI pending table address overflow")?;
+        let last_pending = pending_table_phys_base
+            .checked_add(last_offset)
+            .ok_or("GICR LPI pending table address overflow")?;
+        if last_pending >= 1 << 52 {
+            return Err("GICR LPI pending table address exceeds 52 bits");
+        }
+        for (idx, rd) in redistributors.iter().enumerate() {
             let pending = pending_table_phys_base + (idx * pending_table_stride) as u64;
             unsafe { rd.as_ref() }.lpi.configure_lpi_tables(
                 property_table_phys,
