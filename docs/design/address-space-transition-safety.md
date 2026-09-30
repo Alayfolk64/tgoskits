@@ -278,9 +278,19 @@ stage-1 页表的 PE 必须属于同一域，平台配置不能仅凭 `TCR_EL1.S
 不再从 FDT 根兼容串推断。动态 AArch64 平台要求固件在启动任何次核前满足
 [Linux AArch64 启动协议的 coherency 要求](https://docs.kernel.org/arch/arm64/booting.html)，
 并要求所有会访问同一运行期 EL1/EL2 stage-one 页表的处理器处于同一 Inner Shareable 域。
-前者要求次核能接收维护操作，但单靠协议文本不能证明后者；每个实体板卡仍需验证
+`someboot` 的 AArch64 EL1/EL2 启动后端已在各自的 `flush_tlb(Some(_))` 中使用
+Inner Shareable TLBI；`ax_cpu::mmu::{El1, El2}::configure_stage1` 也把页表遍历配置为
+Inner Shareable。这些源码只表明软件采用该启动契约，不能单凭寄存器设置证明硬件域的覆盖范围。
+Linux 启动协议要求次核能接收维护操作，但单靠协议文本不能证明实际硬件域；每个实体板卡仍需验证
 次核入域和跨核替换。当前 CI 只在 QEMU virt 验证跨核替换；RK3588 Orange Pi 5 Plus、
 PhytiumPi、Rock 4D、ROC-RK3568-PC 及 ACPI 启动仍缺少本 PR 精确提交的实体跨核验证。
+为检查平台判定不再依赖 FDT 根兼容串，在 QEMU virt 512 MiB、4 CPU 的自动生成 FDT 中，
+仅将根节点 `compatible` 从 `linux,dummy-virt` 改成未列名的
+`tgoskits,unlisted-virt`，保留设备节点与 QEMU 配置；运行期
+`mm-transition-safety` 的跨核权限转换、两核 COW 和 refault 均通过，输出
+`STARRY_SYSTEM_TEST_PASSED: /usr/bin/starry-test-suit/mm-transition-safety`。
+这一回归只证明未知根兼容串不再触发 `prepare_break_before_make()` 的缺页失败；
+QEMU 的同域行为不能代替上述实体平台的 interconnect 与固件验证。
 该硬件完成边界不提供目标 CPU 的 online 状态、逐目标失败报告或 owner 回收许可；
 frame/VA/backend/page-cache owner 的释放仍依赖 ax-hal/runtime 的目标确认、失败
 quarantine 和最终 shootdown。若只在远端回调中执行 DSB，
