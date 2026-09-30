@@ -1,37 +1,10 @@
 //! Page-table metadata for the active architecture.
 
-#[cfg(target_arch = "aarch64")]
-use core::sync::atomic::{AtomicBool, Ordering};
-
 pub use page_table_generic::{PageTableEntry, TableMeta};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::structures::paging::{PageOffset, PageTableIndex, page_table::PageTableLevel};
 
 use crate::VirtAddr;
-
-#[cfg(target_arch = "aarch64")]
-static INNER_SHAREABLE_STAGE1_BBM: AtomicBool = AtomicBool::new(false);
-
-/// Enables IRQ-safe stage-one break-before-make on a certified platform.
-///
-/// # Safety
-///
-/// The platform owner must establish that every CPU which can walk a shared
-/// EL1 or EL2 stage-one table belongs to the same Inner Shareable domain.
-/// This condition must remain true for the lifetime of the runtime.
-#[cfg(target_arch = "aarch64")]
-pub unsafe fn enable_inner_shareable_stage1_bbm() {
-    INNER_SHAREABLE_STAGE1_BBM.store(true, Ordering::Release);
-}
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn require_inner_shareable_stage1_bbm() -> page_table_generic::PagingResult {
-    if INNER_SHAREABLE_STAGE1_BBM.load(Ordering::Acquire) {
-        Ok(())
-    } else {
-        Err(page_table_generic::PagingError::BreakBeforeMakeDomainUnavailable)
-    }
-}
 
 bitflags::bitflags! {
     /// Runtime stage-1 mapping permissions and memory attributes.
@@ -87,7 +60,10 @@ use crate::arch::current::paging::{
     PAGE_SIZE as ARCH_PAGE_SIZE,
 };
 
-/// Page-table metadata for the active target architecture.
+/// Local-domain page-table metadata for the active target architecture.
+///
+/// A shared AArch64 stage-one table uses the runtime metadata in `ax-hal`,
+/// which validates its platform domain before break-before-make.
 #[derive(Clone, Copy)]
 pub struct ArchPagingMeta;
 
@@ -139,34 +115,12 @@ impl TableMeta for ArchPagingMeta {
     }
 
     fn flush_before_make(vaddr: VirtAddr, page_size: usize) -> page_table_generic::PagingResult {
-        #[cfg(target_arch = "aarch64")]
-        {
-            require_inner_shareable_stage1_bbm()?;
-            crate::mmu::El1::flush_tlb_inner_shareable(
-                (page_size == Self::PAGE_SIZE).then_some(vaddr),
-            );
-            Ok(())
+        if page_size > Self::PAGE_SIZE {
+            Self::flush(None);
+        } else {
+            Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
         }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            if page_size > Self::PAGE_SIZE {
-                Self::flush(None);
-            } else {
-                Self::flush_leaf_batch(core::slice::from_ref(&vaddr));
-            }
-            Ok(())
-        }
-    }
-
-    fn prepare_break_before_make() -> page_table_generic::PagingResult {
-        #[cfg(target_arch = "aarch64")]
-        {
-            require_inner_shareable_stage1_bbm()
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            Ok(())
-        }
+        Ok(())
     }
 
     fn complete_replaced_leaf(vaddr: VirtAddr) {

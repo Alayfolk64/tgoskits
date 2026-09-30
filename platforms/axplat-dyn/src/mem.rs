@@ -102,9 +102,9 @@ impl MemIf for MemIfImpl {
     fn stage_one_tlb_domain() -> StageOneTlbDomain {
         #[cfg(target_arch = "aarch64")]
         {
-            // Every admitted CPU must satisfy the Linux AArch64 boot coherency
-            // contract and share one Inner Shareable stage-one TLBI domain.
-            // A port that cannot provide both must not use this implementation.
+            // Linux-compatible AArch64 SMP boot requires all CPUs that may run
+            // the kernel to receive maintenance in one coherent domain. Ports
+            // must also place shared stage-one users in one Inner Shareable domain.
             StageOneTlbDomain::InnerShareable
         }
 

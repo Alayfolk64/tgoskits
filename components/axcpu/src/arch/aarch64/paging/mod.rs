@@ -7,7 +7,9 @@ pub(crate) use stage1::{ADDRESS_BITS, LEVEL_BITS, MAX_BLOCK_LEVEL, PAGE_SIZE};
 pub use stage1::{DescriptorFlags, El1Pte, El2Pte, Pte, Stage1Pte, Stage1Regime};
 pub use stage2::Stage2Pte;
 
-/// Four-level, 4-KiB non-VHE EL2 stage-one table geometry.
+/// Four-level, 4-KiB non-VHE EL2 stage-one table geometry with local TLB scope.
+///
+/// Shared runtime tables use the platform-checked metadata in `ax-hal`.
 #[derive(Clone, Copy)]
 pub struct El2PagingMeta;
 
@@ -23,20 +25,5 @@ impl crate::paging::TableMeta for El2PagingMeta {
 
     fn flush(address: Option<crate::VirtAddr>) {
         super::mmu::El2::flush_tlb(address);
-    }
-
-    fn flush_before_make(
-        address: crate::VirtAddr,
-        page_size: usize,
-    ) -> page_table_generic::PagingResult {
-        crate::paging::require_inner_shareable_stage1_bbm()?;
-        super::mmu::El2::flush_tlb_inner_shareable(
-            (page_size == Self::PAGE_SIZE).then_some(address),
-        );
-        Ok(())
-    }
-
-    fn prepare_break_before_make() -> page_table_generic::PagingResult {
-        crate::paging::require_inner_shareable_stage1_bbm()
     }
 }
