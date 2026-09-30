@@ -1,5 +1,26 @@
 # 启动调试参考
 
+## axloader x86_64 UEFI OTA 与恢复
+
+迁移后的可移动介质启动路径固定是 `EFI/BOOT/BOOTX64.EFI` 小型启动器；
+装载器镜像放在同一个 ESP 的 `EFI/AXLOADER/A.EFI`、`B.EFI`。
+检查试运行失败时先读取 `STATE0.BIN` 和 `STATE1.BIN`：每份 256 字节，
+代次位于偏移 `8..16`，稳定/待试槽位于 `16..18`，试运行标志在 `18`，
+记录最后 32 字节是前 224 字节的 SHA-256。只使用校验通过且代次较新的
+记录；若状态全坏，启动器停止并要求外部介质恢复。镜像摘要不匹配时同样
+先检查对应槽的文件，而不是修改固件引导顺序。
+
+调试顺序：确认固件实际从预期 ESP 启动 `BOOTX64.EFI`；确认启动器按当前
+记录选槽，并在待试 `StartImage` 前持久标记 `attempted`；确认待试装载器
+报告运行摘要/升级 ID 且只由相同来源确认；掉电后检查记录的
+`rolled_back`。`ota_direct_listening` 证明 TCP4 服务已绑定；再通过
+QEMU `hostfwd` 发 `GET /api/v1/ota/status` 才能证明客户端可访问。
+`cargo xtask axloader test qemu --target x86_64-unknown-uefi` 使用真实 FAT
+镜像跨 QEMU 启动，避免 `fat:rw:` 的实验性写入语义污染回滚结论。
+首次迁移覆盖启动器时仍可能断电，需要保留
+`EFI/AXLOADER/BOOTX64.ORIGINAL.EFI` 及外部启动介质。没有同网卡 TCP4
+服务绑定时观察 `ota_direct_unavailable`，服务端启动功能仍可使用。
+
 本文件记录 LoongArch 动态统一可扩展固件接口平台启动、someboot 对称多处理、StarryOS 测试和 Axvisor LoongArch 虚拟化扩展 QEMU 冒烟测试的项目经验。
 
 ## 分层映射
@@ -281,16 +302,26 @@ timer 退出。旧入口必然执行到 HVCL 并在退出类别断言失败；�
 且保留 pending 位、恢复宿主 IRQ 屏蔽状态。它提供入口契约的确定性证明，Axvisor
 `normal/smoke` 继续验证 Linux 启动、定时唤醒和块设备访问。
 
+Linux 已枚举 VirtIO 块设备却停在首次挂载时，还需检查延后队列是否在
+WFI 前提交。`axvm::runtime::vcpus::run_waits_for_event()` 由主 vCPU
+无条件推进设备轮询，再进入体系结构等待；次 vCPU 不执行 VM 级设备轮询。
+队列通知可能仅设置设备的 `queue_pending`，不能只检查运行时的
+`device_poll_requested`，否则没有提交给文件工作线程的请求也不会产生完成唤醒。
+`FileBackend.shared` 使用 `IrqSafeMutex`，因为调用者持有关闭中断的队列租约；
+存储 I/O 和通知在该锁之外执行。验证同时保留等待前轮询的顺序测试和真实
+Linux 挂载结果，偶然成功的重试不能证明已修复丢失进展。
+
 ## QEMU 调试模式
 
 ### axloader UEFI 网络启动
 
-- axloader 控制面只使用固件提供的网络协议。`SimpleNetwork`、`Ip4Config2`、`UDP4 Service Binding` 和 `HTTP Service Binding` 必须来自同一个 UEFI 控制器；发现、MAC 和 HTTP 分别来自不同网卡不算可用实现。
+- axloader v5 控制面只使用固件提供的网络协议。`SimpleNetwork`、`Ip4Config2`、`UDP4 Service Binding` 和 `TCP4 Service Binding` 必须来自同一个 UEFI 控制器；广播、MAC 和 HTTP 监听分别来自不同网卡不算可用实现。
 - `ConOut` 只输出诊断；不要从 `ConIn` 或 `SerialIo` 解析 READY/BOOT、AT 命令或字符匹配协议。目标映像接管后，串口才作为交互终端。
-- 每次固件启动重新执行 UDP 2998 发现并取得新的 `registration_id`。多 server 响应必须拒绝，未绑定和空闲状态继续轮询，失败使用有上限退避，不回退串口。
-- QEMU smoke 要走真实 UEFI UDP/HTTP。SLiRP 可承担 DHCP 与 HTTP；需要把二层广播交给宿主测试服务时，用 `filter-mirror` 捕获客户机发包、用独立 `filter-redirector` 注入响应，并验证四字节大端帧长、IPv4/UDP 校验和、目标 MAC/IP/端口。
-- UEFI HTTP JSON POST 必须显式携带 `Content-Type: application/json` 与准确的 `Content-Length`；只有请求体字节但没有长度头时，HTTP/1.1 server 会把请求解析为空 body。对同一网卡连续创建 HTTP 子协议时，上一请求的 protocol guard 必须先完成关闭，避免 OVMF 将相同 OpenProtocol 键合并后在析构期返回 `NOT_FOUND`。
-- 成功证据必须同时包含真实内核 GET、长度和 SHA-256 校验、`ready_to_handoff` 状态及 ELF 装载。`ready_to_handoff` 后先析构 UDP、HTTP、IP 配置及其事件和子句柄，再调用 `ExitBootServices`；退出后不能再调用固件网络或控制台服务。
+- 每次固件启动生成新的 `boot_epoch`，在 UDP 2998 单向广播，并在 TCP4 2999 提供设备 HTTP 接口；即使 ostool-server 不在线，直连调用方仍可上传、确认和启动。修改请求携带 `X-Boot-Epoch`，旧代次必须拒绝。
+- QEMU smoke 使用真实 UEFI TCP4 接收启动及 OTA 文件，SLiRP `hostfwd` 将宿主空闲端口指向客户机 2999。服务端联调时，`filter-mirror` 捕获客户机广播帧，宿主夹具解析四字节大端帧长和 UDP 长度后转交本地服务端；测试地址仅在夹具内映射到 `hostfwd`，服务端必须通过真实 HTTP 调用设备。
+- UEFI HTTP 修改请求明确携带准确的 `Content-Length`；核对内核与 initramfs 的长度和 SHA-256，并在 OTA 待试确认前拒绝启动。v5 只接受 `__x86_64_efi_pe_entry`；cmdline 以 UCS-2 EFI LoadOptions 交接，可选 initramfs 以 `BootPayload` 表交接。someboot 在退出 Boot Services 前从实际 image handle 复制 LoadOptions，命令行来源优先级是 EFI LoadOptions、旧 `BootPayload.cmdline`、ESP `cmdline.txt`、FDT `/chosen/bootargs`、编译期命令行。
+- `cargo xtask axloader test qemu --target x86_64-unknown-uefi` 必须上传真实 ArceOS UEFI ELF，跨同一 FAT 镜像的独立启动验证无附加字段、仅 cmdline、仅 initramfs 和两者都有；成功证据来自内核的 `HOST_CMDLINE`、`HOST_INITRAMFS_PASSED`，不能只停在 `ready_to_handoff`。
+- 发送准备交接响应后先析构 TCP4 监听、子句柄、事件及 UDP4 广播对象，再调用 `ExitBootServices`；退出后不能再调用固件网络或控制台服务。
 
 - 首条可靠输出前失败时加入 `-S -s`，在复位处停止并连接 GDB。
 - 加入 `-d int,cpu_reset,guest_errors` 记录陷阱、复位和无效客户机访问。
@@ -383,6 +414,30 @@ Starry 的可执行文件页、COW 拷贝及预填充由 `PageObject::prepare_ex
 
 对照 Linux `8cd9520d35a6c38db6567e97dd93b1f11f185dc6` 的 `__set_ptes_anysz -> __sync_cache_and_tags -> __sync_icache_dcache`。用 `cargo xtask starry test board --board orangepi-5-plus --test-case exec-cache` 验证文件页内核写入后的重新取指；QEMU 只作为执行路径检查，不作为 I-cache/D-cache 实机红绿证明。完整所有权与证据见 `docs/design/user-executable-cache-coherence.md`。
 ## 宿主 initramfs
+
+板卡测试停在 systemd 的 `Freezing execution`，或 BusyBox 持续启动不存在的
+`/dev/tty1`～`/dev/tty6` 时，先检查实际 `init=` 与根文件系统，不能仅延长超时。
+等待测试 shell 的 `board-*.toml` 使用 `BoardRunConfig.boot.cmdline` 明确指定
+`init=/bin/sh`，设置 `HOME=/root USER=root HOSTNAME=starry`，在 `--` 后传入
+`-c "cd /root; export PS1=$USER@$HOSTNAME:~#; exec /bin/sh -i"`。
+提示符只在 shell 中派生，不能把完整 `shell_prefix` 写入 cmdline，否则内核
+打印参数时会触发测试步骤，命令会在运行时控制台接管前发出。
+这是完整 cmdline，需保留实际 `root=`、`console=` 与 `earlycon`；仅加
+测试 shell 参数会覆盖固件的串口选择。VisionFive 2 保留
+`console=ttyS0,115200 debug rootwait earlycon=sbi`，JL LSGD2K10 保留
+`earlycon`。OrangePi 5 Plus 和 SG2002 使用
+`/dev/mmcblk0p2`，ROCK 4D 使用 `/dev/mmcblk0p3`。Axvisor Starry guest 在
+`[kernel].cmdline` 中指定同样的客户机启动条件，不改宿主 cmdline。
+确认提示符后仍须执行用例命令并检查成功标记；该测试模式不证明 OpenRC
+生命周期或完整的终端作业控制。普通启动的可选 cmdline 仍可省略。
+
+U-Boot 回显命令在中途缺字、尾部丢失或重试内容交错时，先区分固件命令行
+长度限制与串口输入未被消费。宿主 `write_all`、`flush` 成功不能证明目标已
+处理输入；`uboot-shell 0.2.9` 的 `UbootShell::cmd` 在回显开启的控制台中逐字节
+等待设备确认，缺失回显时中断并重新取得提示符，不盲目重复整行。核对完整
+`setenv bootargs` 的回显、`printenv bootargs` 和内核实际 cmdline；不要通过
+缩短有效 cmdline 或恢复服务端持锁 `tcdrain` 掩盖输入流控制问题。该修复不
+改变固件自身的命令行容量，YMODEM 二进制传输也不走命令回显路径。
 
 宿主归档的构建、交接、预留、解包、根选择与回收顺序见
 [`docs/design/host-initramfs.md`](../../../../docs/design/host-initramfs.md)。
