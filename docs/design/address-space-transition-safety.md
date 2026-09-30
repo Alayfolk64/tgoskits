@@ -259,9 +259,11 @@ shootdown 确认之前还必须存在独立的“页表写入已发布”边。A
 远端 IPI 前执行 `dsb ishst`；每个目标 CPU 的常规失效只执行本地
 `dsb nshst → TLBI → dsb nsh → isb`。`ArchPagingMeta::flush_batch` 和
 `El2PagingMeta::flush_batch` 保持本核语义，CPU mask、online 状态、失效确认和资源回收仍由
-ax-hal/runtime 软件 shootdown 事务拥有。唯一的预写入例外是 break-before-make：
+ax-hal/runtime 软件 shootdown 事务拥有。break-before-make 的预写入硬件事务由
+`ax_hal::paging::ArchPagingMeta` 实施；`ax_cpu::paging::{ArchPagingMeta, El2PagingMeta}`
+只保留本地失效，`ax_cpu::mmu::{El1, El2}` 提供底层 TLBI 指令原语：
 `Frame::remap_recursive` 更换物理页，以及 huge leaf 与子表互换时，必须先清除旧描述符，再由
-`TableMeta::flush_before_make` 在内共享域完成失效，最后才能写入新描述符；
+`TableMeta::flush_before_make` 在平台声明的失效域完成同步，最后才能写入新描述符；
 `TableMeta::publish_new_mapping` 再完成新项的可见性屏障。AArch64 EL1/EL2
 对单页分别使用 `vaae1is`/`vae2is`，对覆盖多个翻译的 huge 变更使用全域失效；这些同步 TLBI
 按 `dsb ishst → TLBI ...IS → dsb ish → isb` 完成。后一个 `dsb ish` 等待同一
@@ -274,22 +276,28 @@ stage-1 页表的 PE 必须属于同一域，平台配置不能仅凭 `TCR_EL1.S
 `TCR_EL2.SH0` 设为 Inner 就推断这一点。如果平台不能保证同域，必须在写入新项前
 另行完成覆盖所有使用者的失效，例如两阶段软件 shootdown 或平台专用的更宽域操作。
 `ax-plat::mem::StageOneTlbDomain` 将这一硬件前提交给平台实现声明；
-`ax-hal::init_early` 只在平台报告 `InnerShareable` 时启用同步预写入失效，
-不再从 FDT 根兼容串推断。动态 AArch64 平台要求固件在启动任何次核前满足
-[Linux AArch64 启动协议的 coherency 要求](https://docs.kernel.org/arch/arm64/booting.html)，
-并要求所有会访问同一运行期 EL1/EL2 stage-one 页表的处理器处于同一 Inner Shareable 域。
+`ax-hal` 在每次清旧描述符之前检查域，不从 FDT 根兼容串推断，也不设置跨页表实例的
+全局开关。动态 AArch64 平台按 Linux 兼容的 SMP 启动契约声明
+`InnerShareable`，不以 FDT 根兼容串或单个构建配置决定能否执行 BBM。
+[Linux AArch64 启动协议](https://docs.kernel.org/arch/arm64/booting.html)要求所有将由
+内核启动的 CPU 在入内核前属于同一 coherency domain，并能接收维护操作；
+[Linux v7.1 的 TLB 实现](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/arch/arm64/include/asm/tlbflush.h)
+使用 `DSB ISHST → TLBI ...IS → DSB ISH` 覆盖共享页表的处理器。本平台实现采用
+相同的硬件前提，保留原有多核启动能力。动态 AArch64 平台不会将多核构建静默降为单核。
+若固件或 interconnect 不满足这一启动契约，该平台不能按当前配置安全运行多核页表替换。
 `someboot` 的 AArch64 EL1/EL2 启动后端已在各自的 `flush_tlb(Some(_))` 中使用
 Inner Shareable TLBI；`ax_cpu::mmu::{El1, El2}::configure_stage1` 也把页表遍历配置为
 Inner Shareable。这些源码只表明软件采用该启动契约，不能单凭寄存器设置证明硬件域的覆盖范围。
-Linux 启动协议要求次核能接收维护操作，但单靠协议文本不能证明实际硬件域；每个实体板卡仍需验证
-次核入域和跨核替换。当前 CI 只在 QEMU virt 验证跨核替换；RK3588 Orange Pi 5 Plus、
-PhytiumPi、Rock 4D、ROC-RK3568-PC 及 ACPI 启动仍缺少本 PR 精确提交的实体跨核验证。
+Linux 的启动前提与 TLBI 实现共同说明所采用的软件契约，但不能单凭寄存器设置或协议文本
+证明每块实体板卡的固件和 interconnect 实际满足该契约。当前 QEMU 回归覆盖跨核替换；
+RK3588 Orange Pi 5 Plus、PhytiumPi、Rock 4D、ROC-RK3568-PC 与 ACPI 启动仍需实体回归。
 为检查平台判定不再依赖 FDT 根兼容串，在 QEMU virt 512 MiB、4 CPU 的自动生成 FDT 中，
 仅将根节点 `compatible` 从 `linux,dummy-virt` 改成未列名的
 `tgoskits,unlisted-virt`，保留设备节点与 QEMU 配置；运行期
 `mm-transition-safety` 的跨核权限转换、两核 COW 和 refault 均通过，输出
 `STARRY_SYSTEM_TEST_PASSED: /usr/bin/starry-test-suit/mm-transition-safety`。
-这一回归只证明未知根兼容串不再触发 `prepare_break_before_make()` 的缺页失败；
+这一回归只证明动态 AArch64 QEMU 构建在未知根兼容串下不触发
+`prepare_break_before_make()` 的缺页失败；
 QEMU 的同域行为不能代替上述实体平台的 interconnect 与固件验证。
 该硬件完成边界不提供目标 CPU 的 online 状态、逐目标失败报告或 owner 回收许可；
 frame/VA/backend/page-cache owner 的释放仍依赖 ax-hal/runtime 的目标确认、失败
