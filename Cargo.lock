@@ -171,6 +171,7 @@ name = "aic8800"
 version = "0.3.3"
 dependencies = [
  "aes-kw",
+ "ax-runtime",
  "dma-api",
  "hmac",
  "log",
