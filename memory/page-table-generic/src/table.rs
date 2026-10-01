@@ -19,15 +19,15 @@ pub(crate) const MAX_DEFERRED_PAGE_TABLE_LEVELS: usize = 8;
 
 /// An occupied mapping snapshot, including a non-present leaf.
 #[derive(Debug)]
-pub struct MappedLeaf<C> {
+struct MappedLeaf<C> {
     /// Base virtual address of the complete leaf mapping.
-    pub vaddr: VirtAddr,
+    vaddr: VirtAddr,
     /// Base physical address retained by the mapping.
-    pub paddr: PhysAddr,
+    paddr: PhysAddr,
     /// Size represented by this leaf's page-table level.
-    pub size: usize,
+    size: usize,
     /// Opaque architecture-owned configuration.
-    pub config: C,
+    config: C,
 }
 
 /// A bounded batch of detached intermediate page-table frames.
@@ -2079,13 +2079,10 @@ impl<T: TableMeta, A: FrameAllocator> PageTableRef<T, A> {
     ///
     /// Returns [`PagingError::NotMapped`] for an unused entry or subtree and
     /// a hierarchy error for a malformed intermediate descriptor.
-    pub fn query_occupied_leaf(
-        &self,
-        vaddr: VirtAddr,
-    ) -> PagingResult<crate::MappedLeaf<PteConfigOf<T>>> {
+    fn query_occupied_leaf(&self, vaddr: VirtAddr) -> PagingResult<MappedLeaf<PteConfigOf<T>>> {
         let (pte, level) = self.query_occupied(vaddr)?;
         let size = Frame::<T, A>::level_size(level);
-        Ok(crate::MappedLeaf {
+        Ok(MappedLeaf {
             vaddr: vaddr.align_down(size),
             paddr: pte.paddr(level > 1),
             size,

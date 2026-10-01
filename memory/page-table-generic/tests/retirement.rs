@@ -100,28 +100,30 @@ fn deferred_range_retains_tables_and_reports_an_error_prefix() {
 }
 
 #[test]
-fn occupied_leaf_query_retains_inaccessible_mapping_geometry() {
+fn occupied_query_retains_inaccessible_mapping_for_unmap() {
     for size in [4096, 0x20_0000] {
         let mut table = new_table();
         let address = VirtAddr::from(0x20_0000);
         let physical = PhysAddr::from(0x80_0000);
         assert!(matches!(
-            table.query_occupied_leaf(address),
+            table.query_occupied(address),
             Err(PagingError::NotMapped)
         ));
         table.map_page(address, physical, size, 1).unwrap();
         table.protect_page(address, 0).unwrap();
         assert_eq!(table.query(address), Err(PagingError::NotMapped));
         reset_events();
-        let leaf = table.query_occupied_leaf(address + size - 1).unwrap();
-        assert_eq!(leaf.vaddr, address);
-        assert_eq!(leaf.paddr, physical);
-        assert_eq!(leaf.size, size);
-        assert_eq!(leaf.config, 0);
+        let (pte, level) = table.query_occupied(address + size - 1).unwrap();
+        assert_eq!(level, if size == 4096 { 1 } else { 2 });
+        assert_eq!(pte.paddr(level > 1), physical);
+        assert_eq!(pte.config(level > 1), 0);
         EVENTS.with_borrow(|events| assert!(events.is_empty()));
-        assert_eq!(table.unmap_page(address).unwrap(), (physical, 0, size));
+        assert_eq!(
+            table.unmap_page(address + size - 1).unwrap(),
+            (physical, 0, size)
+        );
         assert!(matches!(
-            table.query_occupied_leaf(address),
+            table.query_occupied(address),
             Err(PagingError::NotMapped)
         ));
     }
