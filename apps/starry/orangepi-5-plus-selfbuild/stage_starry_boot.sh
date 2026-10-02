@@ -139,6 +139,8 @@ case "$root_partuuid" in
 esac
 printf 'starry_fit=/image.fit\nstarry_root=PARTUUID=%s\n' "$root_partuuid" \
     > "$stage_dir/starryEnv.txt"
+printf '%s\n' 'starry_shell_args=init=/bin/sh HOME=/root USER=root HOSTNAME=starry -- -c "cd /root; export PS1=$USER@$HOSTNAME:~#; exec /bin/sh -i"' \
+    >> "$stage_dir/starryEnv.txt"
 fit_sha=$(sha256sum "$stage_dir/image.fit")
 fit_sha=${fit_sha%% *}
 boot_sha=$(sha256sum "$stage_dir/boot-starryos-emmc.scr")

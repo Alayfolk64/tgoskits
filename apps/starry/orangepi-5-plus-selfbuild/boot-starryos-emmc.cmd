@@ -16,10 +16,10 @@ if load ${devtype} ${devnum}:${distro_bootpart} ${env_addr} ${prefix}starryEnv.t
 fi
 test -n "${starry_fit}" || setenv starry_fit /image.fit
 
-if test -z "${starry_root}"; then
-    echo "TGOSKits: starry_root is missing; refusing to guess a Starry block-device index"
+if test -z "${starry_root}" || test -z "${starry_shell_args}"; then
+    echo "TGOSKits: StarryOS boot arguments are missing"
 else
-    setenv bootargs "root=${starry_root} rootwait rw rootfstype=ext4 console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000"
+    setenv bootargs "root=${starry_root} rootwait rw rootfstype=ext4 console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000 ${starry_shell_args}"
 
     if ext4load ${devtype} ${devnum}:${distro_bootpart} ${fit_addr} ${starry_fit}; then
         fdt addr ${fit_addr}
@@ -34,7 +34,7 @@ else
         # ramdisk, so remove the stale range before entering StarryOS.
         fdt rm /chosen linux,initrd-start
         fdt rm /chosen linux,initrd-end
-        fdt set /chosen bootargs "root=${starry_root} rootwait rw rootfstype=ext4 console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000"
+        fdt set /chosen bootargs "${bootargs}"
         fdt print /chosen bootargs
         booti ${kernel_load_addr} - ${fdt_load_addr}
     else
