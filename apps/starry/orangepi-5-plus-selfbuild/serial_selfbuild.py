@@ -15,7 +15,7 @@ import serial
 
 MARKER = "STARRY-ORANGEPI5PLUS-SELFBUILD"
 SHELL_PROMPT = b"root@starry:/root #"
-SHELL_PROMPT_PATTERN = re.compile(rb"root@starry:(?:/root #|~# )")
+SHELL_PROMPT_PATTERN = re.compile(rb"(?:^|[\r\n])root@starry:(?:/root #|~#) ?")
 GUEST_COMMAND = b"sh /opt/starry-orangepi5plus-selfbuild/init.sh\r"
 
 
