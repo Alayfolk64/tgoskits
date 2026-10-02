@@ -140,6 +140,13 @@ impl ContextHandle {
 /// queue ordering so that every later tracked completion subsumes it.
 /// `Pending` carries the fence token for [`VirglOps::wait_fence`] and
 /// [`VirglOps::fence_completed`].
+///
+/// The token is the completion proof for fenced fire-and-forget submissions
+/// (`submit`, `transfer_from_host`, `release_buffer`): dropping it without
+/// observing it releases the caller's share of the ordering proof, so the
+/// compiler flags every discard — silence it with `let _ =` only where the
+/// direction is intentionally fire-and-forget.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Completion {
     Complete,
@@ -263,8 +270,18 @@ pub trait GpuDevice: DriverGeneric {
 
     /// Fails with `Busy` while context, scanout or in-flight work still uses
     /// the buffer; its backing remains owned by the device in that case.
-    fn release_buffer(&mut self, buffer: BufferHandle) -> Result<(), GpuError>;
+    /// On success the submission is fire-and-forget and carries a fence; the
+    /// returned completion is the caller's proof that the host stopped
+    /// touching the backing — observe it (outside the device lock) before
+    /// freeing the backing memory.
+    fn release_buffer(&mut self, buffer: BufferHandle) -> Result<Completion, GpuError>;
 
+    /// Reports whether a fenced submission is complete. Like
+    /// [`VirglOps::fence_completed`], implementations advance their
+    /// completion view first (deliver the accumulated batch and pump), so a
+    /// caller with no other service path still observes its own fenced
+    /// submissions complete.
+    ///
     /// `DeviceLost` ends every outstanding completion for this device.
     fn completion_status(&mut self, completion: Completion) -> Result<CompletionStatus, GpuError>;
 

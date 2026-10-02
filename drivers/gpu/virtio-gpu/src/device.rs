@@ -308,8 +308,10 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             unsafe { self.resource_attach_backing(FRAMEBUFFER_RESOURCE_ID, paddr, size) }
         {
             // The resource exists but has no backing; release it so a failed
-            // attach does not leak a host resource. The DMA drops here because
-            // the device never received the range.
+            // attach does not leak a host resource. No completion observation
+            // is needed before the DMA drops here: the attach failed, so the
+            // device never received the range and cannot DMA into it — the
+            // unref only frees the empty host-side resource object.
             let _ = self.resource_unref(FRAMEBUFFER_RESOURCE_ID);
             return Err(err);
         }
@@ -317,15 +319,16 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         // Bind the resource to the scanout. If that fails we must stop the
         // device from using the backing before freeing it: detach first, then
         // unref. `detached` must mean the host has actually finished the
-        // teardown: `resource_unref` enqueues the unref after the detach (FIFO
-        // order) and drains the whole queue before returning, so its success
-        // is the completion proof for both. On TimedOut/QueueBroken the DMA
-        // is kept alive here and released by a later retry or the device
-        // reset in `Drop`.
+        // teardown: `resource_unref` only enqueues the unref (fire-and-forget
+        // with a fence), so this cold rollback path drains explicitly — the
+        // FIFO pop covers the detach and the unref alike. On
+        // TimedOut/QueueBroken the DMA is kept alive here and released by a
+        // later retry or the device reset in `Drop`.
         if let Err(err) = self.set_scanout(rect, SCANOUT_ID, FRAMEBUFFER_RESOURCE_ID) {
             let detached = self
                 .resource_detach_backing(FRAMEBUFFER_RESOURCE_ID)
                 .and_then(|()| self.resource_unref(FRAMEBUFFER_RESOURCE_ID))
+                .and_then(|_fence| self.wait_idle())
                 .is_ok();
             if !detached {
                 // Keep the DMA alive: the device may still be writing into it.
@@ -361,10 +364,13 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         self.rect = None;
         self.resource_detach_backing(FRAMEBUFFER_RESOURCE_ID)?;
         self.resource_unref(FRAMEBUFFER_RESOURCE_ID)?;
-        // Fire-and-forget teardown: the device must be provably done with the
-        // backing before it is handed back to the allocator, so drain the
-        // ring before releasing the DMA (`resource_unref` already drains; a
-        // second drain is a no-op that keeps this path's proof local).
+        // The device must be provably done with the backing before it is
+        // handed back to the allocator: `resource_unref` only enqueues the
+        // unref (fire-and-forget with a fence), so this cold teardown path
+        // drains explicitly — the FIFO pop covers the stop-scanout, the
+        // detach and the unref alike. On failure the `?` keeps the DMA in
+        // `self.frame_buffer_dma` for a later retry or the reset in `Drop`.
+        self.wait_idle()?;
         self.frame_buffer_dma = None;
         Ok(())
     }
@@ -605,8 +611,12 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     /// Detaches the backing memory from a resource.
     ///
     /// After the host processes this command it no longer reads or writes the
-    /// ranges that were attached. Fire-and-forget: teardown callers drain the
-    /// queue ([`VirtIoGpu::resource_unref`] does) before releasing the memory.
+    /// ranges that were attached. Fire-and-forget: the caller is responsible
+    /// for the completion proof — drain ([`VirtIoGpu::wait_idle`]) or observe
+    /// a later fenced command's fence — before releasing the memory. The
+    /// driver's teardown paths pair this command with the fenced
+    /// `resource_unref` and drain explicitly; the OS layer waits on the
+    /// unref's fence.
     pub fn resource_detach_backing(&mut self, resource_id: u32) -> Result<(), Error> {
         self.ctrl
             .enqueue(
@@ -626,30 +636,31 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     ///
     /// The protocol has a single `RESOURCE_UNREF` for 2D and 3D resources, so
     /// this is also the only way to destroy a 3D resource. The command is
-    /// submitted and delivered, and this call returns only after the host has
-    /// popped everything — the guest memory previously attached to the
-    /// resource may be freed by its owner as soon as it returns (Linux instead
-    /// defers the free to its completion callback; draining here is the
-    /// no-callback equivalent).
-    ///
-    /// The drain is bounded by the wait timeout: on [`Error::TimedOut`] the
-    /// host is unrecoverably stalled, and the caller releasing memory the
-    /// device may still own is the accepted tradeoff for unwedging the guest.
-    pub fn resource_unref(&mut self, resource_id: u32) -> Result<(), Error> {
+    /// submitted fire-and-forget with a fence and delivered; this returns the
+    /// fence id as soon as it is on the ring. The fence's completion is the
+    /// proof that the host stopped touching the released backing: the used
+    /// ring is FIFO, so the pop of the fenced unref implies the pop of every
+    /// earlier command (the same implicit ordering submits rely on). The
+    /// guest memory previously attached to the resource may only be freed
+    /// after the OS layer observes that fence outside the device lock.
+    /// Cold recovery paths inside this crate that must not return without
+    /// the proof drain explicitly via [`VirtIoGpu::wait_idle`].
+    pub fn resource_unref(&mut self, resource_id: u32) -> Result<u64, Error> {
+        let fence_id = self.alloc_fence()?;
         self.ctrl
             .enqueue(
                 &mut self.transport,
                 &ResourceUnref {
-                    header: CtrlHeader::with_type(Command::RESOURCE_UNREF),
+                    header: CtrlHeader::with_fence(Command::RESOURCE_UNREF, 0, fence_id),
                     resource_id,
                     _padding: 0,
                 },
                 None,
-                0,
+                fence_id,
             )
             .map(|_| ())?;
         self.ctrl_notify();
-        self.ctrl.wait_idle(&mut self.transport)
+        Ok(fence_id)
     }
 
     // --- 3D (virgl) commands ---
@@ -888,21 +899,25 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             .map(|_| ())
     }
 
-    /// Transfers a 3D resource from the host to guest memory, and waits until
-    /// the host has applied it: the caller reads the guest memory right after
-    /// this returns, so completion has to be observed before the data is
-    /// valid (Linux waits the same transfer's fence in
-    /// `virtio_gpu_transfer_from_host_ioctl`). The read-back drain is bounded
-    /// by the wait timeout — see [`VirtIoGpu::new`].
-    pub fn transfer_from_host_3d(&mut self, params: Transfer3d) -> Result<(), Error> {
+    /// Transfers a 3D resource from the host to guest memory. The command is
+    /// submitted fire-and-forget **with a fence** and returns the fence id:
+    /// the fence's completion proves the host applied the transfer (the used
+    /// ring is FIFO, so its pop implies the pop of every earlier command),
+    /// which is what makes the guest memory valid to read. The OS layer
+    /// observes that fence outside the device lock and syncs the backing for
+    /// the CPU before letting its caller read back (Linux instead relies on
+    /// dma_resv deferred destruction and returns without waiting).
+    pub fn transfer_from_host_3d(&mut self, params: Transfer3d) -> Result<u64, Error> {
         self.require_virgl()?;
+        let fence_id = self.alloc_fence()?;
         self.ctrl
             .enqueue(
                 &mut self.transport,
                 &CmdTransferHost3D {
-                    header: CtrlHeader::with_type_and_ctx(
+                    header: CtrlHeader::with_fence(
                         Command::TRANSFER_FROM_HOST_3D,
                         params.ctx_id,
+                        fence_id,
                     ),
                     box_: params.box_,
                     offset: params.offset,
@@ -912,11 +927,11 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
                     layer_stride: params.layer_stride,
                 },
                 None,
-                0,
+                fence_id,
             )
             .map(|_| ())?;
         self.ctrl_notify();
-        self.ctrl.wait_idle(&mut self.transport)
+        Ok(fence_id)
     }
 
     /// Submits a virgl command stream to a rendering context and returns the

@@ -241,14 +241,17 @@ impl<H: Hal, T: Transport> VirtIoGpuDevice<H, T> {
 
     fn cleanup_failed_create(&mut self, id: u32) {
         // A failed create may have enqueued commands whose completion the
-        // caller cannot observe. The UNREF path already delivers and drains
-        // the queue — its success is the completion proof (the host popped
-        // everything, so it is done with the backing). Any failure is
-        // ambiguous: reset the device to stop all DMA before the caller drops
-        // its backing.
+        // caller cannot observe, and the UNREF submission no longer drains
+        // on its own (the hot-path wait moved to the OS layer). This cold
+        // recovery path still needs the completion proof before the caller
+        // drops its backing, so drain explicitly; `confirm_drain` marks the
+        // device lost — stopping all DMA — exactly when that proof stays
+        // unconfirmable.
         if self.raw.resource_unref(id).is_err() {
             self.mark_lost();
+            return;
         }
+        let _ = self.confirm_drain();
     }
 
     /// Delivers the accumulated fire-and-forget batch and waits until the host
@@ -679,7 +682,7 @@ impl<H: Hal + 'static, T: Transport + Send + 'static> GpuDevice for VirtIoGpuDev
             .ok_or(GpuError::InvalidHandle)
     }
 
-    fn release_buffer(&mut self, buffer: BufferHandle) -> Result<(), GpuError> {
+    fn release_buffer(&mut self, buffer: BufferHandle) -> Result<Completion, GpuError> {
         self.ensure_ready()?;
         let key = buffer.id().get();
         let id = self.resource_id(buffer)?;
@@ -709,35 +712,48 @@ impl<H: Hal + 'static, T: Transport + Send + 'static> GpuDevice for VirtIoGpuDev
             }
             self.resources.get_mut(&key).unwrap().attached = false;
         }
-        // `resource_unref` delivers the batch and drains the whole queue: its
-        // success is the completion proof that the host stopped touching the
-        // backing, so the caller may free the memory once this returns. A
-        // drain failure is ambiguous — reset stops all DMA before the caller
-        // can release the backing.
+        // The fenced UNREF submission carries its own completion proof: the
+        // caller observes the returned fence outside the device lock before
+        // freeing the backing (the used ring is FIFO, so the fenced pop
+        // implies every earlier command's pop too). A submission failure is
+        // ambiguous — reset stops all DMA before the caller can release the
+        // backing.
         match self.raw.resource_unref(id) {
-            Ok(()) => {}
-            Err(Error::QueueBusy) => return Err(GpuError::Busy),
+            Ok(fence) => {
+                // The fence counter starts at 1 and only increases, so the
+                // token always fits the NonZeroU64 the completion carries.
+                let fence = NonZeroU64::new(fence).expect("fence ids start at 1 and only increase");
+                self.resources.remove(&key);
+                Ok(Completion::Pending(fence))
+            }
+            Err(Error::QueueBusy) => Err(GpuError::Busy),
             Err(_) => {
                 self.mark_lost();
-                return Err(GpuError::DeviceLost);
+                Err(GpuError::DeviceLost)
             }
         }
-        self.resources.remove(&key);
-        Ok(())
     }
 
     fn completion_status(&mut self, completion: Completion) -> Result<CompletionStatus, GpuError> {
         self.ensure_ready()?;
         match completion {
             Completion::Complete => Ok(CompletionStatus::Complete),
-            // A submit's fence: the level check reflects every completion the
-            // service path has pumped so far; the caller's polling loop goes
-            // through the device lock, which pumps on entry.
-            Completion::Pending(fence) => Ok(if self.raw.fence_completed(fence.get()) {
-                CompletionStatus::Complete
-            } else {
-                CompletionStatus::Pending
-            }),
+            // A query must make progress on its own: deliver anything still
+            // accumulated (a no-op after a well-formed transaction boundary)
+            // and pump — the high-water mark only advances when completed
+            // entries are popped. This is what lets a caller with no service
+            // path at all (a registration-time rollback, before the runtime
+            // publishes the device and the IRQ worker can pump) still
+            // observe its own fenced submissions complete.
+            Completion::Pending(fence) => {
+                self.raw.ctrl_notify();
+                self.raw.pump_completions().map_err(map_error)?;
+                Ok(if self.raw.fence_completed(fence.get()) {
+                    CompletionStatus::Complete
+                } else {
+                    CompletionStatus::Pending
+                })
+            }
         }
     }
 
@@ -1047,14 +1063,13 @@ impl<H: Hal, T: Transport> VirglOps for VirtIoGpuDevice<H, T> {
     fn transfer_from_host(&mut self, transfer: Transfer3d) -> Result<Completion, GpuError> {
         self.ensure_ready()?;
         let command = self.transfer_command(transfer)?;
-        // The raw path delivers and drains before returning: the caller reads
-        // the guest memory right after this returns, so completion has to be
-        // observed before the data is valid.
-        self.raw.transfer_from_host_3d(command).map_err(map_error)?;
-        if let Some(backing) = &self.resources[&transfer.resource.id().get()].backing {
-            backing.sync_for_cpu(0..backing.len())?;
-        }
-        Ok(Completion::Complete)
+        // Fenced fire-and-forget: the guest data becomes readable once the
+        // returned fence is observed, and only then may the backing be
+        // synced for the CPU. Syncing here — before the wait that moved out
+        // of the device lock — would race the host write.
+        let fence = self.raw.transfer_from_host_3d(command).map_err(map_error)?;
+        let fence = NonZeroU64::new(fence).expect("fence ids start at 1 and only increase");
+        Ok(Completion::Pending(fence))
     }
 
     fn submit(&mut self, context: ContextHandle, commands: &[u8]) -> Result<Completion, GpuError> {

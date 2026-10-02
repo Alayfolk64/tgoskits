@@ -609,12 +609,38 @@ struct GpuResource {
 
 impl Drop for GpuResource {
     fn drop(&mut self) {
-        if let Err(error) = ax_gpu::with_gpu_for_cleanup(|device| device.release_buffer(self.device_handle))
-            .and_then(core::convert::identity)
-        {
+        if let Err(error) = release_gpu_buffer_and_drain(self.device_handle) {
             warn!("failed to release GPU buffer {:?}: {error}", self.device_handle);
         }
     }
+}
+
+/// Releases a GPU buffer and waits, outside the device control lock, until
+/// the host finished with its backing: the fenced UNREF submission returns a
+/// completion token, and observing it outside the lock is the proof (the
+/// used ring is FIFO, so the fenced pop implies every earlier command's pop
+/// — the same ordering submits rely on, so concurrent producers cannot
+/// starve the wait the way a whole-queue drain outside the lock would).
+/// On a timeout the release itself stays submitted and the caller proceeds
+/// with its teardown: the host is unrecoverably stalled at that point — the
+/// same accepted tradeoff the driver documents for its bounded waits.
+fn release_gpu_buffer_and_drain(handle: BufferHandle) -> Result<(), GpuError> {
+    let completion = ax_gpu::with_gpu_for_cleanup(|device| device.release_buffer(handle))
+        .and_then(core::convert::identity)?;
+    wait_completion_outside_lock(completion)
+}
+
+/// Observes a driver completion token outside the device control lock,
+/// sleeping until its fence fires (or the bounded wait expires). A
+/// `Complete` token needs no wait.
+/// Observes a driver completion token outside the device control lock,
+/// sleeping until its fence fires (or the bounded wait expires). A
+/// `Complete` token needs no wait. Capability-independent: the fenced
+/// command completes on the control queue of any device, so this is also
+/// the release proof for 2D dumb buffers on a non-virgl virtio-gpu —
+/// `GpuResource::drop` serves both kinds.
+fn wait_completion_outside_lock(completion: Completion) -> Result<(), GpuError> {
+    ax_gpu::wait_completion(completion, ax_gpu::GPU_WAIT_TIMEOUT)
 }
 
 /// Kernel-side dma-buf for a *host* 3D resource (blob or classic virgl
@@ -1086,6 +1112,11 @@ impl Card0 {
     }
 
     pub fn new() -> Arc<Self> {
+        // The GPU IRQ worker calls this after pumping completions, so a
+        // poll-blocked out-fence waiter is woken in µs instead of waiting out
+        // the fence refresher's 250 µs active tick. Runs once per boot (this
+        // constructor is the single Card0 instantiation).
+        ax_gpu::set_completion_notifier(super::sync_file::on_gpu_completion);
         Arc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
             vblank: VblankClock::new(monotonic_time_nanos()),
@@ -2148,7 +2179,7 @@ impl Card0 {
                 Ok(Some(id)) => id,
                 Ok(None) => self.next_res_handle.fetch_add(1, Ordering::Relaxed),
                 Err(error) => {
-                    let _ = ax_gpu::with_gpu_for_cleanup(|device| device.release_buffer(device_handle));
+                    let _ = release_gpu_buffer_and_drain(device_handle);
                     return Err(map_gpu_err(error));
                 }
             };

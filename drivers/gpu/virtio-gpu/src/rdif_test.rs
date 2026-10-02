@@ -660,11 +660,11 @@ fn test_only_and_release_keep_scanout_and_backing() {
     assert!(new_weak.upgrade().is_none());
 }
 
-/// Same ambiguity as `unconfirmed_context_destroy_resets_before_releasing_backing`,
-/// on the buffer-release path: the stalled host cannot confirm the UNREF
-/// drain, so the device is reset before the backing is dropped.
+/// The buffer-release drain moved to the caller: with the host stalled the
+/// release still submits and succeeds instead of timing out and resetting
+/// the device — the OS layer waits for the drain outside the device lock.
 #[test]
-fn unconfirmed_release_resets_before_backing_release() {
+fn stalled_release_submits_without_resetting_the_device() {
     let host = Arc::new(Mutex::new(Host::default()));
     let mut device = make_device(&host, ticking_clock);
     let descriptor = BufferDescriptor::Image2d {
@@ -679,17 +679,33 @@ fn unconfirmed_release_resets_before_backing_release() {
     drop(backing);
 
     host.lock().unwrap().stall = true;
-    assert_eq!(device.release_buffer(buffer), Err(GpuError::DeviceLost));
-    assert!(host.lock().unwrap().status.is_empty());
-    assert_eq!(host.lock().unwrap().queue.descriptors, 0);
+    // The old contract reset the device here when the inline drain timed
+    // out; the submission is fire-and-forget with a fence now, so a stalled
+    // host no longer wedges or resets on release.
+    let completion = device.release_buffer(buffer).unwrap();
+    let Completion::Pending(fence) = completion else {
+        panic!("a stalled release must report a pending fence, got {completion:?}")
+    };
+
+    // The completion proof is the caller's fence wait now: the fence has
+    // not fired under the stall, and the query succeeding proves the device
+    // was NOT reset — a lost device fails every operation fast with
+    // DeviceLost.
+    assert!(!device.fence_completed(fence.get()).unwrap());
     assert!(weak.upgrade().is_none());
 }
 
-/// Async submit semantics: `submit` returns a pending fence token without
-/// waiting, the token completes once the service path pumps the host's
-/// completion, and `wait_fence` blocks until then.
+/// Async submit semantics: `submit` returns a pending fence token, and the
+/// completion becomes observable through `completion_status` itself — the
+/// query delivers the accumulated batch and pumps, with no service path,
+/// IRQ worker or polling loop in between.
+///
+/// Regression (registration-rollback release): the query used to be a pure
+/// level read, so the exclusive rollback wait before `MAIN_GPU` is
+/// published — where no service path exists — could never observe its own
+/// fenced UNREF complete and always burned its whole budget.
 #[test]
-fn submit_returns_a_fence_that_completes_through_the_service_path() {
+fn completion_status_delivers_and_pumps_before_reporting() {
     let host = Arc::new(Mutex::new(Host {
         device_features: 1,
         ..Host::default()
@@ -702,14 +718,8 @@ fn submit_returns_a_fence_that_completes_through_the_service_path() {
     let Completion::Pending(fence) = completion else {
         panic!("submit must return a pending fence, got {completion:?}")
     };
-    // Nothing has been delivered or pumped yet: the fence is outstanding and
-    // a completion query reports Pending.
-    assert_eq!(
-        device.completion_status(completion).unwrap(),
-        rdif_gpu::CompletionStatus::Pending
-    );
-    // The service path delivers the batch and pumps the completion.
-    device.service_pending().unwrap();
+    // The first query observes the completion by itself: delivery and the
+    // completion pump happen inside it.
     assert_eq!(
         device.completion_status(completion).unwrap(),
         rdif_gpu::CompletionStatus::Complete
