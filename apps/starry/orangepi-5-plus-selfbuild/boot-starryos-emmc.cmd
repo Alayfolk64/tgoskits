@@ -30,6 +30,10 @@ else
         cp.b ${kernel_data} ${kernel_load_addr} ${kernel_size}
         cp.b ${image_dtb_data} ${fdt_load_addr} ${image_dtb_size}
         fdt addr ${fdt_load_addr}
+        # The Linux-exported FDT still names its initrd. This boot passes no
+        # ramdisk, so remove the stale range before entering StarryOS.
+        fdt rm /chosen linux,initrd-start
+        fdt rm /chosen linux,initrd-end
         fdt set /chosen bootargs "root=${starry_root} rootwait rw rootfstype=ext4 console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000"
         fdt print /chosen bootargs
         booti ${kernel_load_addr} - ${fdt_load_addr}
