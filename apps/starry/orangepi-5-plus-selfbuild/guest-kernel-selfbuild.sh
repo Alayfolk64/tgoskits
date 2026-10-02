@@ -21,7 +21,21 @@ esac
 [ -f "$source_dir/.tgoskits-source-meta" ] || fail source-meta-missing
 [ -f "$source_dir/$build_config" ] || fail build-config-missing
 [ -x "$xtask" ] || fail prepared-xtask-missing
-[ ! -e "$source_dir/target" ] || fail kernel-target-not-cold
+target_mode=$(sed -n 's/^target_mode=//p' /etc/starry-selfbuild/run.conf)
+target_mode=${target_mode:-cold}
+artifact=$source_dir/target/aarch64-unknown-none-softfloat/release/starryos
+case "$target_mode" in
+    cold)
+        [ ! -e "$source_dir/target" ] || fail kernel-target-not-cold
+        cold_target=true
+        ;;
+    reuse)
+        [ -d "$source_dir/target" ] || fail kernel-target-cache-missing
+        rm -f "$artifact" "$artifact.bin"
+        cold_target=false
+        ;;
+    *) fail invalid-target-mode ;;
+esac
 mkdir -p -- "${run_dir%/*}"
 mkdir -- "$run_dir" || fail run-directory-already-exists
 exec > >(tee "$run_dir/run.log") 2>&1
@@ -56,7 +70,7 @@ for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     done
 done
 
-printf '===%s-BEGIN run=%s workload=starry cold_target=true===\n' "$marker" "$run_id"
+printf '===%s-BEGIN run=%s workload=starry cold_target=%s===\n' "$marker" "$run_id" "$cold_target"
 start=$(date +%s)
 set +e
 "$xtask" starry build --config "$build_config"
@@ -66,7 +80,6 @@ elapsed=$(( $(date +%s) - start ))
 printf '===%s-STARRY-BUILD-END run=%s rc=%s elapsed=%s===\n' "$marker" "$run_id" "$rc" "$elapsed"
 [ "$rc" -eq 0 ] || fail "starry-build-rc-$rc"
 
-artifact=$source_dir/target/aarch64-unknown-none-softfloat/release/starryos
 [ -s "$artifact" ] || fail artifact-elf-missing
 [ -s "$artifact.bin" ] || fail artifact-bin-missing
 python3 - "$artifact" <<'PY'
@@ -89,4 +102,4 @@ printf '%s\n' "$elapsed" > "$run_dir/starry-build-elapsed-seconds"
 )
 printf '%s\n' "$run_id" > /output/latest-run
 sync
-printf '===%s-PASS run=%s workload=starry cold_target=true elapsed=%s===\n' "$marker" "$run_id" "$elapsed"
+printf '===%s-PASS run=%s workload=starry cold_target=%s elapsed=%s===\n' "$marker" "$run_id" "$cold_target" "$elapsed"
