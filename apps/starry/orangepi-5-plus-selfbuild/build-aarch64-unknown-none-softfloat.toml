@@ -1,7 +1,6 @@
 # Build-time config for the OrangePi 5 Plus self-build application.
 target = "aarch64-unknown-none-softfloat"
 features = [
-  "legacy-board-init",
   "ax-driver/list-pci-devices",
   "ax-driver/rk3588-pcie",
   "ax-driver/realtek-rtl8125",
