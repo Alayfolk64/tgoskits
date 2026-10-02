@@ -23,14 +23,23 @@ esac
 [ -x "$xtask" ] || fail prepared-xtask-missing
 target_mode=$(sed -n 's/^target_mode=//p' /etc/starry-selfbuild/run.conf)
 target_mode=${target_mode:-cold}
-artifact=$source_dir/target/aarch64-unknown-none-softfloat/release/starryos
+target_dir=$(sed -n 's/^target_dir=//p' /etc/starry-selfbuild/run.conf)
+if [ -z "$target_dir" ]; then
+    target_dir=$source_dir/target
+else
+    case "$target_dir" in
+        /opt/tgoskits-sources/*/target) ;;
+        *) fail invalid-target-dir ;;
+    esac
+fi
+artifact=$target_dir/aarch64-unknown-none-softfloat/release/starryos
 case "$target_mode" in
     cold)
-        [ ! -e "$source_dir/target" ] || fail kernel-target-not-cold
+        [ ! -e "$target_dir" ] || fail kernel-target-not-cold
         cold_target=true
         ;;
     reuse)
-        [ -d "$source_dir/target" ] || fail kernel-target-cache-missing
+        [ -d "$target_dir" ] || fail kernel-target-cache-missing
         rm -f "$artifact" "$artifact.bin"
         cold_target=false
         ;;
@@ -43,7 +52,11 @@ exec > >(tee "$run_dir/run.log") 2>&1
 export CARGO_HOME=/root/.cargo
 export PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin"
 export CARGO_NET_OFFLINE=true
-unset CARGO_TARGET_DIR
+if [ "$target_dir" = "$source_dir/target" ]; then
+    unset CARGO_TARGET_DIR
+else
+    export CARGO_TARGET_DIR="$target_dir"
+fi
 cd "$source_dir"
 
 sysroot=$(rustc --print sysroot)
@@ -71,6 +84,7 @@ for policy in /sys/devices/system/cpu/cpufreq/policy*; do
 done
 
 printf '===%s-BEGIN run=%s workload=starry cold_target=%s===\n' "$marker" "$run_id" "$cold_target"
+printf 'target_dir=%s\n' "$target_dir"
 start=$(date +%s)
 set +e
 "$xtask" starry build --config "$build_config"
