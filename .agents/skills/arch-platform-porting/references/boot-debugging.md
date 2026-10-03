@@ -30,10 +30,8 @@ QEMU `hostfwd` 发 `GET /api/v1/ota/status` 才能证明客户端可访问。
 `restore_linux_boot.sh` 恢复并同步 Linux 启动脚本后，才由
 `arm_selfbuild_watchdog.sh` 启动请求 20 秒、实际约 22 秒、每 10 秒喂狗的硬件保护。
 普通编译租约和短基准租约由各自构建配置选择，连续编译日志不能续租。
-`arceos-helloworld` 基准复用板载 Linux 编译的任务工具；先安装静态 BusyBox，
-由 `capture_linux_bench_clock.sh` 记录当前 Linux UTC，启动后使用已部署的
-`rootfs/usr/local/bin/busybox date -u -s` 校时。外层 Linux rootfs 不一定有 BusyBox，
-不能只写裸 `busybox` 命令并假定存在。返回 Linux 必须核验 boot ID、启动脚本、
+`arceos-helloworld` 基准复用板载 Linux 编译的任务工具；由 `capture_linux_bench_clock.sh` 记录当前 Linux UTC，启动后直接使用
+`date -u -s` 校时，并核对读取值与记录值一致。返回 Linux 必须核验 boot ID、启动脚本、
 SSH、fsck 和根分区写入，不能以 Starry 内存中两个哈希一致代替持久恢复。
 
 ## 分层映射

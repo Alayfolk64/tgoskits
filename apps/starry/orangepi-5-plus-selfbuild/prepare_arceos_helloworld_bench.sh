@@ -14,10 +14,6 @@ cmp /boot/boot.scr /boot/boot.scr.tgoskits-backup
 [ "$(systemctl show --property=RuntimeWatchdogUSec --value)" = 20s ]
 fuser -s /dev/watchdog0
 
-command -v busybox
-[ -x /bin/busybox ]
-install -m 0755 /bin/busybox "$rootfs/usr/local/bin/busybox"
-
 source=$rootfs$guest_tool
 destination=$rootfs/usr/local/bin/tg-xtask
 [ -x "$source" ]

@@ -38,13 +38,12 @@ ELF 和 raw binary，回到 Linux 后取回产物并验证 SHA-256。暂不把�
 
 对比 `arceos-helloworld` 时，先在板载 Linux 用固定源码和工具链编译一次
 `tg-xtask`，用 `prepare_arceos_helloworld_bench.sh` 把这份二进制安装到
-共享 rootfs；板载 Linux 先安装 `busybox-static`，准备脚本同时复制静态
-BusyBox 到 rootfs 的 `/usr/local/bin/busybox`。Linux 和两组 StarryOS 都运行 `/usr/local/bin/tg-xtask arceos build
+共享 rootfs。Linux 和两组 StarryOS 都运行 `/usr/local/bin/tg-xtask arceos build
 --package arceos-helloworld --target aarch64-unknown-none-softfloat`，分别使用
 全新 `CARGO_TARGET_DIR`。每次进入 StarryOS 前在 Linux 执行
 `capture_linux_bench_clock.sh`，StarryOS 的
 `init-arceos-helloworld-bench.sh` 先恢复 Linux 启动脚本并启动看门狗，再以
-`busybox date -u -s` 同步记录的 Linux UTC 时间，然后开始构建。
+`date -u -s` 同步记录的 Linux UTC 时间，然后开始构建。
 U-Boot 必须默认进入 Linux：若当前 `/boot/boot.scr` 是已知的
 Starry 脚本且存在经过内容检查的 `boot.scr.tgoskits-backup`，准备脚本会先保留
 当前脚本再恢复 Linux 备份；遇到未知 `bootcmd` 或无法验证的备份时会停止，
