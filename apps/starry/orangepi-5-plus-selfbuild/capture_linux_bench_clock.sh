@@ -7,6 +7,7 @@ clock_file=$rootfs/etc/starry-selfbuild/linux-clock-epoch
 [ "$(id -u)" -eq 0 ]
 cmp /boot/boot.scr /boot/boot.scr.tgoskits-backup
 [ -x "$rootfs/usr/local/bin/tg-xtask" ]
+[ -x "$rootfs/usr/local/bin/busybox" ]
 linux_epoch=$(date -u +%s)
 case "$linux_epoch" in
     ''|*[!0-9]*) exit 2 ;;
