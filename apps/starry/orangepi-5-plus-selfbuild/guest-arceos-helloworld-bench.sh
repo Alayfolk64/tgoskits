@@ -27,6 +27,8 @@ export CARGO_INCREMENTAL=0
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 
 cd "$source_dir"
+sysroot=$(rustc --print sysroot)
+export LD_LIBRARY_PATH="$sysroot/lib"
 echo "===ARCEOS-HELLOWORLD-BENCH-BEGIN run=$run_id==="
 cat .tgoskits-source-meta
 sha256sum Cargo.lock
