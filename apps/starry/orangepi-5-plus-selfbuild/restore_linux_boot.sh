@@ -5,6 +5,7 @@ marker=STARRY-ORANGEPI5PLUS-SELFBUILD
 linux_boot=/boot/boot.scr.tgoskits-backup
 starry_boot=/boot/boot-starryos-emmc.scr
 active_boot=/boot/boot.scr
+app_dir=$(dirname "$0")
 
 fail() {
     echo "===${marker}-LINUX-BOOT-RESTORE-FAIL reason=$1==="
@@ -13,6 +14,11 @@ fail() {
 
 [ -s "$linux_boot" ] || fail linux-boot-backup-missing
 [ -s "$starry_boot" ] || fail starry-boot-script-missing
+if "$app_dir/boot_script_is_starry.sh" "$linux_boot"; then
+    fail linux-boot-backup-is-starry
+else
+    [ "$?" -eq 1 ] || fail linux-boot-backup-check-failed
+fi
 if cmp -s "$active_boot" "$linux_boot"; then
     echo "===${marker}-LINUX-BOOT-RESTORED state=already-linux==="
     exit 0

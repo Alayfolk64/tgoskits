@@ -33,6 +33,9 @@ rknpu = ["ax-driver/rknpu", "starry-kernel/rknpu"]
 jpeg = ["ax-driver/jpeg", "starry-kernel/jpeg"]
 rga = ["ax-driver/rga", "starry-kernel/rga"]
 stack-protector = ["ax-std/stack-protector", "starry-kernel/stack-protector"]
+selfbuild-watchdog = ["starry-kernel/selfbuild-watchdog"]
+selfbuild-watchdog-40min-lease = ["starry-kernel/selfbuild-watchdog-40min-lease"]
+selfbuild-watchdog-smoke-lease = ["starry-kernel/selfbuild-watchdog-smoke-lease"]
 
 [[bin]]
 name = "starryos"

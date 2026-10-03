@@ -13,10 +13,28 @@ ELF 和 raw binary，回到 Linux 后取回产物并验证 SHA-256。暂不把�
 
 ## 恢复模型
 
-chroot 里的编译命令由 `timeout` 限制为 21,600 秒；正常结束后主动 reboot。
-本应用不启用硬件自动复位。如果内核死锁导致 `timeout` 无法运行，串口监控会在
-22,800 秒后报告失败，但板卡仍需人工复位。U-Boot 必须默认
-进入 Linux：若当前 `/boot/boot.scr` 是已知的
+板载 Linux 的长任务先运行 `configure_linux_watchdog.sh`。它在确认活动
+`boot.scr` 等于 Linux 备份后，让 systemd 独占 `/dev/watchdog0`，请求 20 秒
+硬件超时；本板实测硬件取整为 22 秒。systemd 至少每半个请求周期喂狗一次，
+即最长约 10 秒；此处复用 PID 1 的现成机制，不与其并行打开设备。运行时会
+核对 `RuntimeWatchdogUSec` 和设备占用。`stage_starry_boot.sh` 部署前执行此配置。
+
+`build-aarch64-unknown-none-softfloat.toml` 启用 `selfbuild-watchdog`。
+`init.sh` 和 `init-kernel-selfbuild.sh` 先运行 `restore_linux_boot.sh`，
+再通过 `arm_selfbuild_watchdog.sh` 核对活动脚本与 Linux 备份一致并启动硬件看门狗。
+内核请求 20 秒复位超时，CPU 0 的任务每 10 秒喂狗；驱动按硬件档位向上取整，
+启动日志会输出实际超时。在本板上，请求 30 秒会被取整为 44 秒，故选择
+请求 20 秒、实际约 22 秒，满足 30 秒内复位的目标。常规自编的喂狗租约为
+22,200 秒，chroot 中的命令由
+`timeout` 限制为 21,600 秒；短 `tg-xtask` 对比使用
+`watchdog-tgxtask-benchmark.toml`，租约为 2,400 秒。正常结束后主动 reboot。
+如果只有 Cargo 子进程卡住而喂狗任务仍运行，不会在 22 秒后复位；租约到期
+才会停止喂狗并由硬件复位。若 StarryOS 在恢复 `boot.scr` 之前卡死，当前
+一次性脚本仍不能保证复位回 Linux，必须按已验证的人工路径恢复。
+`watchdog-recovery-smoke.toml` 仅供受控恢复测试，租约为 40 秒；
+`init-watchdog-smoke.sh` 恢复 Linux 启动入口后启动看门狗，并等待租约到期，
+用于实测复位后的 Linux boot ID、SSH 和 fsck 状态。常规编译不得使用此配置。
+U-Boot 必须默认进入 Linux：若当前 `/boot/boot.scr` 是已知的
 Starry 脚本且存在经过内容检查的 `boot.scr.tgoskits-backup`，准备脚本会先保留
 当前脚本再恢复 Linux 备份；遇到未知 `bootcmd` 或无法验证的备份时会停止，
 绝不猜测和覆盖。

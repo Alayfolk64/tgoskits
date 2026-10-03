@@ -260,3 +260,87 @@ fn cpufreq_governor_loop() {
         ax_driver::cpufreq::governor_poll(&busy);
     }
 }
+
+#[cfg(feature = "selfbuild-watchdog")]
+// RK3588's fixed TOP rounds this request to roughly 22 seconds; 30 rounds to 44.
+const SELFBUILD_WATCHDOG_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(20);
+#[cfg(feature = "selfbuild-watchdog")]
+const SELFBUILD_WATCHDOG_FEED_PERIOD: core::time::Duration = core::time::Duration::from_secs(10);
+#[cfg(feature = "selfbuild-watchdog-smoke-lease")]
+const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(40);
+#[cfg(all(
+    feature = "selfbuild-watchdog-40min-lease",
+    not(feature = "selfbuild-watchdog-smoke-lease")
+))]
+const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(2_400);
+#[cfg(all(
+    feature = "selfbuild-watchdog",
+    not(feature = "selfbuild-watchdog-40min-lease"),
+    not(feature = "selfbuild-watchdog-smoke-lease")
+))]
+const SELFBUILD_WATCHDOG_LEASE: core::time::Duration = core::time::Duration::from_secs(22_200);
+
+#[cfg(feature = "selfbuild-watchdog")]
+static SELFBUILD_WATCHDOG_STATE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Arm only after the guest restored and synced the Linux boot selector.
+/// The finite lease also recovers a userspace task that never exits.
+#[cfg(feature = "selfbuild-watchdog")]
+pub(crate) fn arm_selfbuild_watchdog() -> Result<(), ax_driver::watchdog::ControlError> {
+    use core::sync::atomic::Ordering;
+
+    match SELFBUILD_WATCHDOG_STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(2) => return Ok(()),
+        Err(_) => return Err(ax_driver::watchdog::ControlError::Unavailable),
+    }
+    let armed = match ax_driver::watchdog::arm_reset(SELFBUILD_WATCHDOG_TIMEOUT) {
+        Ok(armed) => armed,
+        Err(error) => {
+            SELFBUILD_WATCHDOG_STATE.store(0, Ordering::Release);
+            return Err(error);
+        }
+    };
+    warn!(
+        "self-build watchdog armed: requested={:?} actual={:?} feed={:?} lease={:?}",
+        armed.requested(),
+        armed.actual(),
+        SELFBUILD_WATCHDOG_FEED_PERIOD,
+        SELFBUILD_WATCHDOG_LEASE
+    );
+
+    let mut affinity = ax_runtime::task::sched::CpuSet::empty(ax_runtime::hal::cpu_num());
+    assert!(affinity.insert(ax_runtime::task::sched::CpuId::new(0)));
+    let _ = kernel_thread_builder(String::from("selfbuild-wdt"))
+        .affinity(affinity)
+        .spawn(selfbuild_watchdog_loop)
+        .expect("failed to spawn self-build watchdog feeder");
+    SELFBUILD_WATCHDOG_STATE.store(2, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(feature = "selfbuild-watchdog")]
+pub(crate) fn selfbuild_watchdog_armed() -> bool {
+    use core::sync::atomic::Ordering;
+
+    SELFBUILD_WATCHDOG_STATE.load(Ordering::Acquire) == 2
+}
+
+#[cfg(feature = "selfbuild-watchdog")]
+fn selfbuild_watchdog_loop() {
+    let lease_started = ax_runtime::hal::time::monotonic_time();
+    loop {
+        sleep(SELFBUILD_WATCHDOG_FEED_PERIOD);
+        if ax_runtime::hal::time::monotonic_time().saturating_sub(lease_started)
+            >= SELFBUILD_WATCHDOG_LEASE
+        {
+            warn!("self-build watchdog lease expired; waiting for hardware reset");
+            return;
+        }
+        if let Err(error) = ax_driver::watchdog::ping() {
+            error!("self-build watchdog ping failed: {error}; waiting for hardware reset");
+            return;
+        }
+    }
+}

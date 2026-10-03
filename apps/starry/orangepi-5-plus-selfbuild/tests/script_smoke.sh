@@ -4,17 +4,24 @@ set -euo pipefail
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 for script in \
+    arm_selfbuild_watchdog.sh \
     benchmark.sh \
     boot_script_is_starry.sh \
     boot_starry_once.sh \
     boot_starry_once_remote.sh \
     connect_serial.sh \
+    configure_linux_watchdog.sh \
     deploy_starry_boot_remote.sh \
     ensure_linux_fsck.sh \
     fetch_artifacts.sh \
     guest-selfbuild.sh \
+    guest-tg-xtask-bench.sh \
     init.sh \
+    init-kernel-selfbuild.sh \
+    init-tg-xtask-bench.sh \
+    init-watchdog-smoke.sh \
     install_source_link.sh \
+    linux-run-tg-xtask-bench.sh \
     provision_rootfs.sh \
     provision_rootfs_remote.sh \
     restore_linux_boot.sh \
@@ -38,12 +45,13 @@ for entrypoint in \
     "$app_dir/$entrypoint" --help >/dev/null
 done
 
-python3 - "$app_dir/serial_selfbuild.py" <<'PY'
+python3 - "$app_dir/serial_selfbuild.py" "$app_dir/patch-secret-service-derive.py" <<'PY'
 import ast
 import pathlib
 import sys
 
-ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for source in sys.argv[1:]:
+    ast.parse(pathlib.Path(source).read_text(encoding="utf-8"))
 PY
 
 bash "$app_dir/tests/boot_script_identity.sh"

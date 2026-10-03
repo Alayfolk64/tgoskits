@@ -1,4 +1,4 @@
-# Build-time config for the OrangePi 5 Plus self-build application.
+# Build-time config for the bounded tg-xtask board benchmark.
 target = "aarch64-unknown-none-softfloat"
 features = [
   "ax-driver/list-pci-devices",
@@ -12,6 +12,7 @@ features = [
   "ax-driver/rk3588-cpufreq",
   "rknpu",
   "selfbuild-watchdog",
+  "selfbuild-watchdog-40min-lease",
 ]
 log = "Warn"
 max_cpu_num = 8

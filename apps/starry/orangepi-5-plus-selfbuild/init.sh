@@ -11,8 +11,8 @@ boot_restored=0
 fail() {
     echo "===${marker}-FAIL reason=$1==="
     if [ "$boot_restored" = 1 ]; then
-        sync 2>/dev/null || true
-        reboot -f 2>/dev/null || true
+        sync
+        reboot -f
     fi
     exit 1
 }
@@ -23,6 +23,8 @@ fail() {
 [ -x "$restore_boot" ] || fail linux-boot-restore-script-missing
 "$restore_boot" || fail linux-boot-restore
 boot_restored=1
+"/opt/starry-orangepi5plus-selfbuild/arm_selfbuild_watchdog.sh" \
+    || fail hardware-watchdog-arm
 
 command -v chroot >/dev/null 2>&1 || fail chroot-missing
 command -v mount >/dev/null 2>&1 || fail mount-missing

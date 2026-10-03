@@ -16,6 +16,17 @@ fn debugfs_builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     let tracing = crate::tracepoint::init_tracing_dir(fs.clone());
     root.add("tracing", tracing);
+    #[cfg(feature = "selfbuild-watchdog")]
+    {
+        use axfs_ng_vfs::NodePermission;
+
+        let control = super::SpecialFsFile::new_regular_with_perm(
+            fs.clone(),
+            SelfbuildWatchdogControl,
+            NodePermission::OWNER_READ | NodePermission::OWNER_WRITE,
+        );
+        root.add("selfbuild_watchdog", control);
+    }
     #[cfg(feature = "uaccess-lock-regression")]
     root.add(
         "uaccess_lock_regression",
@@ -54,6 +65,35 @@ fn debugfs_builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleFile::new_regular(fs.clone(), || Ok(crate::syscall::render_file_lock_metrics())),
     );
     SimpleDir::new_maker(fs, Arc::new(root))
+}
+
+#[cfg(feature = "selfbuild-watchdog")]
+struct SelfbuildWatchdogControl;
+
+#[cfg(feature = "selfbuild-watchdog")]
+impl super::DirectRwFsFileOps for SelfbuildWatchdogControl {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
+        let status: &[u8] = if crate::entry::selfbuild_watchdog_armed() {
+            b"armed\n"
+        } else {
+            b"disarmed\n"
+        };
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(status.len());
+        let count = buf.len().min(status.len() - start);
+        buf[..count].copy_from_slice(&status[start..start + count]);
+        Ok(count)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
+        if offset != 0 || !matches!(buf, b"arm\n" | b"arm") {
+            return Err(axfs_ng_vfs::VfsError::InvalidInput);
+        }
+        crate::entry::arm_selfbuild_watchdog().map_err(|error| {
+            warn!("self-build watchdog arm failed: {error}");
+            axfs_ng_vfs::VfsError::Io
+        })?;
+        Ok(buf.len())
+    }
 }
 
 #[cfg(feature = "qperf-metrics")]
