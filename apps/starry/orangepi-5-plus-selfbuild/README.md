@@ -49,7 +49,7 @@ arms the RK3588 hardware watchdog. The kernel requests a 20-second reset
 timeout and feeds it every 10 seconds on CPU 0. This board rounds a 30-second
 request up to 44 seconds, but the 20-second request to about 22 seconds. The
 normal self-build lease ends after 22,200 seconds. The dedicated
-`watchdog-tgxtask-benchmark.toml` shortens it to 2,400 seconds. If a Cargo
+`watchdog-arceos-helloworld-benchmark.toml` shortens it to 2,400 seconds. If a Cargo
 worker stalls while the feeder remains healthy, the board resets only after
 the lease ends. A hang before the Linux boot selector is restored still needs
 manual recovery. The guest uses the system-default CPU affinity and

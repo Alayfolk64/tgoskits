@@ -9,11 +9,13 @@ run_id=${1:?run id is required}
 "$app_dir/restore_linux_boot.sh"
 "$app_dir/arm_selfbuild_watchdog.sh"
 
-build_epoch=$(sed -n 's/^build_epoch=//p' "$rootfs/etc/starry-selfbuild/run.conf")
-case "$build_epoch" in
+linux_epoch=$(cat "$rootfs/etc/starry-selfbuild/linux-clock-epoch")
+case "$linux_epoch" in
     ''|*[!0-9]*) exit 2 ;;
 esac
-"$app_dir/set_guest_clock.sh" TG-XTASK-BENCH "$build_epoch"
+busybox date -u -s "@$linux_epoch"
+current_epoch=$(date -u +%s)
+echo "===ARCEOS-HELLOWORLD-BENCH-CLOCK linux_epoch=$linux_epoch current_epoch=$current_epoch==="
 
 for directory in proc dev sys; do
     [ -d "$rootfs/$directory" ]
@@ -23,10 +25,10 @@ for directory in proc dev sys; do
 done
 
 set +e
-chroot "$rootfs" /bin/bash /guest-tg-xtask-bench.sh "$run_id"
+chroot "$rootfs" /bin/bash /guest-arceos-helloworld-bench.sh "$run_id"
 rc=$?
 set -e
 sync
-echo "===TG-XTASK-BENCH-STARRY-EXIT run=$run_id rc=$rc==="
+echo "===ARCEOS-HELLOWORLD-BENCH-STARRY-EXIT run=$run_id rc=$rc==="
 reboot -f
 exit "$rc"

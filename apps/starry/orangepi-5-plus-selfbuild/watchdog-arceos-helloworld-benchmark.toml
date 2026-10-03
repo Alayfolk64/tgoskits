@@ -1,4 +1,4 @@
-# Build-time config for the bounded tg-xtask board benchmark.
+# Build-time config for the bounded arceos-helloworld board benchmark.
 target = "aarch64-unknown-none-softfloat"
 features = [
   "ax-driver/list-pci-devices",

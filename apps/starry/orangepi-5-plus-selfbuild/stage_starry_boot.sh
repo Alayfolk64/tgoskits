@@ -157,17 +157,18 @@ rsync -a -e "$rsync_ssh" \
     "$stage_dir/starryEnv.txt" \
     "$app_dir/boot_script_is_starry.sh" \
     "$app_dir/arm_selfbuild_watchdog.sh" \
+    "$app_dir/capture_linux_bench_clock.sh" \
     "$app_dir/configure_linux_watchdog.sh" \
     "$app_dir/deploy_starry_boot_remote.sh" \
     "$app_dir/ensure_linux_fsck.sh" \
     "$app_dir/init.sh" \
     "$app_dir/init-kernel-selfbuild.sh" \
-    "$app_dir/init-tg-xtask-bench.sh" \
+    "$app_dir/init-arceos-helloworld-bench.sh" \
     "$app_dir/init-watchdog-smoke.sh" \
     "$app_dir/guest-kernel-selfbuild.sh" \
-    "$app_dir/guest-tg-xtask-bench.sh" \
-    "$app_dir/linux-run-tg-xtask-bench.sh" \
-    "$app_dir/patch-secret-service-derive.py" \
+    "$app_dir/guest-arceos-helloworld-bench.sh" \
+    "$app_dir/linux-run-arceos-helloworld-bench.sh" \
+    "$app_dir/prepare_arceos_helloworld_bench.sh" \
     "$app_dir/restore_linux_boot.sh" \
     "$app_dir/set_guest_clock.sh" \
     "$app_dir/validate_sha256.sh" \
@@ -180,6 +181,9 @@ ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/arm_selfbuild_watchdog.sh" \
     "$remote_app/arm_selfbuild_watchdog.sh"
+ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
+    "$remote_app/incoming/capture_linux_bench_clock.sh" \
+    "$remote_app/capture_linux_bench_clock.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/configure_linux_watchdog.sh" \
     "$remote_app/configure_linux_watchdog.sh"
@@ -199,18 +203,21 @@ ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/init-kernel-selfbuild.sh" "$remote_app/init-kernel-selfbuild.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
-    "$remote_app/incoming/init-tg-xtask-bench.sh" "$remote_app/init-tg-xtask-bench.sh"
+    "$remote_app/incoming/init-arceos-helloworld-bench.sh" \
+    "$remote_app/init-arceos-helloworld-bench.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/init-watchdog-smoke.sh" "$remote_app/init-watchdog-smoke.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
     "$remote_app/incoming/guest-kernel-selfbuild.sh" "$remote_app/rootfs/guest-kernel-selfbuild.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
-    "$remote_app/incoming/guest-tg-xtask-bench.sh" "$remote_app/rootfs/guest-tg-xtask-bench.sh"
+    "$remote_app/incoming/guest-arceos-helloworld-bench.sh" \
+    "$remote_app/rootfs/guest-arceos-helloworld-bench.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
-    "$remote_app/incoming/linux-run-tg-xtask-bench.sh" "$remote_app/linux-run-tg-xtask-bench.sh"
+    "$remote_app/incoming/linux-run-arceos-helloworld-bench.sh" \
+    "$remote_app/linux-run-arceos-helloworld-bench.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n install -m 0755 \
-    "$remote_app/incoming/patch-secret-service-derive.py" \
-    "$remote_app/patch-secret-service-derive.py"
+    "$remote_app/incoming/prepare_arceos_helloworld_bench.sh" \
+    "$remote_app/prepare_arceos_helloworld_bench.sh"
 ssh "${ssh_args[@]}" "$remote" sudo -n \
     "$remote_app/deploy_starry_boot_remote.sh" \
     "$fit_sha" "$boot_sha" "$env_sha" "$root_partuuid"
