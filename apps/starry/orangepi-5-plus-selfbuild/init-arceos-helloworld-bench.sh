@@ -13,7 +13,7 @@ linux_epoch=$(cat "$rootfs/etc/starry-selfbuild/linux-clock-epoch")
 case "$linux_epoch" in
     ''|*[!0-9]*) exit 2 ;;
 esac
-"$rootfs/usr/local/bin/busybox" date -u -s "@$linux_epoch"
+date -u -s "@$linux_epoch"
 current_epoch=$(date -u +%s)
 echo "===ARCEOS-HELLOWORLD-BENCH-CLOCK linux_epoch=$linux_epoch current_epoch=$current_epoch==="
 
