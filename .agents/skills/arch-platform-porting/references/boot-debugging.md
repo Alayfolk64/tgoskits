@@ -23,6 +23,19 @@ QEMU `hostfwd` 发 `GET /api/v1/ota/status` 才能证明客户端可访问。
 
 本文件记录 LoongArch 动态统一可扩展固件接口平台启动、someboot 对称多处理、StarryOS 测试和 Axvisor LoongArch 虚拟化扩展 QEMU 冒烟测试的项目经验。
 
+## Orange Pi 5 Plus 编译实验恢复
+
+物理板编译实验使用 `apps/starry/orangepi-5-plus-selfbuild/stage_starry_boot.sh`
+和 `boot_starry_once.sh`，从板载 Linux 部署并一次性启动，不手工抢 U-Boot。
+`restore_linux_boot.sh` 恢复并同步 Linux 启动脚本后，才由
+`arm_selfbuild_watchdog.sh` 启动请求 20 秒、实际约 22 秒、每 10 秒喂狗的硬件保护。
+普通编译租约和短基准租约由各自构建配置选择，连续编译日志不能续租。
+`arceos-helloworld` 基准复用板载 Linux 编译的任务工具；先安装静态 BusyBox，
+由 `capture_linux_bench_clock.sh` 记录当前 Linux UTC，启动后使用已部署的
+`rootfs/usr/local/bin/busybox date -u -s` 校时。外层 Linux rootfs 不一定有 BusyBox，
+不能只写裸 `busybox` 命令并假定存在。返回 Linux 必须核验 boot ID、启动脚本、
+SSH、fsck 和根分区写入，不能以 Starry 内存中两个哈希一致代替持久恢复。
+
 ## 分层映射
 
 | 层 | 常见文件 | 必须一致的内容 |
