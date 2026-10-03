@@ -1,4 +1,4 @@
-# Build-time config for the OrangePi 5 Plus self-build application.
+# Controlled short lease for checking reset into Linux on the physical board.
 target = "aarch64-unknown-none-softfloat"
 features = [
   "ax-driver/list-pci-devices",
@@ -12,6 +12,7 @@ features = [
   "ax-driver/rk3588-cpufreq",
   "rknpu",
   "selfbuild-watchdog",
+  "selfbuild-watchdog-smoke-lease",
 ]
 log = "Warn"
 max_cpu_num = 8

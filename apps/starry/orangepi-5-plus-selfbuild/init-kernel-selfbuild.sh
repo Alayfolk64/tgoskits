@@ -8,6 +8,7 @@ rootfs=$app_dir/rootfs
 run_id=${1:-kernel-cold}
 "$app_dir/restore_linux_boot.sh"
 sha256sum /boot/boot.scr /boot/boot.scr.tgoskits-backup
+"$app_dir/arm_selfbuild_watchdog.sh"
 [ -f "$rootfs/opt/tgoskits/Cargo.toml" ]
 [ -x "$rootfs/usr/local/bin/tg-xtask" ]
 [ -x "$rootfs/usr/bin/timeout" ]

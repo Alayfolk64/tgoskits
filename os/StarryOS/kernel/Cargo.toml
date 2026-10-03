@@ -51,6 +51,9 @@ sg2002-cvi-usb-camera = [
 uvc = ["dep:ax-media", "dep:media-uvc"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
+selfbuild-watchdog = ["ax-driver/watchdog"]
+selfbuild-watchdog-40min-lease = ["selfbuild-watchdog"]
+selfbuild-watchdog-smoke-lease = ["selfbuild-watchdog"]
 axtest = ["ax-runtime/fault-injection", "dep:axtest"]
 axtest-coverage = ["dep:axtest", "axtest/coverage"]
 

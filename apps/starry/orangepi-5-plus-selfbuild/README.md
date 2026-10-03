@@ -37,11 +37,22 @@ within the same picocom session.
 `tests/script_smoke.sh` includes a regression that sends pasted input through
 real picocom and two PTYs; it requires picocom for that check.
 
-The guest command has a 21,600-second userspace timeout. There is no automatic
-kernel-deadlock reset: if the kernel stops scheduling, the serial monitor can
-report a timeout, but the board requires manual recovery. The Starry shell
-restores the verified Linux boot script before starting the workload, so a later
-manual reset returns to Linux. The guest uses the system-default CPU affinity and
+On board Linux, `configure_linux_watchdog.sh` makes systemd the sole owner of
+`/dev/watchdog0` after verifying the Linux boot script. It requests a 20-second
+runtime timeout, measured as 22 seconds on this board; systemd contacts the
+device at least once in half the requested time.
+`stage_starry_boot.sh` applies this configuration before deployment.
+
+The guest command has a 21,600-second userspace timeout. After the Starry
+shell restores and verifies the Linux boot script, `arm_selfbuild_watchdog.sh`
+arms the RK3588 hardware watchdog. The kernel requests a 20-second reset
+timeout and feeds it every 10 seconds on CPU 0. This board rounds a 30-second
+request up to 44 seconds, but the 20-second request to about 22 seconds. The
+normal self-build lease ends after 22,200 seconds. The dedicated
+`watchdog-tgxtask-benchmark.toml` shortens it to 2,400 seconds. If a Cargo
+worker stalls while the feeder remains healthy, the board resets only after
+the lease ends. A hang before the Linux boot selector is restored still needs
+manual recovery. The guest uses the system-default CPU affinity and
 parallelism: it first builds the debug `tg-xtask` host runner with plain
 `cargo build -p tg-xtask`, then invokes that exact binary to build
 StarryOS from the application build config. It emits minute-level compile-unit
