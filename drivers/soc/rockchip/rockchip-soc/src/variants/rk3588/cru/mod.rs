@@ -382,6 +382,12 @@ impl Cru {
     ///
     /// 返回时钟频率 (Hz)，如果不支持该时钟则返回错误
     pub fn clk_get_rate(&self, id: crate::clock::ClkId) -> ClockResult<u64> {
+        if id == TCLK_WDT0 {
+            return Ok(OSC_HZ);
+        }
+        if id == PCLK_WDT0 {
+            return self.root_clk_get_rate(PCLK_TOP_ROOT);
+        }
         // 1. PLL 时钟
         if is_pll_clk(id) {
             let pll_id = PllId::try_from(id).map_err(|_| ClockError::unsupported(id))?;

@@ -93,6 +93,7 @@ members = [
     "drivers/usb/uvc-if",
     "drivers/usb/usb-serial",
     "drivers/usb/utils/*",
+    "drivers/watchdog/*",
 
     "os/StarryOS/kernel",
     "os/StarryOS/signal",
@@ -243,6 +244,7 @@ rdif-power = { version = "0.9", path = "drivers/interface/rdif-power" }
 rdif-reset = { version = "0.2", path = "drivers/interface/rdif-reset" }
 rdif-serial = { version = "0.10", path = "drivers/interface/rdif-serial" }
 rdif-vsock = { version = "0.3", path = "drivers/interface/rdif-vsock" }
+rdif-watchdog = { version = "0.1", path = "drivers/interface/rdif-watchdog" }
 rk3588-pci = { version = "0.2", path = "drivers/pci/rk3588-pci" }
 rockchip-npu = { version = "0.7", path = "drivers/npu/rockchip-npu" }
 rockchip-rga = { version = "0.3", path = "drivers/gpu/rockchip-rga" }
@@ -268,6 +270,7 @@ usb-serial = { version = "0.1", path = "drivers/usb/usb-serial" }
 ax-media = { version = "0.1", path = "drivers/media/ax-media" }
 media-uvc = { version = "0.1", path = "drivers/media/uvc" }
 dwmmc-host = { version = "0.4", path = "drivers/blk/dwmmc-host", default-features = false }
+dw-wdt = { version = "0.1", path = "drivers/watchdog/dw-wdt" }
 phytium-mci-host = { version = "0.4", path = "drivers/blk/phytium-mci-host", default-features = false }
 cv181x-sdhci = { version = "0.1", path = "drivers/blk/cv181x-sdhci", default-features = false }
 sdhci-host = { version = "0.5", path = "drivers/blk/sdhci-host", default-features = false }
