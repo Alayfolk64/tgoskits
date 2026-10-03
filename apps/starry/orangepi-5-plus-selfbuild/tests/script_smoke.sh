@@ -9,19 +9,21 @@ for script in \
     boot_script_is_starry.sh \
     boot_starry_once.sh \
     boot_starry_once_remote.sh \
+    capture_linux_bench_clock.sh \
     connect_serial.sh \
     configure_linux_watchdog.sh \
     deploy_starry_boot_remote.sh \
     ensure_linux_fsck.sh \
     fetch_artifacts.sh \
     guest-selfbuild.sh \
-    guest-tg-xtask-bench.sh \
+    guest-arceos-helloworld-bench.sh \
     init.sh \
     init-kernel-selfbuild.sh \
-    init-tg-xtask-bench.sh \
+    init-arceos-helloworld-bench.sh \
     init-watchdog-smoke.sh \
     install_source_link.sh \
-    linux-run-tg-xtask-bench.sh \
+    linux-run-arceos-helloworld-bench.sh \
+    prepare_arceos_helloworld_bench.sh \
     provision_rootfs.sh \
     provision_rootfs_remote.sh \
     restore_linux_boot.sh \

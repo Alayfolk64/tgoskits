@@ -8,9 +8,9 @@ mounted_dev=0
 mounted_sys=0
 
 cleanup() {
-    if [ "$mounted_sys" = 1 ]; then umount -R "$rootfs/sys" || true; fi
-    if [ "$mounted_dev" = 1 ]; then umount -R "$rootfs/dev" || true; fi
-    if [ "$mounted_proc" = 1 ]; then umount "$rootfs/proc" || true; fi
+    if [ "$mounted_sys" = 1 ]; then umount -R "$rootfs/sys"; fi
+    if [ "$mounted_dev" = 1 ]; then umount -R "$rootfs/dev"; fi
+    if [ "$mounted_proc" = 1 ]; then umount "$rootfs/proc"; fi
 }
 trap cleanup EXIT
 
@@ -32,4 +32,4 @@ fi
 
 sync
 echo 3 > /proc/sys/vm/drop_caches
-chroot "$rootfs" /bin/bash /guest-tg-xtask-bench.sh "$run_id"
+chroot "$rootfs" /bin/bash /guest-arceos-helloworld-bench.sh "$run_id"
