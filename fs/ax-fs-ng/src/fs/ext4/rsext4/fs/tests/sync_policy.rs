@@ -1,7 +1,8 @@
 //! Persistence policies exercise real VFS operations and real ext4 barriers.
 
 use axfs_ng_vfs::{
-    Location, MetadataUpdate, Mountpoint, NodePermission, NodeType, WritebackPolicy,
+    FileRangeOperation, Location, MetadataUpdate, Mountpoint, NodePermission, NodeType,
+    PreallocationMode, WritebackPolicy,
 };
 use rsext4::{InodeFlags, InodeMetadataUpdate};
 
@@ -61,7 +62,7 @@ fn synchronous_inode_metadata_and_directory_flags_force_commit() {
 }
 
 #[test]
-fn synchronous_inode_cached_write_forces_commit() {
+fn synchronous_inode_cached_mutations_hold_admission_until_commit() {
     crate::os::memory::test_support::with_test_page_provider(true, |_| {
         let (filesystem, root, flushes) = background_mount();
         let file = create_file(&root, "cached-sync");
@@ -96,6 +97,44 @@ fn synchronous_inode_cached_write_forces_commit() {
         probe.finish();
         assert_eq!(handle.position(), Some(8));
         assert!(cached.dirty_pages_in_range(0, 1).unwrap().is_empty());
+
+        for (operation, expected_len) in [
+            (
+                FileRangeOperation::Allocate(PreallocationMode::ExtendSize),
+                2 * 4096,
+            ),
+            (
+                FileRangeOperation::ZeroRange(PreallocationMode::KeepSize),
+                2 * 4096,
+            ),
+            (FileRangeOperation::InsertRange, 3 * 4096),
+            (FileRangeOperation::CollapseRange, 2 * 4096),
+            (FileRangeOperation::PunchHole, 2 * 4096),
+        ] {
+            let writing_filesystem = filesystem.clone();
+            let probe = super::namespace::watch_flush(move || {
+                assert_eq!(writing_filesystem.cached_writes.active_count(), 1);
+                Ok(())
+            });
+            handle
+                .backend()
+                .unwrap()
+                .operate_range(4096, 4096, operation)
+                .unwrap();
+            probe.finish();
+            assert_eq!(cached.len(), expected_len);
+            assert_eq!(filesystem.cached_writes.active_count(), 0);
+        }
+
+        assert_eq!(
+            handle
+                .backend()
+                .unwrap()
+                .operate_range(1, 4096, FileRangeOperation::InsertRange,),
+            Err(axfs_ng_vfs::VfsError::InvalidInput)
+        );
+        filesystem.cached_writes.close_and_drain().unwrap();
+        filesystem.cached_writes.reopen();
     });
 }
 

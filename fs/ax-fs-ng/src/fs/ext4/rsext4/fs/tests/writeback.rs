@@ -2,7 +2,10 @@
 
 use core::{cell::Cell, sync::atomic::AtomicBool};
 
-use axfs_ng_vfs::{CachedWriteGuard, Location, Mountpoint, NodePermission, NodeType};
+use axfs_ng_vfs::{
+    CachedWriteGuard, FileRangeOperation, Location, Mountpoint, NodePermission, NodeType,
+    PreallocationMode,
+};
 
 use super::*;
 use crate::{
@@ -149,6 +152,7 @@ fn failed_final_mount_writeback_keeps_dirty_cache_for_retry() {
 fn closing_cached_admission_blocks_mutations_but_still_allows_page_writeback() {
     with_test_page_provider(true, |_| {
         let (filesystem, file) = cached_test_file();
+        file.set_len(3 * 4096).unwrap();
         file.write_at(b"final".as_slice(), 0).unwrap();
         filesystem.cached_writes.close_and_drain().unwrap();
 
@@ -166,6 +170,25 @@ fn closing_cached_admission_blocks_mutations_but_still_allows_page_writeback() {
             file.write_at(&[0x55][..], 0),
             Err::<usize, _>(VfsError::ResourceBusy)
         );
+        assert_eq!(
+            file.preallocate(3 * 4096, 4096, PreallocationMode::ExtendSize),
+            Err(VfsError::ResourceBusy)
+        );
+        for operation in [
+            FileRangeOperation::Allocate(PreallocationMode::ExtendSize),
+            FileRangeOperation::ZeroRange(PreallocationMode::KeepSize),
+            FileRangeOperation::PunchHole,
+            FileRangeOperation::CollapseRange,
+            FileRangeOperation::InsertRange,
+        ] {
+            assert_eq!(
+                file.operate_range(0, 4096, operation),
+                Err(VfsError::ResourceBusy),
+                "closed admission accepted {operation:?}"
+            );
+        }
+        assert_eq!(file.len(), 3 * 4096);
+        assert_eq!(file.location().len(), Ok(3 * 4096));
 
         crate::file::writeback_filesystem_pages(&*filesystem).unwrap();
         filesystem.sync_to_disk().unwrap();
