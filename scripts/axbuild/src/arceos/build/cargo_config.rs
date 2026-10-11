@@ -11,6 +11,14 @@ pub(crate) fn load_cargo_config(
     request: &ResolvedBuildRequest,
     workspace: &WorkspaceContext,
 ) -> anyhow::Result<Cargo> {
+    load_cargo_config_with_default_features(request, workspace, true)
+}
+
+pub(crate) fn load_cargo_config_with_default_features(
+    request: &ResolvedBuildRequest,
+    workspace: &WorkspaceContext,
+    include_default_features: bool,
+) -> anyhow::Result<Cargo> {
     let metadata = workspace.metadata();
     let axbuild_dir = workspace.axbuild_artifact_dir();
     let makefile_features = build::makefile_features_from_env();
@@ -22,24 +30,23 @@ pub(crate) fn load_cargo_config(
         );
     }
     let to_bin = config.to_bin;
+    let build_info = config.build_info;
     let mut cargo = if config.freestanding {
-        config
-            .build_info
-            .into_prepared_no_std_cargo_config_with_metadata(
-                &request.package,
-                &request.target,
-                metadata,
-                build::BareKernelLinkMode::Pie,
-            )?
+        build_info.into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+            &request.package,
+            &request.target,
+            metadata,
+            build::BareKernelLinkMode::Pie,
+            include_default_features,
+        )?
     } else {
-        config
-            .build_info
-            .into_prepared_std_cargo_config_with_metadata(
-                &request.package,
-                &request.target,
-                metadata,
-                &axbuild_dir,
-            )?
+        build_info.into_prepared_std_cargo_config_with_metadata_and_defaults(
+            &request.package,
+            &request.target,
+            metadata,
+            &axbuild_dir,
+            include_default_features,
+        )?
     };
     cargo.to_bin |= to_bin;
     Ok(cargo)

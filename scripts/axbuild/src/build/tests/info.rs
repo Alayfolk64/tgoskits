@@ -1,5 +1,108 @@
 use super::*;
-use crate::build::info::toolchain_rustflags;
+use crate::build::info::{
+    BuildInfo, package_enables_mmu, package_enables_mmu_with_defaults, package_mmu_enabled,
+    toolchain_rustflags, toolchain_rustflags_for_mmu,
+};
+
+#[test]
+fn duplicate_mmu_capabilities_add_only_one_stack_protector_rustflag() {
+    let flags = toolchain_rustflags_for_mmu(&HashMap::new(), true);
+
+    assert_eq!(
+        flags
+            .iter()
+            .filter(|flag| flag.as_str() == "-Zstack-protector=strong")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn package_metadata_resolves_mmu_capability_through_defaults_and_aliases() {
+    let metadata = repo_metadata();
+
+    for package in ["arceos-helloworld", "starryos", "axvisor"] {
+        assert!(
+            package_enables_mmu(package, &metadata, &[]).unwrap(),
+            "{package} must resolve a paging-enabled dependency"
+        );
+    }
+    assert!(package_enables_mmu("ax-runtime", &metadata, &["paging".into()]).unwrap());
+    assert!(package_enables_mmu("ax-libc", &metadata, &["paging".into()]).unwrap());
+    assert!(package_enables_mmu("ax-std", &metadata, &["dns".into()]).unwrap());
+    assert!(package_enables_mmu("ax-runtime", &metadata, &["vmap-task-stack".into()]).unwrap());
+    assert!(!package_enables_mmu("ax-hal", &metadata, &["uspace".into()]).unwrap());
+    assert!(!package_enables_mmu("ax-runtime", &metadata, &[]).unwrap());
+    assert!(package_enables_mmu_with_defaults("arceos-helloworld", &metadata, &[], true,).unwrap());
+    assert!(
+        !package_enables_mmu_with_defaults("arceos-helloworld", &metadata, &[], false,).unwrap()
+    );
+}
+
+#[test]
+fn package_mmu_detection_does_not_mutate_feature_selection() {
+    let metadata = repo_metadata();
+
+    let libc = BuildInfo {
+        features: vec!["fs".to_string()],
+        ..BuildInfo::default()
+    };
+    assert!(package_mmu_enabled("ax-libc", &metadata, &libc.features, true).unwrap());
+    assert_eq!(libc.features, vec!["fs".to_string()]);
+
+    let app = BuildInfo::default();
+    assert!(package_mmu_enabled("arceos-helloworld", &metadata, &app.features, true).unwrap());
+    assert!(app.features.is_empty());
+
+    assert!(!package_mmu_enabled("arceos-helloworld", &metadata, &app.features, false,).unwrap());
+}
+
+#[test]
+fn package_mmu_rustflags_follow_metadata_without_injecting_features() {
+    let metadata = repo_metadata();
+    let cargo = BuildInfo::default()
+        .into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+            "arceos-helloworld",
+            "x86_64-unknown-none",
+            &metadata,
+            BareKernelLinkMode::Default,
+            true,
+        )
+        .unwrap();
+    assert!(cargo.features.is_empty());
+    assert!(cargo.args.join("\n").contains("-Zstack-protector=strong"));
+
+    let cargo = BuildInfo::default()
+        .into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+            "arceos-helloworld",
+            "x86_64-unknown-none",
+            &metadata,
+            BareKernelLinkMode::Default,
+            false,
+        )
+        .unwrap();
+    assert!(!cargo.args.join("\n").contains("-Zstack-protector=strong"));
+}
+
+#[test]
+fn axlibc_paging_alias_is_normalized_before_cargo_feature_resolution() {
+    let metadata = repo_metadata();
+    let app = BuildInfo {
+        features: vec!["axlibc/paging".to_string()],
+        ..BuildInfo::default()
+    };
+
+    let cargo = app
+        .into_prepared_no_std_cargo_config_with_metadata(
+            "arceos-helloworld",
+            "x86_64-unknown-none",
+            &metadata,
+            BareKernelLinkMode::Default,
+        )
+        .unwrap();
+
+    assert_eq!(cargo.features, vec!["ax-std/paging".to_string()]);
+}
 
 #[test]
 fn toolchain_rustflags_preserves_debug_and_backtrace_env() {

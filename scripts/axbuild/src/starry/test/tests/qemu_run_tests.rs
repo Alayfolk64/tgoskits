@@ -239,4 +239,10 @@ fn qemu_group_build_context_uses_dynamic_group_platform_over_default_request() {
             .windows(2)
             .any(|pair| pair == ["-Z", "build-std=core,alloc"])
     );
+    assert!(
+        cargo
+            .args
+            .iter()
+            .any(|arg| arg.contains("-Zstack-protector=strong"))
+    );
 }

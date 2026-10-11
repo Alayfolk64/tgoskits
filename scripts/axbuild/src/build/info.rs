@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use anyhow::bail;
 
 use super::*;
@@ -28,21 +30,250 @@ pub(crate) fn toolchain_rustflags(env: &HashMap<String, String>) -> Vec<String> 
     flags
 }
 
-pub(super) fn features_enable_stack_protector(features: &[String]) -> bool {
-    features.iter().any(|feature| {
-        matches!(
-            feature.as_str(),
-            "stack-protector" | "ax-std/stack-protector" | "starry-kernel/stack-protector"
-        )
+enum FeatureResolutionEvent {
+    ActivatePackage {
+        package: String,
+        include_default: bool,
+        features: Vec<String>,
+    },
+    EnableDependency {
+        owner: String,
+        dependency: String,
+        feature: Option<String>,
+    },
+    EnableFeature {
+        package: String,
+        feature: String,
+    },
+}
+
+fn dependency_for<'a>(package: &'a Package, name: &str) -> Option<&'a cargo_metadata::Dependency> {
+    package.dependencies.iter().find(|dependency| {
+        dependency.name == name
+            || dependency.rename.as_deref() == Some(name)
+            || (name == "axlibc" && dependency.name == "ax-libc")
     })
 }
 
-pub(crate) fn toolchain_rustflags_for_features(
-    env: &HashMap<String, String>,
+fn dependency_package_name(
+    metadata: &Metadata,
+    dependency: &cargo_metadata::Dependency,
+) -> Option<String> {
+    let candidates = [
+        dependency.name.as_str(),
+        dependency.rename.as_deref().unwrap_or(""),
+    ];
+    candidates.into_iter().find_map(|candidate| {
+        metadata
+            .packages
+            .iter()
+            .find(|package| {
+                metadata.workspace_members.contains(&package.id) && package.name == candidate
+            })
+            .map(|package| package.name.to_string())
+    })
+}
+
+fn feature_resolution_has_mmu(
+    package: &str,
+    metadata: &Metadata,
+    requested_features: &[String],
+    include_default_features: bool,
+) -> anyhow::Result<bool> {
+    let mut events = VecDeque::from([FeatureResolutionEvent::ActivatePackage {
+        package: package.to_string(),
+        include_default: include_default_features,
+        features: requested_features.to_vec(),
+    }]);
+    let mut activated_packages = HashSet::new();
+    let mut activated_dependencies = HashSet::new();
+    let mut visited_features = HashSet::new();
+
+    while let Some(event) = events.pop_front() {
+        match event {
+            FeatureResolutionEvent::ActivatePackage {
+                package,
+                include_default,
+                features,
+            } => {
+                let package_info = workspace_package(metadata, &package)?;
+                if activated_packages.insert(package.clone()) {
+                    if include_default && package_info.features.contains_key("default") {
+                        events.push_back(FeatureResolutionEvent::EnableFeature {
+                            package: package.clone(),
+                            feature: "default".to_string(),
+                        });
+                    }
+                    for dependency in package_info
+                        .dependencies
+                        .iter()
+                        .filter(|dependency| !dependency.optional)
+                    {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: dependency.name.clone(),
+                            feature: None,
+                        });
+                    }
+                }
+                for feature in features {
+                    if package_info.features.contains_key(&feature) {
+                        events.push_back(FeatureResolutionEvent::EnableFeature {
+                            package: package.clone(),
+                            feature,
+                        });
+                    } else if let Some((dependency, feature)) = feature.split_once('/') {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: dependency.to_string(),
+                            feature: Some(feature.to_string()),
+                        });
+                    } else if dependency_for(package_info, &feature).is_some() {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: feature,
+                            feature: None,
+                        });
+                    }
+                }
+            }
+            FeatureResolutionEvent::EnableDependency {
+                owner,
+                dependency,
+                feature,
+            } => {
+                let owner_info = workspace_package(metadata, &owner)?;
+                let optional_feature = dependency.ends_with('?');
+                let dependency_name = dependency.trim_end_matches('?');
+                let Some(dependency_info) = dependency_for(owner_info, dependency_name) else {
+                    continue;
+                };
+                let dependency_key = (owner.clone(), dependency_name.to_string());
+                if optional_feature && !activated_dependencies.contains(&dependency_key) {
+                    continue;
+                }
+                let Some(dependency_package) = dependency_package_name(metadata, dependency_info)
+                else {
+                    continue;
+                };
+                if activated_dependencies.insert(dependency_key) {
+                    events.push_back(FeatureResolutionEvent::ActivatePackage {
+                        package: dependency_package.clone(),
+                        include_default: dependency_info.uses_default_features,
+                        features: dependency_info.features.clone(),
+                    });
+                }
+                if let Some(feature) = feature {
+                    events.push_back(FeatureResolutionEvent::EnableFeature {
+                        package: dependency_package,
+                        feature,
+                    });
+                }
+            }
+            FeatureResolutionEvent::EnableFeature { package, feature } => {
+                if !visited_features.insert((package.clone(), feature.clone())) {
+                    continue;
+                }
+                if package == "ax-runtime" && feature == "paging" {
+                    return Ok(true);
+                }
+                let package_info = workspace_package(metadata, &package)?;
+                let Some(values) = package_info.features.get(&feature) else {
+                    continue;
+                };
+                for value in values {
+                    if let Some(dependency) = value.strip_prefix("dep:") {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: dependency.to_string(),
+                            feature: None,
+                        });
+                    } else if let Some((dependency, feature)) = value.split_once('/') {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: dependency.to_string(),
+                            feature: Some(feature.to_string()),
+                        });
+                    } else if package_info.features.contains_key(value) {
+                        events.push_back(FeatureResolutionEvent::EnableFeature {
+                            package: package.clone(),
+                            feature: value.clone(),
+                        });
+                    } else if dependency_for(package_info, value).is_some() {
+                        events.push_back(FeatureResolutionEvent::EnableDependency {
+                            owner: package.clone(),
+                            dependency: value.clone(),
+                            feature: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Returns whether Cargo's default and requested package features select an MMU-backed
+/// ArceOS dependency. This closes the gap between Cargo's feature resolver and the
+/// explicit `BuildInfo.features` list used to construct rustflags.
+pub(crate) fn package_enables_mmu(
+    package: &str,
+    metadata: &Metadata,
+    requested_features: &[String],
+) -> anyhow::Result<bool> {
+    package_enables_mmu_with_defaults(package, metadata, requested_features, true)
+}
+
+pub(crate) fn package_enables_mmu_with_defaults(
+    package: &str,
+    metadata: &Metadata,
+    requested_features: &[String],
+    include_default_features: bool,
+) -> anyhow::Result<bool> {
+    feature_resolution_has_mmu(
+        package,
+        metadata,
+        requested_features,
+        include_default_features,
+    )
+}
+
+/// Returns whether the selected package feature graph enables the MMU provider.
+pub(crate) fn package_mmu_enabled(
+    package: &str,
+    metadata: &Metadata,
     features: &[String],
+    include_default_features: bool,
+) -> anyhow::Result<bool> {
+    package_enables_mmu_with_defaults(package, metadata, features, include_default_features)
+}
+
+fn package_mmu_feature_marker(
+    package: &str,
+    metadata: &Metadata,
+) -> anyhow::Result<Option<String>> {
+    let package = workspace_package(metadata, package)?;
+    if package.features.contains_key("paging") {
+        return Ok(Some("paging".to_string()));
+    }
+    for dependency in ["ax-std", "ax-runtime", "ax-hal", "ax-libc", "axlibc"] {
+        if package
+            .dependencies
+            .iter()
+            .any(|candidate| candidate.name == dependency)
+        {
+            return Ok(Some(format!("{dependency}/paging")));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn toolchain_rustflags_for_mmu(
+    env: &HashMap<String, String>,
+    mmu_enabled: bool,
 ) -> Vec<String> {
     let mut flags = toolchain_rustflags(env);
-    if features_enable_stack_protector(features) {
+    if mmu_enabled {
         flags.push("-Zstack-protector=strong".to_string());
     }
     flags
@@ -483,12 +714,32 @@ impl BuildInfo {
     }
 
     pub(crate) fn into_prepared_base_cargo_config_with_metadata(
-        mut self,
+        self,
         package: &str,
         target: &str,
         metadata: &Metadata,
         axbuild_dir: &Path,
     ) -> anyhow::Result<Cargo> {
+        self.into_prepared_base_cargo_config_with_metadata_and_defaults(
+            package,
+            target,
+            metadata,
+            axbuild_dir,
+            true,
+        )
+    }
+
+    pub(crate) fn into_prepared_base_cargo_config_with_metadata_and_defaults(
+        mut self,
+        package: &str,
+        target: &str,
+        metadata: &Metadata,
+        axbuild_dir: &Path,
+        include_default_features: bool,
+    ) -> anyhow::Result<Cargo> {
+        self.normalize_mmu_feature_aliases(package, metadata)?;
+        let mmu_enabled =
+            package_mmu_enabled(package, metadata, &self.features, include_default_features)?;
         self.validated_max_cpu_num()?;
         self.validate_features()?;
         self.resolve_std_features();
@@ -526,7 +777,7 @@ impl BuildInfo {
             .display()
             .to_string(),
         );
-        let rustflags = toolchain_rustflags_for_features(&cargo.env, &cargo.features);
+        let rustflags = toolchain_rustflags_for_mmu(&cargo.env, mmu_enabled);
         cargo.extra_config = Some(
             std_cargo_config_path(axbuild_dir, &std_target.target_name, &wrapper, &rustflags)?
                 .display()
@@ -546,20 +797,53 @@ impl BuildInfo {
         self.into_prepared_base_cargo_config_with_metadata(package, target, metadata, axbuild_dir)
     }
 
+    pub(crate) fn into_prepared_std_cargo_config_with_metadata_and_defaults(
+        self,
+        package: &str,
+        target: &str,
+        metadata: &Metadata,
+        axbuild_dir: &Path,
+        include_default_features: bool,
+    ) -> anyhow::Result<Cargo> {
+        self.into_prepared_base_cargo_config_with_metadata_and_defaults(
+            package,
+            target,
+            metadata,
+            axbuild_dir,
+            include_default_features,
+        )
+    }
+
     /// Builds a freestanding kernel against only `core` and `alloc`.
     pub(crate) fn into_prepared_no_std_cargo_config_with_metadata(
-        mut self,
+        self,
         package: &str,
         target: &str,
         metadata: &Metadata,
         link_mode: BareKernelLinkMode,
     ) -> anyhow::Result<Cargo> {
+        self.into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+            package, target, metadata, link_mode, true,
+        )
+    }
+
+    pub(crate) fn into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+        mut self,
+        package: &str,
+        target: &str,
+        metadata: &Metadata,
+        link_mode: BareKernelLinkMode,
+        include_default_features: bool,
+    ) -> anyhow::Result<Cargo> {
+        self.normalize_mmu_feature_aliases(package, metadata)?;
+        let mmu_enabled =
+            package_mmu_enabled(package, metadata, &self.features, include_default_features)?;
         self.validated_max_cpu_num()?;
         self.validate_features()?;
         self.reject_freestanding_std_compat()?;
         self.enable_package_smp_feature(package, metadata)?;
 
-        let mut rustflags = toolchain_rustflags_for_features(&self.env, &self.features);
+        let mut rustflags = toolchain_rustflags_for_mmu(&self.env, mmu_enabled);
         rustflags.extend(link_mode.rustflags(target));
         let bare_target = freestanding_build_target_for(target);
         let args = Self::build_cargo_args(target, &rustflags);
@@ -613,6 +897,33 @@ impl BuildInfo {
         self.features.dedup();
     }
 
+    fn normalize_mmu_feature_aliases(
+        &mut self,
+        package: &str,
+        metadata: &Metadata,
+    ) -> anyhow::Result<()> {
+        if !self
+            .features
+            .iter()
+            .any(|feature| feature == "axlibc/paging")
+        {
+            return Ok(());
+        }
+
+        let marker = package_mmu_feature_marker(package, metadata)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "feature `axlibc/paging` cannot be normalized for package `{package}`; use a \
+                 package with a paging capability"
+            )
+        })?;
+        for feature in &mut self.features {
+            if feature == "axlibc/paging" {
+                *feature = marker.clone();
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_c_app_features(&mut self) -> anyhow::Result<()> {
         self.validate_features()?;
         // `max_cpu_num` is an explicit C build setting; expose the matching ax-std
@@ -656,6 +967,12 @@ impl BuildInfo {
             bail!(
                 "feature `{feature}` is no longer supported; dynamic platform selection is \
                  automatic, remove the feature from the selected configuration"
+            );
+        }
+        if is_removed_stack_hardening_feature(feature) {
+            bail!(
+                "feature `{feature}` was removed; enable the canonical `paging` capability \
+                 (`ax-std/paging` for system builds) instead"
             );
         }
         Ok(())
