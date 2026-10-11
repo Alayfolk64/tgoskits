@@ -18,7 +18,9 @@ struct observation {
 
 static atomic_int release_workers;
 /* The parent blocks until each new worker has sampled its entry CPU. A
- * sched_yield polling loop can compete with the worker it is waiting for. */
+ * sched_yield polling loop can compete with the worker it is waiting for.
+ * Finish this two-party round before creating another thread: a later create
+ * failure cannot leave an earlier worker waiting for a missing participant. */
 static pthread_barrier_t ready_barrier;
 
 static int rendezvous_ready(void)
@@ -73,6 +75,7 @@ static void *pinned_load(void *argument)
 int main(void)
 {
     cpu_set_t original, allowed;
+    CPU_ZERO(&original);
     if (syscall(SYS_sched_getaffinity, 0, sizeof(original), &original) < 0) {
         perror("FAIL: sched_getaffinity");
         return 1;
@@ -90,10 +93,12 @@ int main(void)
         perror("FAIL: restrict test to two allowed CPUs");
         return 1;
     }
+    int failed = 0;
     int barrier_error = pthread_barrier_init(&ready_barrier, NULL, 2);
     if (barrier_error != 0) {
         printf("FAIL: initialize ready barrier: %s\n", strerror(barrier_error));
-        return 1;
+        failed = 1;
+        goto restore_affinity;
     }
 
     pthread_t threads[WORKERS];
@@ -102,7 +107,6 @@ int main(void)
     struct observation load[LOAD_WORKERS] = {0};
     int created = 0;
     int load_created = 0;
-    int failed = 0;
     for (int index = 0; index < WORKERS; index++) {
         int error = pthread_create(&threads[index], NULL, worker, &results[index]);
         if (error != 0) {
@@ -181,13 +185,14 @@ int main(void)
         printf("FAIL: destroy ready barrier: %s\n", strerror(barrier_error));
         failed = 1;
     }
-    if (syscall(SYS_sched_setaffinity, 0, sizeof(original), &original) != 0) {
-        perror("FAIL: restore affinity");
-        failed = 1;
-    }
     if (CPU_COUNT(&observed) != WORKERS) {
         printf("FAIL: new workers used %d distinct CPUs, expected %d\n",
                CPU_COUNT(&observed), WORKERS);
+        failed = 1;
+    }
+restore_affinity:
+    if (syscall(SYS_sched_setaffinity, 0, sizeof(original), &original) != 0) {
+        perror("FAIL: restore affinity");
         failed = 1;
     }
     if (!failed)
