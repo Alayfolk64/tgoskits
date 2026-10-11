@@ -291,9 +291,12 @@ impl Ext4Filesystem {
     }
 
     pub(crate) fn directory_cache_generation(&self, inode: InodeNumber) -> VfsResult<Option<u64>> {
-        // Reuse the canonical inode change attribute across renamed/open
-        // directory aliases. The read-only capability never loads or waits;
-        // paused, evicted and retired metadata must force ordinary lookup.
+        // Namespace commits advance the canonical parent inode change attribute
+        // through rsext4's parent_dir_change, invalidating misses in every
+        // renamed/open directory alias. A fixed or wrapper-local version would
+        // keep stale misses after another alias creates a name.
+        // The read-only capability never loads or waits; paused, evicted and
+        // retired metadata must force ordinary lookup.
         self.inode_metadata
             .try_get(inode)
             .map(|cached| cached.map(|info| info.change_attribute))
