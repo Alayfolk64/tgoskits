@@ -22,7 +22,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     vec::Vec,
@@ -34,7 +34,8 @@ use crate::{
     AxVmResult, HostWaitQueueHandle, ax_err,
     host::task::{IrqNotification, ThreadWakeHandle},
     identity::{RunId, VcpuInstance},
-    irq::model::PendingVcpuInterrupt,
+    irq::model::{PendingVcpuInterrupt, RunEpoch, SourceEvent},
+    manager::ControlShared,
     runtime::{
         kick::kick_target,
         queue::{INTERRUPT_SOURCE_CAPACITY, QueuedVcpuInterrupt, SlotUpdate, VcpuSignalSlot},
@@ -46,6 +47,84 @@ pub(crate) use crate::{irq::deferred::RunSignalWorker, runtime::queue::SignalErr
 const IRQ_CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
 const IRQ_INFLIGHT_MASK: usize = !IRQ_CLOSED_BIT;
 const POLL_OWNER_NONE: usize = usize::MAX;
+const CONTROLLER_EVENT_CAPACITY: usize = 64;
+
+struct ControllerEventQueue<const CAPACITY: usize> {
+    entries: [Option<SourceEvent>; CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl<const CAPACITY: usize> ControllerEventQueue<CAPACITY> {
+    const fn new() -> Self {
+        Self {
+            entries: [None; CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, event: SourceEvent) -> Result<(), SignalError> {
+        for offset in 0..self.len {
+            let index = (self.head + offset) % self.entries.len();
+            let Some(queued) = &mut self.entries[index] else {
+                continue;
+            };
+            match (queued, event) {
+                // A controller pending bit represents an edge source once,
+                // even when the producer raises it repeatedly before the
+                // owner drains the ingress.  This is the same state model as
+                // Linux's per-descriptor pending bit, rather than a capacity
+                // workaround for an event counter.
+                (
+                    SourceEvent::Pulse {
+                        epoch: queued_epoch,
+                        source: queued_source,
+                    },
+                    SourceEvent::Pulse { epoch, source },
+                ) if *queued_epoch == epoch && *queued_source == source => return Ok(()),
+                // A level-triggered line is a state, not a count.  Preserve
+                // the first FIFO position and publish only the latest
+                // electrical state for this run/source pair.
+                (
+                    SourceEvent::Level {
+                        epoch: queued_epoch,
+                        source: queued_source,
+                        asserted: queued_asserted,
+                    },
+                    SourceEvent::Level {
+                        epoch,
+                        source,
+                        asserted,
+                    },
+                ) if *queued_epoch == epoch && *queued_source == source => {
+                    *queued_asserted = asserted;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if self.len == self.entries.len() {
+            return Err(SignalError::Capacity);
+        }
+        let index = (self.head + self.len) % self.entries.len();
+        self.entries[index] = Some(event);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn drain(&mut self, output: &mut Vec<SourceEvent>) {
+        while self.len != 0 {
+            let event = self.entries[self.head]
+                .take()
+                .expect("controller event queue slot must be occupied");
+            self.head = (self.head + 1) % self.entries.len();
+            self.len -= 1;
+            output.push(event);
+        }
+    }
+}
 
 /// Per-run, per-vCPU interrupt and work signal state.
 ///
@@ -55,7 +134,7 @@ const POLL_OWNER_NONE: usize = usize::MAX;
 /// sources still pending for an inactive vCPU. Because a closed object rejects
 /// every new publication, a stale run can never inject into its successor.
 pub(crate) struct RunSignals {
-    run: RunId,
+    epoch: RunEpoch,
     vcpu_count: usize,
     slots: Box<[VcpuSignalSlot]>,
     registration_lock: RawSpinLock<()>,
@@ -65,6 +144,8 @@ pub(crate) struct RunSignals {
     irq_state: AtomicUsize,
     irq_pending: AtomicUsize,
     irq_notify: IrqNotification,
+    controller_events: RawSpinLock<ControllerEventQueue<CONTROLLER_EVENT_CAPACITY>>,
+    control: OnceLock<Weak<ControlShared>>,
 }
 
 /// Guards one hard-IRQ publisher against interrupt quiescence.
@@ -96,7 +177,7 @@ impl RunSignals {
         }
 
         Ok(Arc::new(Self {
-            run,
+            epoch: RunEpoch::new(run),
             vcpu_count,
             slots: slots.into_boxed_slice(),
             registration_lock: RawSpinLock::new(()),
@@ -106,11 +187,82 @@ impl RunSignals {
             irq_state: AtomicUsize::new(0),
             irq_pending: AtomicUsize::new(0),
             irq_notify: IrqNotification::new(),
+            controller_events: RawSpinLock::new(ControllerEventQueue::new()),
+            control: OnceLock::new(),
         }))
     }
 
+    /// Binds this run to its lifecycle owner before guest entry is admitted.
+    pub(crate) fn bind_control(&self, control: Weak<ControlShared>) {
+        let _ = self.control.set(control);
+    }
+
+    fn control(&self) -> Option<Arc<ControlShared>> {
+        self.control.get().and_then(Weak::upgrade)
+    }
+
+    /// Publishes a shared-controller event from a device or hard-IRQ context.
+    ///
+    /// The bounded ingress stores pending source state: repeated edge raises
+    /// share one pending entry and level raises update that entry's latest
+    /// state. The signal worker drains it in task context and posts to the
+    /// lifecycle owner.
+    pub(crate) fn publish_controller_event(&self, event: SourceEvent) -> Result<(), SignalError> {
+        let producer = IrqProducerGuard::new(self)?;
+        let result = match event {
+            SourceEvent::Pulse { .. } | SourceEvent::Level { .. } => {
+                self.controller_events.lock_irqsave().push(event)
+            }
+            // EOI is produced by a vCPU task after guest execution.  It must
+            // use [`Self::post_controller_event_task`] so completion cannot
+            // be rejected by the hard-IRQ ingress while the owner is draining
+            // another controller source.
+            SourceEvent::Eoi { .. } => Err(SignalError::InvalidSource),
+        };
+        drop(producer);
+        if result.is_ok() {
+            self.irq_notify.notify();
+        }
+        result
+    }
+
+    pub(crate) fn drain_controller_events(&self) -> Vec<SourceEvent> {
+        let mut output = Vec::with_capacity(CONTROLLER_EVENT_CAPACITY);
+        self.controller_events.lock_irqsave().drain(&mut output);
+        output
+    }
+
+    /// Posts one task-context controller completion directly to the lifecycle
+    /// mailbox.  Guest EOI is already outside hardware execution, so it does
+    /// not belong in the allocation-free hard-IRQ ingress.  A closed owner is
+    /// a normal run-retirement window and returns [`SignalError::Closed`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn post_controller_event_task(&self, event: SourceEvent) -> Result<(), SignalError> {
+        let Some(control) = self.control() else {
+            return Err(SignalError::Closed);
+        };
+        if control.post_interrupt(event) {
+            Ok(())
+        } else {
+            Err(SignalError::Closed)
+        }
+    }
+
+    pub(crate) fn post_controller_events(&self) {
+        let Some(control) = self.control() else {
+            return;
+        };
+        for event in self.drain_controller_events() {
+            control.post_interrupt(event);
+        }
+    }
+
     pub(crate) const fn run_id(&self) -> RunId {
-        self.run
+        self.epoch.run()
+    }
+
+    pub(crate) const fn epoch(&self) -> RunEpoch {
+        self.epoch
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -139,7 +291,7 @@ impl RunSignals {
     /// [`SignalError::InvalidSource`]; an id outside this run's bitmap is an
     /// [`SignalError::InvalidTarget`].
     fn validate_instance(&self, instance: VcpuInstance) -> Result<usize, SignalError> {
-        if instance.run != self.run {
+        if instance.run != self.epoch.run() {
             return Err(SignalError::InvalidSource);
         }
         self.vcpu_bit(instance.vcpu_id)
@@ -148,6 +300,28 @@ impl RunSignals {
 
     pub(crate) fn contains_vcpu(&self, vcpu_id: usize) -> bool {
         self.vcpu_bit(vcpu_id).is_some()
+    }
+
+    /// Returns whether an exact vCPU activation is still registered.
+    ///
+    /// Controller owners use this check when completing a delivery token. The
+    /// slot lock is a leaf synchronization boundary; no VM or device service is
+    /// reached while it is held.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_current_instance(&self, instance: VcpuInstance) -> bool {
+        self.slot(instance.vcpu_id)
+            .is_some_and(|slot| slot.is_registered(instance))
+    }
+
+    /// Returns the activation currently registered for one vCPU.
+    ///
+    /// This is a task-side snapshot used to stamp a controller completion with
+    /// the exact target activation. It never exposes the wake target or any
+    /// upper-layer service.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn current_instance(&self, vcpu_id: usize) -> Option<VcpuInstance> {
+        self.slot(vcpu_id)
+            .and_then(crate::runtime::queue::VcpuSignalSlot::current_instance)
     }
 
     /// Binds one vCPU activation to its fixed wake and entry target.
@@ -212,6 +386,20 @@ impl RunSignals {
         self.publish_queued(vcpu_id, interrupt.into())
     }
 
+    /// Publishes one source and reports whether it created a new queue entry.
+    ///
+    /// Controller owners use this result to retain one EOI source identity per
+    /// actual delivery. Coalesced duplicate sources must not create a second
+    /// completion token.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn publish_with_status(
+        &self,
+        vcpu_id: usize,
+        interrupt: PendingVcpuInterrupt,
+    ) -> Result<bool, SignalError> {
+        self.publish_queued_with_status(vcpu_id, interrupt.into())
+    }
+
     /// Publishes one concrete architecture interrupt source into the run queue.
     ///
     /// The queue belongs to the run and the vCPU identity, not to one activation,
@@ -232,11 +420,36 @@ impl RunSignals {
         vcpu_id: usize,
         interrupt: QueuedVcpuInterrupt,
     ) -> Result<(), SignalError> {
+        self.publish_queued_with_status(vcpu_id, interrupt)
+            .map(|_| ())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn publish_queued_with_status(
+        &self,
+        vcpu_id: usize,
+        interrupt: QueuedVcpuInterrupt,
+    ) -> Result<bool, SignalError> {
         let Some(slot) = self.slot(vcpu_id) else {
             return Err(SignalError::InvalidTarget);
         };
         let producer = IrqProducerGuard::new(self)?;
-        let result = slot.publish(interrupt).map(|_created| ());
+        let result = slot.publish(interrupt);
+        drop(producer);
+        result
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn publish_queued_with_status(
+        &self,
+        vcpu_id: usize,
+        interrupt: QueuedVcpuInterrupt,
+    ) -> Result<bool, SignalError> {
+        let Some(slot) = self.slot(vcpu_id) else {
+            return Err(SignalError::InvalidTarget);
+        };
+        let producer = IrqProducerGuard::new(self)?;
+        let result = slot.publish(interrupt);
         drop(producer);
         result
     }
@@ -328,6 +541,15 @@ impl RunSignals {
     /// Prevents new hard-IRQ publishers from entering this run.
     pub(crate) fn close_interrupts(&self) {
         self.irq_state.fetch_or(IRQ_CLOSED_BIT, Ordering::Release);
+    }
+
+    /// Returns whether this run has stopped admitting interrupt producers.
+    ///
+    /// The lifecycle owner uses this boundary before dispatching a controller
+    /// event already waiting in its mailbox. A paused run keeps admission open
+    /// at this layer, while a stopping or failed run retires every old event.
+    pub(crate) fn interrupts_closed(&self) -> bool {
+        self.irq_state.load(Ordering::Acquire) & IRQ_CLOSED_BIT != 0
     }
 
     /// Returns true only after closing is visible and all IRQ publishers left.
@@ -556,7 +778,7 @@ impl RunSignals {
             if let Err(error) = self.kick(vcpu_id) {
                 trace!(
                     "run {:?} deferred IRQ kick for vCPU {vcpu_id} was not delivered: {error:?}",
-                    self.run
+                    self.epoch.run()
                 );
             }
         }
@@ -586,11 +808,13 @@ impl Iterator for SetBits {
 mod tests {
     use std::sync::Arc;
 
+    use axdevice_base::InterruptControllerId;
+
     use super::*;
     use crate::{
         HostWaitQueueHandle, InterruptTriggerMode,
         identity::{RunId, VcpuInstance, VmKey},
-        irq::model::{PendingVcpuInterrupt, VirtualInterruptId},
+        irq::model::{InterruptSourceId, PendingVcpuInterrupt, SourceEvent, VirtualInterruptId},
         vcpu::VcpuSignals,
     };
 
@@ -610,8 +834,99 @@ mod tests {
         PendingVcpuInterrupt {
             id: VirtualInterruptId(id),
             trigger: InterruptTriggerMode::EdgeTriggered,
+            source: None,
         }
         .into()
+    }
+
+    #[test]
+    fn duplicate_pulses_share_one_controller_pending_slot() {
+        let run = run_signals(1);
+        let source = InterruptSourceId::new(InterruptControllerId::new(0), 4, None);
+        for _ in 0..CONTROLLER_EVENT_CAPACITY * 4 {
+            run.publish_controller_event(SourceEvent::Pulse {
+                epoch: run.epoch(),
+                source,
+            })
+            .expect("repeated edge state must not consume another queue slot");
+        }
+        assert_eq!(
+            run.drain_controller_events(),
+            vec![SourceEvent::Pulse {
+                epoch: run.epoch(),
+                source,
+            }]
+        );
+    }
+
+    #[test]
+    fn task_controller_event_does_not_use_hard_irq_ingress() {
+        let run = run_signals(1);
+        assert_eq!(
+            run.publish_controller_event(SourceEvent::Eoi {
+                epoch: run.epoch(),
+                token: crate::irq::model::DeliveryToken {
+                    source: InterruptSourceId::new(InterruptControllerId::new(0), 4, None),
+                    target: instance(run.run_id(), 0, 1),
+                },
+            }),
+            Err(SignalError::InvalidSource)
+        );
+    }
+
+    #[test]
+    fn level_ingress_coalesces_latest_state_for_one_source() {
+        let run = run_signals(1);
+        let source = InterruptSourceId::new(InterruptControllerId::new(0), 4, None);
+
+        for asserted in [true, false, true]
+            .into_iter()
+            .cycle()
+            .take(CONTROLLER_EVENT_CAPACITY * 4)
+        {
+            run.publish_controller_event(SourceEvent::Level {
+                epoch: run.epoch(),
+                source,
+                asserted,
+            })
+            .expect("repeated level state must not consume another queue slot");
+        }
+        let events = run.drain_controller_events();
+
+        assert_eq!(
+            events,
+            vec![SourceEvent::Level {
+                epoch: run.epoch(),
+                source,
+                asserted: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn level_ingress_keeps_capacity_bound_for_distinct_sources() {
+        let run = run_signals(1);
+        for source in 0..CONTROLLER_EVENT_CAPACITY {
+            run.publish_controller_event(SourceEvent::Level {
+                epoch: run.epoch(),
+                source: InterruptSourceId::new(InterruptControllerId::new(0), source as u32, None),
+                asserted: true,
+            })
+            .expect("distinct level sources should fill the fixed queue");
+        }
+
+        assert_eq!(
+            run.publish_controller_event(SourceEvent::Level {
+                epoch: run.epoch(),
+                source: InterruptSourceId::new(
+                    InterruptControllerId::new(0),
+                    CONTROLLER_EVENT_CAPACITY as u32,
+                    None,
+                ),
+                asserted: true,
+            }),
+            Err(SignalError::Capacity)
+        );
     }
 
     /// A parked/stopped execution must return to its owner; an admitted one with

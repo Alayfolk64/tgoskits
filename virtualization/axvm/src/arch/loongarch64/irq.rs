@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use ax_std::os::arceos::sync::RawSpinLock;
@@ -27,7 +27,10 @@ use axvm_types::InterruptTriggerMode;
 
 use crate::{
     AxVmResult, RunId, ax_err,
-    irq::model::{PendingVcpuInterrupt, VirtualInterruptId},
+    irq::model::{
+        InterruptControllerEndpoint, InterruptControllerOwner, InterruptSourceId,
+        PendingVcpuInterrupt, SourceEvent, VirtualInterruptId,
+    },
     runtime::QueuedVcpuInterrupt,
     services::{RunSignals, SignalError},
     sync::MutexExt,
@@ -75,8 +78,7 @@ impl LoongArchRunPort {
         vcpu_id: usize,
         interrupt: PendingVcpuInterrupt,
     ) -> Result<(), SignalError> {
-        self.signals.publish_queued(vcpu_id, interrupt.into())?;
-        self.wake_recorded(vcpu_id)
+        self.publish_queued(vcpu_id, interrupt.into())
     }
 
     /// Publishes one queued source from hard-IRQ context.
@@ -85,8 +87,7 @@ impl LoongArchRunPort {
         vcpu_id: usize,
         interrupt: QueuedVcpuInterrupt,
     ) -> Result<(), SignalError> {
-        self.signals.publish_queued(vcpu_id, interrupt)?;
-        self.wake_recorded(vcpu_id)
+        self.publish_queued(vcpu_id, interrupt)
     }
 
     /// Publishes one EIOINTC output vector produced by guest MMIO handling.
@@ -95,22 +96,36 @@ impl LoongArchRunPort {
         vcpu_id: usize,
         vector: usize,
     ) -> Result<(), SignalError> {
-        self.signals
-            .publish_queued(vcpu_id, QueuedVcpuInterrupt::External { vector })?;
-        self.wake_recorded(vcpu_id)
+        self.publish_queued(vcpu_id, QueuedVcpuInterrupt::External { vector })
+    }
+
+    fn publish_queued(
+        &self,
+        vcpu_id: usize,
+        interrupt: QueuedVcpuInterrupt,
+    ) -> Result<(), SignalError> {
+        match self.signals.publish_queued(vcpu_id, interrupt) {
+            // Closing admission retires this run. A late callback cannot
+            // reach a successor and therefore completes without a delivery
+            // error; all other publication errors remain visible.
+            Ok(()) => self.wake_recorded(vcpu_id),
+            Err(SignalError::Closed) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Completes a publication whose source is already in the run's fixed queue.
     ///
     /// [`RunSignals::publish_queued`] is the only step that records the source:
-    /// when it rejects the publication nothing is pending and no later owner
-    /// entry can observe it, so its error is reported to the caller instead of
-    /// being presented as delivery. Once it returns, the queue owns the record;
-    /// a target activation that retired before this wake leaves the source
-    /// pending for its successor, so a skipped wake is not a delivery failure.
+    /// a closed run has already retired its admission window, so a late
+    /// publication is complete without a wake. Other rejected publications
+    /// leave no pending source and remain errors. Once publication returns, the
+    /// queue owns the record; a target activation that retired before this wake
+    /// leaves the source pending for its successor, so a skipped wake is not a
+    /// delivery failure.
     fn wake_recorded(&self, vcpu_id: usize) -> Result<(), SignalError> {
         match self.signals.kick_from_irq(vcpu_id) {
-            Ok(()) | Err(SignalError::InactiveTarget) => Ok(()),
+            Ok(()) | Err(SignalError::InactiveTarget | SignalError::Closed) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -126,6 +141,7 @@ impl LoongArchRunPort {
         Ok(PendingVcpuInterrupt {
             id: VirtualInterruptId(id),
             trigger: InterruptTriggerMode::EdgeTriggered,
+            source: None,
         })
     }
 }
@@ -206,14 +222,16 @@ pub(crate) struct LoongArchPchPicRuntime {
     pic: Arc<LoongArchPchPic>,
     run: LoongArchRunBinding,
     inputs: Mutex<BTreeMap<usize, (InterruptTriggerMode, WiredIrqInput)>>,
+    runtime: Weak<Self>,
 }
 
 impl LoongArchPchPicRuntime {
     fn new(pic: Arc<LoongArchPchPic>, run: LoongArchRunBinding) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|runtime| Self {
             pic,
             run,
             inputs: Mutex::new(BTreeMap::new()),
+            runtime: runtime.clone(),
         })
     }
 
@@ -241,7 +259,7 @@ impl VirtualInterruptController for LoongArchPchPicRuntime {
         if input.value() >= PCH_PIC_INPUT_COUNT {
             return Err(IrqError::InvalidInput {
                 endpoint: InterruptEndpoint::Wired {
-                    controller: self.id(),
+                    controller: <Self as VirtualInterruptController>::id(self),
                     input,
                 },
                 operation: "open LoongArch PCH-PIC input",
@@ -258,7 +276,7 @@ impl VirtualInterruptController for LoongArchPchPicRuntime {
             if *registered_trigger != trigger {
                 return Err(IrqError::InvalidInput {
                     endpoint: InterruptEndpoint::Wired {
-                        controller: self.id(),
+                        controller: <Self as VirtualInterruptController>::id(self),
                         input,
                     },
                     operation: "open LoongArch PCH-PIC input",
@@ -274,10 +292,144 @@ impl VirtualInterruptController for LoongArchPchPicRuntime {
         let sink: Arc<dyn WiredIrqSink> = Arc::new(LoongArchPchPicIrqSink {
             pic: Arc::clone(&self.pic),
             run: Arc::clone(&self.run),
+            runtime: self.runtime.clone(),
         });
-        let registered = WiredIrqInput::new(self.id(), input, trigger, sink);
+        let registered = WiredIrqInput::new(
+            <Self as VirtualInterruptController>::id(self),
+            input,
+            trigger,
+            sink,
+        );
         inputs.insert(input.value(), (trigger, registered.clone()));
         Ok(registered)
+    }
+}
+
+impl InterruptControllerEndpoint for LoongArchPchPicRuntime {
+    type Error = crate::AxVmError;
+
+    fn id(&self) -> InterruptControllerId {
+        <Self as VirtualInterruptController>::id(self)
+    }
+
+    fn wired_input(
+        &self,
+        input: ControllerInputId,
+        trigger: InterruptTriggerMode,
+    ) -> IrqResult<WiredIrqInput> {
+        <Self as VirtualInterruptController>::wired_input(self, input, trigger)
+    }
+
+    fn submit(&self, event: SourceEvent) -> crate::AxVmResult {
+        let epoch = match event {
+            SourceEvent::Pulse { epoch, .. }
+            | SourceEvent::Level { epoch, .. }
+            | SourceEvent::Eoi { epoch, .. } => epoch,
+        };
+        let Some(port) = self.run.current() else {
+            return Err(crate::AxVmError::StaleRun {
+                expected: epoch.run(),
+                current: None,
+            });
+        };
+        if port.signals.epoch() != epoch {
+            return Err(crate::AxVmError::StaleRun {
+                expected: epoch.run(),
+                current: Some(port.signals.run_id()),
+            });
+        }
+        match port.signals.publish_controller_event(event) {
+            Ok(()) | Err(SignalError::Closed) => Ok(()),
+            Err(error) => Err(crate::AxVmError::interrupt(
+                "queue LoongArch interrupt event",
+                error,
+            )),
+        }
+    }
+}
+
+impl InterruptControllerOwner for LoongArchPchPicRuntime {
+    type Error = crate::AxVmError;
+
+    fn apply_source(&self, event: SourceEvent) -> crate::AxVmResult {
+        let epoch = match event {
+            SourceEvent::Pulse { epoch, .. }
+            | SourceEvent::Level { epoch, .. }
+            | SourceEvent::Eoi { epoch, .. } => epoch,
+        };
+        let Some(port) = self.run.current() else {
+            // Teardown clears the exact run port before late mailbox events
+            // are necessarily consumed. A retired event cannot reach a new
+            // run and is therefore already complete.
+            return Ok(());
+        };
+        if port.signals.epoch() != epoch {
+            return Err(crate::AxVmError::StaleRun {
+                expected: epoch.run(),
+                current: Some(port.signals.run_id()),
+            });
+        }
+        let source = match event {
+            SourceEvent::Pulse { source, .. } | SourceEvent::Level { source, .. } => source,
+            SourceEvent::Eoi { token, .. } => token.source,
+        };
+        if source.controller != <Self as InterruptControllerEndpoint>::id(self) {
+            return Err(crate::AxVmError::invalid_input(
+                "submit LoongArch interrupt",
+                "source belongs to another controller",
+            ));
+        }
+        let input = usize::try_from(source.source).map_err(|_| {
+            crate::AxVmError::invalid_input(
+                "submit LoongArch interrupt",
+                "source does not fit usize",
+            )
+        })?;
+        if input >= PCH_PIC_INPUT_COUNT {
+            return Err(crate::AxVmError::invalid_input(
+                "submit LoongArch interrupt",
+                "source is outside the PCH-PIC range",
+            ));
+        }
+        match event {
+            SourceEvent::Pulse { .. } => {
+                if let Some(vector) = self.pic.set_irq_level(input, true) {
+                    match port.publish_external(EXTERNAL_TARGET_VCPU, vector) {
+                        Ok(()) | Err(SignalError::Closed) => {}
+                        Err(error) => {
+                            return Err(crate::AxVmError::interrupt(
+                                "publish LoongArch interrupt",
+                                error,
+                            ));
+                        }
+                    }
+                }
+                self.pic.set_irq_level(input, false);
+            }
+            SourceEvent::Level { asserted, .. } => {
+                let vector = self.pic.set_irq_level(input, asserted);
+                if asserted && let Some(vector) = vector {
+                    match port.publish_external(EXTERNAL_TARGET_VCPU, vector) {
+                        Ok(()) | Err(SignalError::Closed) => {}
+                        Err(error) => {
+                            return Err(crate::AxVmError::interrupt(
+                                "publish LoongArch level interrupt",
+                                error,
+                            ));
+                        }
+                    }
+                }
+            }
+            SourceEvent::Eoi { token, .. } => {
+                if token.target.run != epoch.run {
+                    return Err(crate::AxVmError::invalid_input(
+                        "complete LoongArch interrupt",
+                        "delivery token belongs to another run",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -285,10 +437,37 @@ impl VirtualInterruptController for LoongArchPchPicRuntime {
 struct LoongArchPchPicIrqSink {
     pic: Arc<LoongArchPchPic>,
     run: LoongArchRunBinding,
+    runtime: Weak<LoongArchPchPicRuntime>,
 }
 
 impl WiredIrqSink for LoongArchPchPicIrqSink {
     fn set_level(&self, input: ControllerInputId, asserted: bool) -> IrqResult {
+        if let Some(runtime) = self.runtime.upgrade()
+            && let Some(port) = runtime.run.current()
+        {
+            return InterruptControllerEndpoint::submit(
+                runtime.as_ref(),
+                SourceEvent::Level {
+                    epoch: port.signals.epoch(),
+                    source: InterruptSourceId::new(
+                        <LoongArchPchPicRuntime as VirtualInterruptController>::id(
+                            runtime.as_ref(),
+                        ),
+                        input.value() as u32,
+                        None,
+                    ),
+                    asserted,
+                },
+            )
+            .map_err(|error| IrqError::Backend {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: InterruptControllerId::new(0),
+                    input,
+                },
+                operation: "submit LoongArch PCH-PIC level event",
+                detail: format!("{error}"),
+            });
+        }
         let vector = self.pic.set_irq_level(input.value(), asserted);
         if !asserted {
             return Ok(());
@@ -314,6 +493,31 @@ impl WiredIrqSink for LoongArchPchPicIrqSink {
     }
 
     fn pulse(&self, input: ControllerInputId) -> IrqResult {
+        if let Some(runtime) = self.runtime.upgrade()
+            && let Some(port) = runtime.run.current()
+        {
+            return InterruptControllerEndpoint::submit(
+                runtime.as_ref(),
+                SourceEvent::Pulse {
+                    epoch: port.signals.epoch(),
+                    source: InterruptSourceId::new(
+                        <LoongArchPchPicRuntime as VirtualInterruptController>::id(
+                            runtime.as_ref(),
+                        ),
+                        input.value() as u32,
+                        None,
+                    ),
+                },
+            )
+            .map_err(|error| IrqError::Backend {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: InterruptControllerId::new(0),
+                    input,
+                },
+                operation: "submit LoongArch PCH-PIC pulse event",
+                detail: format!("{error}"),
+            });
+        }
         self.set_level(input, true)?;
         self.set_level(input, false)
     }
