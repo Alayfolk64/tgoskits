@@ -4,7 +4,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::Ordering,
     task::{Context, Poll},
 };
 
@@ -112,7 +112,6 @@ struct CapacityWaiter {
 /// still cannot fit hands unused capacity to smaller waiters before sleeping.
 pub(super) struct CapacityWaiters {
     waiters: RawSpinLock<Vec<CapacityWaiter>>,
-    count: AtomicUsize,
     #[cfg(test)]
     registration_hook: RawSpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -123,7 +122,6 @@ impl CapacityWaiters {
     pub(super) const fn new() -> Self {
         Self {
             waiters: RawSpinLock::new(Vec::new()),
-            count: AtomicUsize::new(0),
             #[cfg(test)]
             registration_hook: RawSpinLock::new(None),
             #[cfg(test)]
@@ -143,7 +141,6 @@ impl CapacityWaiters {
                 required,
                 notification: Arc::clone(&notification),
             });
-            self.count.store(waiters.len(), Ordering::Release);
         }
         #[cfg(test)]
         self.run_registration_hook();
@@ -178,7 +175,6 @@ impl CapacityWaiters {
                     index += 1;
                 }
             }
-            self.count.store(waiters.len(), Ordering::Release);
             notifications
         };
         for notification in notifications {
@@ -187,12 +183,7 @@ impl CapacityWaiters {
     }
 
     pub(super) fn notify_all(&self) {
-        let waiters = {
-            let mut waiters = self.waiters.lock_irqsave();
-            let detached = core::mem::take(&mut *waiters);
-            self.count.store(0, Ordering::Release);
-            detached
-        };
+        let waiters = core::mem::take(&mut *self.waiters.lock_irqsave());
         #[cfg(test)]
         self.run_detach_hook();
         for waiter in waiters {
@@ -207,13 +198,12 @@ impl CapacityWaiters {
             .position(|waiter| Arc::ptr_eq(&waiter.notification, notification))
         {
             waiters.remove(index);
-            self.count.store(waiters.len(), Ordering::Release);
         }
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.count.load(Ordering::Acquire)
+        self.waiters.lock_irqsave().len()
     }
 
     #[cfg(test)]
@@ -256,6 +246,7 @@ mod tests {
     use alloc::sync::Arc;
     use core::{
         future::Future,
+        sync::atomic::AtomicUsize,
         task::{Context, Poll, Waker},
     };
     use std::{sync::mpsc, task::Wake, time::Duration};
@@ -281,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn available_capacity_notifies_registered_waiter_when_count_is_stale() {
+    fn available_capacity_notifies_registered_waiter() {
         let registry = CapacityWaiters::new();
         let notification = Arc::new(CountingNotification {
             wakes: AtomicUsize::new(0),
@@ -291,9 +282,6 @@ mod tests {
             notification: notification.clone(),
         });
 
-        // A count load may still observe zero after registration has stored
-        // one, so the notification path must inspect the locked queue.
-        registry.count.store(0, Ordering::Relaxed);
         registry.notify_available(1);
         assert_eq!(notification.wakes.load(Ordering::Relaxed), 1);
         assert!(registry.waiters.lock_irqsave().is_empty());
@@ -309,7 +297,6 @@ mod tests {
             required: 1,
             notification: first.clone(),
         });
-        registry.count.store(1, Ordering::Release);
 
         let second = Arc::new(CountingNotification {
             wakes: AtomicUsize::new(0),
@@ -322,7 +309,6 @@ mod tests {
                 required: 1,
                 notification: second_notification,
             });
-            publisher.count.store(waiters.len(), Ordering::Release);
         });
 
         registry.notify_all();
