@@ -11,8 +11,8 @@ use crate::{
     StarryError, StarryResult,
     file::get_file_like,
     mm::{
-        HugePageAdvice, MappingOperation, MappingPublication, MemlockLimit, SharedMemoryObject,
-        VmaAccessPattern, VmaAdviceUpdate, VmaLockMode, VmaMremapSource,
+        HugePageAdvice, MappingOperation, MappingPublication, MemlockLimit, PopulateAccess,
+        SharedMemoryObject, VmaAccessPattern, VmaAdviceUpdate, VmaLockMode, VmaMremapSource,
     },
     pseudofs::{Device, DeviceMmap},
     syscall::fs::{memfd_check_write_seal, memfd_check_write_seal_for_shared_file_backend},
@@ -1386,12 +1386,12 @@ pub fn sys_madvise(
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
         | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_HUGEPAGE | MADV_NOHUGEPAGE
         | MADV_DONTDUMP | MADV_DODUMP | MADV_PAGEOUT | MADV_DONTNEED_LOCKED | MADV_WIPEONFORK
-        | MADV_KEEPONFORK => {}
+        | MADV_KEEPONFORK | MADV_POPULATE_READ | MADV_POPULATE_WRITE => {}
         // Recognized Linux advice values without a Starry implementation must
         // be visible to callers.  Returning EOPNOTSUPP prevents an accidental
         // successful no-op from being mistaken for reclaim, THP, or poisoning.
-        MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_MERGEABLE | MADV_UNMERGEABLE
-        | MADV_COLD | MADV_COLLAPSE | MADV_HWPOISON | MADV_SOFT_OFFLINE => {
+        MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_COLD | MADV_COLLAPSE | MADV_HWPOISON
+        | MADV_SOFT_OFFLINE => {
             return Err(StarryError::OperationNotSupported);
         }
         _ => return Err(StarryError::InvalidInput),
@@ -1415,6 +1415,22 @@ pub fn sys_madvise(
     let aspace_arc = curr.as_thread().proc_data.pin_aspace()?;
     let mut cursor = start_va;
     let mut saw_gap = false;
+
+    if matches!(advice as u32, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
+        let access = if advice as u32 == MADV_POPULATE_WRITE {
+            PopulateAccess::Write
+        } else {
+            PopulateAccess::Read
+        };
+        aspace_arc.populate_advised_range(VirtAddrRange::new(start_va, end), access, || {
+            current
+                .as_thread()
+                .signal()
+                .pending()
+                .has(starry_signal::Signo::SIGKILL)
+        })?;
+        return Ok(0);
+    }
 
     if advice as u32 == MADV_REMOVE {
         while cursor < end {
