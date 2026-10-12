@@ -170,8 +170,12 @@ impl X86LocalApic {
     }
 
     /// Sends a fixed IPI with `vector` to the CPU whose APIC id is
-    /// `dest_apic_id`; in xAPIC mode it then waits for the local APIC to
-    /// accept the command.
+    /// `dest_apic_id`. In xAPIC mode, it waits for the local ICR delivery
+    /// status to clear before writing and again after issuing this command.
+    /// This reports local ICR status, not execution of the remote interrupt
+    /// handler. A timeout can occur before this command is written or after
+    /// publication; a post-write timeout does not mean the IPI was not
+    /// delivered.
     ///
     /// Fails with [`ApicError::XapicDestinationOverflow`] on xAPIC systems
     /// whose destination id does not fit the 8-bit ICR-high field.
@@ -191,6 +195,7 @@ impl X86LocalApic {
             ApicMode::XApic => {
                 let destination = xapic_destination(dest_apic_id)?;
                 let icr_low = ICR_FIXED_LEVEL | u32::from(vector);
+                self.wait_ipi_delivery()?;
                 unsafe {
                     write_xapic_icr(self.xapic_mmio_base, destination, icr_low);
                 }
@@ -201,9 +206,13 @@ impl X86LocalApic {
 
     /// Sends a fixed self-IPI with `vector` to the current CPU.
     ///
-    /// Uses the x2APIC self-IPI register when available (delivery is
-    /// immediate by definition, so no delivery wait applies) and the xAPIC
-    /// self-shorthand ICR otherwise, followed by a delivery wait.
+    /// Uses the x2APIC self-IPI register when available and returns after
+    /// issuing it, or the xAPIC self-shorthand ICR otherwise. The xAPIC path
+    /// waits for the local ICR delivery status to clear before writing and
+    /// again afterward. Neither path waits for the interrupt handler to
+    /// execute. On xAPIC, a timeout may occur before the command is written or
+    /// after publication; a post-write timeout does not mean the IPI was not
+    /// delivered.
     pub fn send_self_ipi(&self, vector: u8) -> Result<(), ApicError> {
         if self.runtime_mode() == ApicMode::X2Apic {
             unsafe {
@@ -211,9 +220,10 @@ impl X86LocalApic {
             }
             return Ok(());
         }
+        self.wait_ipi_delivery()?;
         let icr_low = ICR_FIXED_LEVEL | ICR_DEST_SELF | u32::from(vector);
         unsafe {
-            clear_esr(self.xapic_mmio_base);
+            clear_esr(self.xapic_mmio_base, self.runtime_mode());
             write_xapic_icr(self.xapic_mmio_base, 0, icr_low);
         }
         self.wait_ipi_delivery()
@@ -303,9 +313,9 @@ impl X86LocalApic {
         }
     }
 
-    /// Spins until the last IPI has been accepted by the local APIC, matching
-    /// the delivery-status wait the previous in-glue implementations
-    /// performed after every ICR write.
+    /// Spins until the xAPIC has no pending ICR command. The send paths use
+    /// this before writing so a busy ICR is never overwritten, and afterward
+    /// to wait for the local ICR delivery-status bit to clear.
     fn wait_ipi_delivery(&self) -> Result<(), ApicError> {
         // x2APIC reserves the delivery-status bit, so only the xAPIC command
         // register has a pending state to poll.
@@ -475,10 +485,11 @@ unsafe fn write_x2apic_icr(value: u64) {
 }
 
 /// Clears the error status register by writing zero, the documented
-/// clear-to-zero semantics of the ESR.
-unsafe fn clear_esr(base: VirtAddr) {
+/// clear-to-zero semantics of the ESR, through the mode selected for this
+/// local APIC handle.
+unsafe fn clear_esr(base: VirtAddr, mode: ApicMode) {
     unsafe {
-        match current_apic_mode() {
+        match mode {
             ApicMode::X2Apic => x86::msr::wrmsr(X2APIC_ESR, 0),
             ApicMode::XApic => mmio_write(base, XAPIC_REG_ESR, 0),
         }
@@ -607,6 +618,72 @@ mod tests {
     }
 
     #[test]
+    fn xapic_timeout_does_not_overwrite_a_pending_command() {
+        // The backing page makes the old write-first sequence overwrite the
+        // busy bit before its post-write wait can observe it.
+        let mut registers = mock_xapic_registers();
+        let icr_high = (XAPIC_REG_ICR_HIGH / 4) as usize;
+        let icr_low = (XAPIC_REG_ICR_LOW / 4) as usize;
+        registers[icr_high] = 0xa500_0000;
+        registers[icr_low] = ICR_DELIVERY_STATUS | ICR_FIXED_LEVEL | 0x41;
+
+        let local_apic = mock_xapic_local_apic(&mut registers);
+
+        assert_eq!(
+            local_apic.send_fixed_ipi(0x2a, 0xf1),
+            Err(ApicError::IpiDeliveryTimeout)
+        );
+        assert_eq!(registers[icr_high], 0xa500_0000);
+        assert_eq!(
+            registers[icr_low],
+            ICR_DELIVERY_STATUS | ICR_FIXED_LEVEL | 0x41
+        );
+    }
+
+    #[test]
+    fn xapic_self_ipi_timeout_does_not_overwrite_a_pending_command() {
+        let mut registers = mock_xapic_registers();
+        let esr = (XAPIC_REG_ESR / 4) as usize;
+        let icr_high = (XAPIC_REG_ICR_HIGH / 4) as usize;
+        let icr_low = (XAPIC_REG_ICR_LOW / 4) as usize;
+        registers[esr] = 0x5a5a_1234;
+        registers[icr_high] = 0xa500_0000;
+        registers[icr_low] = ICR_DELIVERY_STATUS | ICR_FIXED_LEVEL | 0x41;
+
+        let local_apic = mock_xapic_local_apic(&mut registers);
+
+        assert_eq!(
+            local_apic.send_self_ipi(0xf1),
+            Err(ApicError::IpiDeliveryTimeout)
+        );
+        assert_eq!(registers[icr_high], 0xa500_0000);
+        assert_eq!(
+            registers[icr_low],
+            ICR_DELIVERY_STATUS | ICR_FIXED_LEVEL | 0x41
+        );
+        assert_eq!(registers[esr], 0x5a5a_1234);
+    }
+
+    #[test]
+    fn idle_xapic_fixed_and_self_ipis_publish_expected_icr_fields() {
+        let mut registers = mock_xapic_registers();
+        let esr = (XAPIC_REG_ESR / 4) as usize;
+        let icr_high = (XAPIC_REG_ICR_HIGH / 4) as usize;
+        let icr_low = (XAPIC_REG_ICR_LOW / 4) as usize;
+        let local_apic = mock_xapic_local_apic(&mut registers);
+
+        local_apic.send_fixed_ipi(0x2a, 0xf1).unwrap();
+        assert_eq!(registers[icr_high], 0x2a00_0000);
+        assert_eq!(registers[icr_low], ICR_FIXED_LEVEL | 0xf1);
+
+        registers[esr] = 0x5a5a_1234;
+        local_apic.send_self_ipi(0xf2).unwrap();
+        assert_eq!(registers[esr], 0);
+        assert_eq!(registers[icr_high], 0);
+        assert_eq!(registers[icr_low], ICR_FIXED_LEVEL | ICR_DEST_SELF | 0xf2);
+    }
+
+    #[test]
     fn runtime_operations_use_the_cached_apic_mode() {
         assert_eq!(
             runtime_access(ApicMode::XApic),
@@ -654,5 +731,24 @@ mod tests {
         assert!(requires_timer_mask_fence(ApicMode::XApic, true));
         assert!(!requires_timer_mask_fence(ApicMode::XApic, false));
         assert!(!requires_timer_mask_fence(ApicMode::X2Apic, true));
+    }
+
+    fn mock_xapic_registers() -> [u32; 256] {
+        [0; 256]
+    }
+
+    fn mock_xapic_local_apic(registers: &mut [u32; 256]) -> X86LocalApic {
+        X86LocalApic {
+            config: LocalApicConfig {
+                timer_vector: 32,
+                error_vector: 33,
+                spurious_vector: 255,
+                timer_mode: TimerMode::OneShot,
+                timer_divide: TimerDivide::Div1,
+                timer_initial: 0,
+            },
+            xapic_mmio_base: VirtAddr::new(registers.as_mut_ptr() as usize),
+            access: runtime_access(ApicMode::XApic),
+        }
     }
 }
