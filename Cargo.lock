@@ -513,6 +513,7 @@ dependencies = [
  "axklib",
  "dma-api",
  "embedded-graphics",
+ "intel-itco-watchdog",
  "libc",
  "mmio-api",
  "rand 0.8.8",
@@ -4524,6 +4525,13 @@ dependencies = [
  "dma-api",
  "mmio-api",
  "rdif-audio",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "intel-itco-watchdog"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.21",
 ]
 
