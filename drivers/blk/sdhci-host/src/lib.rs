@@ -194,7 +194,7 @@ enum BusRequestState {
     PowerOff,
     SetClock(SdhciClockState),
     SetBusWidth(BusWidth),
-    SetSignalVoltage(SdhciVoltageState),
+    SetSignalVoltage(SdhciVoltageState, VoltageProtocol),
     ExecuteTuning(SdhciTuningState),
 }
 
@@ -213,7 +213,8 @@ enum SdhciClockState {
     ExternalStart {
         target_hz: u32,
     },
-    ExternalEnable {
+    ExternalWaitStable {
+        target_hz: u32,
         deadline_ns: u64,
     },
     InternalWaitStable {
@@ -223,24 +224,48 @@ enum SdhciClockState {
 
 enum SdhciVoltageState {
     DisableClock(SignalVoltage),
-    SwitchControllerAndRail(SignalVoltage),
+    SelectSignaling(SignalVoltage),
     WaitVsw {
         voltage: SignalVoltage,
         deadline_ms: Option<u64>,
     },
     EnableClock(SignalVoltage),
-    VerifyDatLines(SignalVoltage),
+    VerifyDatLines {
+        voltage: SignalVoltage,
+        deadline_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VoltageProtocol {
+    Direct,
+    SdCmd11,
 }
 
 enum SdhciTuningState {
-    Start { cmd_index: u8, block_size: u16 },
-    Wait { cmd_index: u8, polls: u32 },
+    Start {
+        cmd_index: u8,
+        block_size: u16,
+    },
+    Wait {
+        cmd_index: u8,
+        block_size: u16,
+        remaining: u8,
+        deadline_ms: u64,
+    },
+    Delay {
+        cmd_index: u8,
+        block_size: u16,
+        remaining: u8,
+        deadline_ms: u64,
+    },
 }
 
 const SDHCI_RESET_POLLS: u32 = 1_000;
 // Linux `sdhci_enable_clk()` bounds this transition by monotonic elapsed time.
 const SDHCI_CLOCK_TIMEOUT_NS: u64 = 150_000_000;
-const SDHCI_TUNING_POLLS: u32 = 1_000_000;
+const SDHCI_TUNING_ATTEMPTS: u8 = 40;
+const SDHCI_TUNING_TIMEOUT_MS: u64 = 50;
 const SDHCI_VOLTAGE_SWITCH_DELAY_MS: u64 = 5;
 const SDHCI_REGISTER_RETRY_DELAY: Duration = Duration::from_micros(100);
 
