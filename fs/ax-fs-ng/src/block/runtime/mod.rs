@@ -2,12 +2,14 @@ mod channel;
 mod completion;
 mod dma;
 mod hctx;
+mod io_stats;
 mod irq;
 mod lifecycle;
 mod metrics;
 mod waiters;
 
 pub use completion::{CompletionGroup, CompletionSubscription};
+pub use io_stats::BlockIoStats;
 pub use irq::BlockIrqAction;
 pub use lifecycle::{
     BlockDeviceHandle, BlockIrqSource, BlockRuntime, RdifBlockDevice, RdifBlockGroup,

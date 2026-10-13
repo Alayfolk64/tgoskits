@@ -22,6 +22,7 @@ pub struct CompletionGroup {
 
 pub(super) struct CompletionSender {
     cell: Arc<CompletionCell>,
+    accounting: Option<super::io_stats::RequestAccounting>,
 }
 
 struct CompletionCell {
@@ -77,7 +78,10 @@ impl CompletionSubscription {
             Self {
                 cell: Arc::clone(&cell),
             },
-            CompletionSender { cell },
+            CompletionSender {
+                cell,
+                accounting: None,
+            },
         )
     }
 
@@ -249,7 +253,20 @@ impl Drop for CompletionSubscription {
 }
 
 impl CompletionSender {
-    pub(super) fn complete(self, request: CompletedRequest) {
+    pub(super) fn account(&mut self, accounting: super::io_stats::RequestAccounting) {
+        self.accounting = Some(accounting);
+    }
+
+    pub(super) fn start_io(&mut self) {
+        if let Some(accounting) = self.accounting.as_mut() {
+            accounting.start();
+        }
+    }
+
+    pub(super) fn complete(mut self, request: CompletedRequest) {
+        if let Some(accounting) = self.accounting.as_mut() {
+            accounting.finish(request.result.is_err());
+        }
         let unclaimed = {
             let mut state = self.cell.state.lock_irqsave();
             if state.receiver_alive {
@@ -524,6 +541,39 @@ mod tests {
         .prepare_for_device()
         .complete_without_device();
         CompletedRequest::new(RequestId::new(id), Ok(()), Some(data))
+    }
+
+    #[test]
+    fn io_accounting_outlives_cancelled_receiver_and_ignores_unsubmitted_drop() {
+        use rdif_block::RequestOp;
+
+        use super::super::io_stats::{DeviceIoMetrics, RequestAccounting};
+
+        let metrics = Arc::new(DeviceIoMetrics::default());
+        let (receiver, mut sender) = pair();
+        sender.account(RequestAccounting::new(
+            Arc::clone(&metrics),
+            RequestOp::Read,
+            8,
+        ));
+        sender.start_io();
+        drop(receiver);
+        assert_eq!(metrics.snapshot().inflight, 1);
+        sender.complete(completed(1));
+        let stats = metrics.snapshot();
+        assert_eq!((stats.inflight, stats.reads, stats.sectors_read), (0, 1, 8));
+        assert_eq!(stats.failed_requests, 0);
+
+        let (receiver, mut sender) = pair();
+        sender.account(RequestAccounting::new(
+            Arc::clone(&metrics),
+            RequestOp::Write,
+            8,
+        ));
+        drop(receiver);
+        drop(sender);
+        assert_eq!(metrics.snapshot().writes, 0);
+        assert_eq!(metrics.snapshot().inflight, 0);
     }
 
     #[derive(Default)]

@@ -42,7 +42,7 @@ pub use block::sync_all_block_caches;
 pub use block::{
     BlockRegion,
     runtime::{
-        BlockBatchStats, BlockDeviceHandle, CompletionGroup, CompletionSubscription,
+        BlockBatchStats, BlockDeviceHandle, BlockIoStats, CompletionGroup, CompletionSubscription,
         block_batch_stats, block_io_stats, release_block_irqs_for_passthrough,
     },
 };

@@ -5,6 +5,7 @@ pub(super) fn barrier_test_inner() -> Arc<DeviceInner> {
     let controller_notification = ops.notification();
     Arc::new(DeviceInner {
         name: String::from("barrier-test"),
+        io_metrics: Arc::default(),
         device_info: RawSpinLock::new(DeviceInfoEpoch::new(test_queue_info().device)),
         max_io_queues: 1,
         irq_sources: Vec::new(),

@@ -872,6 +872,7 @@ impl Drop for BlockDeviceHandle {
 
 struct DeviceInner {
     name: String,
+    io_metrics: Arc<super::io_stats::DeviceIoMetrics>,
     device_info: RawSpinLock<DeviceInfoEpoch>,
     max_io_queues: usize,
     irq_sources: Vec<BlockIrqSource>,
@@ -1047,6 +1048,7 @@ impl BlockDeviceHandle {
         });
         let inner = Arc::new(DeviceInner {
             name,
+            io_metrics: Arc::new(super::io_stats::DeviceIoMetrics::default()),
             device_info: RawSpinLock::new(DeviceInfoEpoch::new(info)),
             max_io_queues,
             irq_sources: irqs,
@@ -1121,6 +1123,11 @@ impl BlockDeviceHandle {
 
     pub fn device_info(&self) -> DeviceInfo {
         self.inner.published_device_info()
+    }
+
+    /// Snapshots this physical device's dispatch-to-completion counters.
+    pub fn io_stats(&self) -> super::io_stats::BlockIoStats {
+        self.inner.io_metrics.snapshot()
     }
 
     /// Returns the installed device list for the Starry kernel axtest target.
@@ -1392,9 +1399,14 @@ impl BlockDeviceHandle {
             return Err(BatchSubmitError::new(BlkError::NoMemory, requests));
         }
         for request in requests {
-            let completion = completions
+            let mut completion = completions
                 .pop_front()
                 .expect("completion sender count matches request batch");
+            completion.account(super::io_stats::RequestAccounting::new(
+                Arc::clone(&self.inner.io_metrics),
+                request.op,
+                sectors_for_blocks(info.device.logical_block_size, request.block_count),
+            ));
             submissions.push_back(Submission {
                 request,
                 completion,

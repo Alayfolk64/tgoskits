@@ -101,6 +101,11 @@ pub(super) fn submit_available(
             && context.scratch.accepted.ids.len() == removed;
 
         if removed != 0 {
+            // Charge only the driver-owned prefix, before publishing it to
+            // hardware. Requests returned for retry remain unaccounted.
+            for metadata in context.scratch.metadata.iter_mut().take(removed) {
+                metadata.completion.start_io();
+            }
             let commit_result = queue.commit_submissions();
             super::super::metrics::record_commit(commit_result);
             if commit_result.is_err() {
@@ -245,12 +250,10 @@ fn reconcile_submission_batch(
 ) -> bool {
     let mut ownership_valid = accepted_ids.len() == removed && removed <= metadata.len();
     for index in 0..removed.min(metadata.len()) {
-        let request = pending_from_metadata(
-            metadata
-                .pop_front()
-                .expect("removed request metadata count was checked"),
-            context.deadline,
-        );
+        let metadata = metadata
+            .pop_front()
+            .expect("removed request metadata count was checked");
+        let request = pending_from_metadata(metadata, context.deadline);
         let Some(id) = accepted_ids.get(index).copied() else {
             context.protocol_failed.push(request);
             ownership_valid = false;

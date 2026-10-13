@@ -544,15 +544,19 @@ fn render_proc_net_snmp() -> String {
 }
 
 fn render_diskstats() -> String {
-    // 14-field Linux /proc/diskstats layout, one line per block device. Only the
-    // selected root device is backed by the block runtime, so only its
-    // request/sector counters are real; timing and in-flight fields have no
-    // source and stay zero.
-    let identity = ax_fs_ng::root::root_block_identity();
-    let (reads, sectors_read, writes, sectors_written) = ax_fs_ng::block_io_stats();
+    // Linux diskstats columns, in milliseconds and 512-byte sectors. This row
+    // describes the selected physical root disk. Discard and merge are not
+    // implemented; flush and all supported I/O timing fields are measured.
+    let Some((identity, stats)) = ax_fs_ng::root::root_block_stats() else {
+        return String::new();
+    };
     format!(
-        "{}       {} {} {reads} 0 {sectors_read} 0 {writes} 0 {sectors_written} 0 0 0 0\n",
-        identity.major, identity.minor, identity.name
+        "{} {} {} {} 0 {} {} {} 0 {} {} {} {} {} 0 0 0 0 {} {}\n",
+        identity.major, identity.minor, identity.name,
+        stats.reads, stats.sectors_read, stats.read_ns / 1_000_000,
+        stats.writes, stats.sectors_written, stats.write_ns / 1_000_000,
+        stats.inflight, stats.busy_ns / 1_000_000, stats.weighted_ns / 1_000_000,
+        stats.flushes, stats.flush_ns / 1_000_000,
     )
 }
 
