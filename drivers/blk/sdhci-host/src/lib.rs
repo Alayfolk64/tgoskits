@@ -8,16 +8,20 @@
 //!
 //! # Scope
 //!
-//! - **Implemented**: **ADMA2 (32-bit) transfers**, 1-bit /
-//!   4-bit / 8-bit bus, default-speed and high-speed clocking, 32-bit response
-//!   slots, 136-bit R2 reconstruction, software reset / clock setup.
-//! - **Out of scope (for now)**: 64-bit ADMA2, HS200 / SDR50 / SDR104
-//!   clocking, and tuning (CMD19 / CMD21). Protocol data commands, including
-//!   eMMC `SEND_EXT_CSD`, use the same ADMA2 path as normal block I/O. 1.8 V
-//!   signaling is wired up at the register level but is gated behind
-//!   [`Sdhci::enable_1v8_signaling`] — platforms that haven't plumbed the
-//!   IO-rail regulator MUST leave it off so the protocol layer falls back
-//!   instead of corrupting transfers.
+//! - **Implemented**: 32-bit and pre-v4 64-bit ADMA2 transfers, 1-bit /
+//!   4-bit / 8-bit buses, default/high-speed and HS200 host timing, bounded
+//!   interrupt-driven CMD19 / CMD21 tuning, response reconstruction, and
+//!   reset / clock transitions. Tuning disables DMA while the controller
+//!   consumes the tuning pattern; normal block I/O remains ADMA2-only.
+//! - **Platform responsibilities**: external clock and DLL setup, power rails,
+//!   and permission to use 1.8 V signaling. Platforms must leave
+//!   [`Sdhci::enable_1v8_signaling`] disabled until the IO-rail contract is
+//!   established; register capability alone does not prove safe signaling.
+//! - **Out of scope**: SDHCI v4 64-bit descriptor layout, HS400 timing and
+//!   enhanced strobe. V4 register-mode selection alone does not provide the
+//!   v4 64-bit transfer contract. Hardware command
+//!   queueing belongs to the separate `cqhci-host` backend; legacy SDHCI still
+//!   owns at most one data request at a time.
 //!
 //! # Usage
 //!
