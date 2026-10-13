@@ -402,6 +402,15 @@ impl MmInner {
             && self.active_mask.load(Ordering::Relaxed) == 0
     }
 
+    fn request_lazy_cpu_reclaim(&self) {
+        // Retiring excludes new pins. Once established continuations drain,
+        // remaining lazy activations must not wait for unrelated user work.
+        // Run outside lifecycle_gate: a UP runtime can release locally.
+        if self.state() == MmState::Retiring && self.kernel_pins.load(Ordering::Acquire) == 0 {
+            self.runtime_cpu_state.request_lazy_reclaim();
+        }
+    }
+
     fn maybe_retire_locked(&self) {
         if !self.is_quiescent_locked() {
             return;
@@ -669,7 +678,7 @@ pub(crate) fn pin_mm_for_rmap(id: AddressSpaceId) -> Result<MmPin, RmapMmLookupE
 /// Callers hold no MM, page graph, cached-I/O or IRQ lock. A Retiring MM may
 /// sleep only after its last kernel pin has drained: new pins require Live,
 /// so no fault continuation can need this cache layout update. Remaining CPU
-/// activations finish their scheduler handoff before reclaim can proceed.
+/// activations are actively evicted from lazy kernel CPUs before reclaim.
 pub(crate) fn pin_mm_for_cache_invalidation(
     id: AddressSpaceId,
 ) -> Result<Option<MmPin>, RmapMmLookupError> {
@@ -876,6 +885,7 @@ impl MmHandle {
 
     /// Transitions the last user owner to `Retiring` without reclaiming data.
     pub fn retire_if_quiescent(&self) -> Option<RetirePermit> {
+        self.inner.request_lazy_cpu_reclaim();
         MmInner::take_retire_permit(&self.inner)
     }
 
@@ -1362,6 +1372,7 @@ pub(super) fn lazy_free_reclaim_request_count_for_test() -> usize {
 }
 
 fn queue_if_retired(inner: &Arc<MmInner>) {
+    inner.request_lazy_cpu_reclaim();
     if let Some(permit) = MmInner::take_retire_permit(inner) {
         enqueue_retire(permit);
     }

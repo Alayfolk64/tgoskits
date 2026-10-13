@@ -1,15 +1,13 @@
 //! Runtime-owned address-space tokens and per-CPU active-mm state.
 
 use alloc::{boxed::Box, sync::Arc};
-#[cfg(feature = "uspace")]
-use core::sync::atomic::AtomicBool;
 #[cfg(feature = "qperf-metrics")]
 use core::sync::atomic::AtomicU64;
 use core::{
     marker::PhantomData,
     mem::align_of,
     ptr,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 use ax_hal::percpu::CpuPin;
@@ -160,6 +158,7 @@ pub struct AddressSpaceCpuState {
     root: usize,
     active_mask: ActiveCpuMask,
     membarrier_bits: AtomicU32,
+    lazy_reclaim_requested: AtomicBool,
 }
 
 enum ActiveCpuMask {
@@ -174,6 +173,7 @@ impl AddressSpaceCpuState {
             root: root.as_usize(),
             active_mask: ActiveCpuMask::Runtime(AtomicUsize::new(0)),
             membarrier_bits: AtomicU32::new(0),
+            lazy_reclaim_requested: AtomicBool::new(false),
         }
     }
 
@@ -184,6 +184,7 @@ impl AddressSpaceCpuState {
             root: root.as_usize(),
             active_mask: ActiveCpuMask::Mm(active_mask),
             membarrier_bits: AtomicU32::new(0),
+            lazy_reclaim_requested: AtomicBool::new(false),
         }
     }
 
@@ -200,6 +201,44 @@ impl AddressSpaceCpuState {
         match &self.active_mask {
             ActiveCpuMask::Runtime(mask) => mask.load(Ordering::Acquire),
             ActiveCpuMask::Mm(mask) => mask.load(Ordering::Acquire),
+        }
+    }
+
+    /// Requests removal of this MM from CPUs borrowing it for kernel threads.
+    ///
+    /// This allocation-free request is permanent. It does not revoke a task's
+    /// selected user MM or acknowledge completion: the ordinary activation
+    /// counters become quiescent only after each CPU switches roots and flushes
+    /// its translations. Call after ending user/pinned continuation ownership
+    /// when teardown must progress without another user task being scheduled.
+    pub fn request_lazy_reclaim(&self) {
+        let first_request = !self.lazy_reclaim_requested.swap(true, Ordering::AcqRel);
+        #[cfg(any(not(feature = "uspace"), test, feature = "host-test"))]
+        let _ = first_request;
+        #[cfg(all(feature = "uspace", not(any(test, feature = "host-test"))))]
+        if first_request {
+            #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+            {
+                // notify_cpu may select a self-directed physical IPI. Keep
+                // that CPU identity stable until all sends have completed.
+                let _preempt = crate::task::sync::PreemptGuard::new();
+                let mut cpus = self.active_mask();
+                while cpus != 0 {
+                    let cpu = cpus.trailing_zeros() as usize;
+                    cpus &= cpus - 1;
+                    match ax_ipi::notify_cpu(ax_hal::irq::CpuId(cpu)) {
+                        Ok(_) | Err(ax_hal::irq::IrqError::CpuOffline) => {}
+                        Err(error) => panic!("lazy MM reclaim notification failed: {error:?}"),
+                    }
+                }
+            }
+            #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
+            {
+                // SMP enables wake-ipi. A UP runtime can consume the same
+                // request locally, without an interrupt transport.
+                let _irq = crate::task::sync::IrqSaveGuard::new();
+                reclaim_current_lazy_address_space();
+            }
         }
     }
 
@@ -385,6 +424,11 @@ impl Drop for TaskAddressSpace {
 
 #[ax_percpu::def_percpu]
 static ACTIVE_ADDRESS_SPACE: usize = 0;
+
+/// Published with the selected task/root transition under local IRQ exclusion.
+#[ax_percpu::def_percpu]
+#[cfg(feature = "uspace")]
+static ACTIVE_MM_IS_LAZY: bool = false;
 
 #[ax_percpu::def_percpu]
 #[cfg(feature = "uspace")]
@@ -719,17 +763,40 @@ impl PreparedAddressSpaceSwitch<'_, '_> {
                 {
                     #[cfg(feature = "qperf-metrics")]
                     ACTIVE_MM_KERNEL_LAZY_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+                    ACTIVE_MM_IS_LAZY.write_current(pin, true);
                     enter_lazy_kernel_address_space(self.previous_raw != 0);
+                    if self.previous.is_some_and(|previous| {
+                        previous
+                            .cpu_state
+                            .lazy_reclaim_requested
+                            .load(Ordering::Acquire)
+                    }) {
+                        let reclaim_ready = release_active_address_space(pin);
+                        if reclaim_ready {
+                            route_reclaim_notification(
+                                self.phase,
+                                || {
+                                    CONTEXT_SWITCH_RECLAIM_READY.with_current(pin, |pending| {
+                                        assert!(!pending.swap(true, Ordering::AcqRel));
+                                    })
+                                },
+                                ax_task::runtime::resource::notify_address_space_reclaim,
+                            );
+                        }
+                    }
                 }
             }
             #[cfg(all(feature = "uspace", not(target_arch = "aarch64")))]
-            PreparedAddressSpaceAction::SameUser => {}
+            PreparedAddressSpaceAction::SameUser => {
+                ACTIVE_MM_IS_LAZY.write_current(pin, false);
+            }
             #[cfg(feature = "uspace")]
             PreparedAddressSpaceAction::User {
                 next_raw,
                 next,
                 mut activation,
             } => {
+                ACTIVE_MM_IS_LAZY.write_current(pin, false);
                 let cpu_id = pin.area().cpu_index().as_usize();
                 let installed = activation
                     .as_ref()
@@ -950,37 +1017,79 @@ pub(super) fn prepare_runtime_address_space_switch<'pin, 'cpu>(
     }
 }
 
-pub(super) fn release_current_active_address_space() {
-    #[cfg(feature = "uspace")]
+#[cfg(feature = "uspace")]
+fn release_active_address_space(pin: &CpuPin<'_>) -> bool {
+    debug_assert!(!ax_cpu::interrupt::irqs_enabled());
+    let previous_raw = ACTIVE_ADDRESS_SPACE.read_current(pin);
+    if previous_raw == 0 {
+        return false;
+    }
+    install_hardware_root(
+        offline_kernel_root(),
+        HardwareAddressSpaceTransition::DifferentAddressSpace,
+    );
+    // Invalidate every local tag before dropping the MM's CPU lease,
+    // including entries retained across AArch64's lazy ASID-zero root.
+    ax_cpu::mmu::flush_tlb(None);
+    if let Some(activation) = replace_active_activation(pin, None) {
+        activation.release(AddressSpaceSwitchProof::new(
+            pin.area().cpu_index().as_usize(),
+        ));
+    }
+    ACTIVE_ADDRESS_SPACE.write_current(pin, 0);
+    // SAFETY: the CPU-local handle retains its active runtime lease
+    // until release_active_cpu below. IRQ exclusion prevents a switch.
+    let previous = unsafe { AddressSpaceHandle::from_raw(previous_raw) };
+    let previous = runtime_address_space(previous)
+        .unwrap_or_else(|_| panic!("CPU retained a stale active address space"));
+    previous
+        .cpu_state
+        .deactivate(pin.area().cpu_index().as_usize());
+    #[cfg(feature = "qperf-metrics")]
+    ACTIVE_MM_LEASE_DEACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+    release_active_cpu(previous)
+}
+
+/// Consumes an MM retirement request on a CPU already executing a kernel task.
+/// Called after the shared IPI edge is claimed, with local IRQs disabled.
+#[cfg(feature = "uspace")]
+pub(crate) fn reclaim_current_lazy_address_space() {
+    debug_assert!(!ax_cpu::interrupt::irqs_enabled());
+    // SAFETY: IRQ exclusion pins the current CPU and serializes both CPU-local
+    // publications with task/root transitions. No remote MM pointer is used.
     let reclaim_ready = unsafe {
         with_current_cpu_pin(|pin| {
-            let previous_raw = ACTIVE_ADDRESS_SPACE.read_current(pin);
-            if previous_raw == 0 {
+            if !ACTIVE_MM_IS_LAZY.read_current(pin) {
                 return false;
             }
-            install_hardware_root(
-                offline_kernel_root(),
-                HardwareAddressSpaceTransition::DifferentAddressSpace,
-            );
-            // CPU offline invalidates every local tag before retiring its MM.
-            ax_cpu::mmu::flush_tlb(None);
-            if let Some(activation) = replace_active_activation(pin, None) {
-                activation.release(AddressSpaceSwitchProof::new(
-                    pin.area().cpu_index().as_usize(),
-                ));
+            let raw = ACTIVE_ADDRESS_SPACE.read_current(pin);
+            if raw == 0 {
+                return false;
             }
-            ACTIVE_ADDRESS_SPACE.write_current(pin, 0);
-            let previous = AddressSpaceHandle::from_raw(previous_raw);
-            let previous = runtime_address_space(previous)
-                .unwrap_or_else(|_| panic!("offline CPU retained a stale active address space"));
-            previous
+            // SAFETY: the published CPU lease keeps this runtime token alive.
+            let active = AddressSpaceHandle::from_raw(raw);
+            let active =
+                runtime_address_space(active).expect("lazy CPU must retain a live runtime token");
+            if !active
                 .cpu_state
-                .deactivate(pin.area().cpu_index().as_usize());
-            #[cfg(feature = "qperf-metrics")]
-            ACTIVE_MM_LEASE_DEACTIVATIONS.fetch_add(1, Ordering::Relaxed);
-            release_active_cpu(previous)
+                .lazy_reclaim_requested
+                .load(Ordering::Acquire)
+            {
+                return false;
+            }
+            release_active_address_space(pin)
         })
     };
+    if reclaim_ready {
+        ax_task::runtime::resource::notify_address_space_reclaim();
+    }
+}
+
+pub(super) fn release_current_active_address_space() {
+    // SAFETY: CPU offline holds local IRQ exclusion through root replacement
+    // and removal of its last published active-mm lease.
+    #[cfg(feature = "uspace")]
+    let reclaim_ready = unsafe { with_current_cpu_pin(release_active_address_space) };
     #[cfg(feature = "uspace")]
     if reclaim_ready {
         ax_task::runtime::resource::notify_address_space_reclaim();
