@@ -932,13 +932,30 @@ impl FsContext {
         boundary: Option<&Location>,
         credentials: &MutationCredentials<'_>,
     ) -> VfsResult<()> {
+        let is_boundary = |location: &Location| {
+            boundary.is_some_and(|boundary| location.ptr_eq(boundary))
+                || location.ptr_eq(&self.root_dir)
+        };
         let mut current = directory.clone();
         loop {
             Self::check_permission(&current, credentials, NodePermission::OTHER_EXEC)?;
-            if boundary.is_some_and(|boundary| current.ptr_eq(boundary))
-                || current.ptr_eq(&self.root_dir)
-            {
+            if is_boundary(&current) {
                 return Ok(());
+            }
+            if current.is_root_of_mount() {
+                // A mount can cover the saved process root or dirfd boundary.
+                // Check those identities before parent() skips past them, but
+                // do not require search permission on hidden covered inodes.
+                let mut covered = current.mountpoint().location();
+                while let Some(location) = covered {
+                    if is_boundary(&location) {
+                        return Ok(());
+                    }
+                    if !location.is_root_of_mount() {
+                        break;
+                    }
+                    covered = location.mountpoint().location();
+                }
             }
             current = current.parent().ok_or(VfsError::InvalidInput)?;
         }
