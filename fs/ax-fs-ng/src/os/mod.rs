@@ -46,4 +46,5 @@ pub fn install(
     }
     #[cfg(feature = "vfs")]
     crate::file::start_background_writeback(runtime_ops);
+    crate::file::start_background_readahead(runtime_ops);
 }

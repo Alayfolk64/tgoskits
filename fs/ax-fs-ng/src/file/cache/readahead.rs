@@ -1,3 +1,5 @@
+use core::ops::Range;
+
 use crate::os::memory::PAGE_SIZE;
 
 const INITIAL_READAHEAD_PAGES: usize = 4;
@@ -12,6 +14,8 @@ pub(super) struct ReadAheadState {
     next_offset: u64,
     window_pages: usize,
     initialized: bool,
+    sequential: bool,
+    loaded: Option<Range<u64>>,
 }
 
 impl ReadAheadState {
@@ -20,6 +24,8 @@ impl ReadAheadState {
             next_offset: 0,
             window_pages: INITIAL_READAHEAD_PAGES,
             initialized: false,
+            sequential: false,
+            loaded: None,
         }
     }
 
@@ -29,6 +35,10 @@ impl ReadAheadState {
         } else {
             offset == 0
         };
+        self.sequential = sequential;
+        if !sequential {
+            self.loaded = None;
+        }
         let first_page = offset / PAGE_SIZE as u64;
         let end_page = end.div_ceil(PAGE_SIZE as u64);
         let requested_pages =
@@ -49,6 +59,39 @@ impl ReadAheadState {
             INITIAL_READAHEAD_PAGES
         };
         ReadAheadPlan { window_pages }
+    }
+
+    pub(super) fn loaded(&mut self, range: Range<u64>) {
+        if self
+            .loaded
+            .as_ref()
+            .is_none_or(|old| old.start <= range.start)
+        {
+            self.loaded = Some(range);
+        }
+    }
+
+    /// Consume one trigger while demand is still inside the resident window.
+    pub(super) fn take_prefetch(&mut self, page: u32, file_pages: u64) -> Option<Range<u64>> {
+        if !self.sequential {
+            return None;
+        }
+        let file_pages = file_pages.min(u64::from(u32::MAX) + 1);
+        let window = self.loaded.as_ref()?;
+        let page = u64::from(page);
+        let trigger = window.start + (window.end - window.start) / 2;
+        if !window.contains(&page) || page < trigger || window.end >= file_pages {
+            return None;
+        }
+        let next = window.end;
+        let count = self.window_pages.max(INITIAL_READAHEAD_PAGES) as u64;
+        self.loaded = None;
+        Some(
+            next..next
+                .saturating_add(count)
+                .min(file_pages)
+                .min(u64::from(u32::MAX) + 1),
+        )
     }
 }
 
@@ -83,6 +126,31 @@ mod tests {
                 .window_pages,
             INITIAL_READAHEAD_PAGES
         );
+
+        state.loaded(18..22);
+        assert_eq!(state.take_prefetch(19, 100), None);
+        assert_eq!(state.take_prefetch(20, 100), Some(22..30));
+        assert_eq!(
+            state.take_prefetch(21, 100),
+            None,
+            "each resident window triggers once"
+        );
+
+        let limit = u64::from(u32::MAX) + 1;
+        state.loaded((limit - 4)..limit);
+        assert_eq!(
+            state.take_prefetch(u32::MAX, limit + 4),
+            None,
+            "the next window must not wrap its first page back to zero"
+        );
+        state.plan(80 * PAGE_SIZE as u64, 81 * PAGE_SIZE as u64);
+        state.loaded(80..81);
+        assert_eq!(
+            state.take_prefetch(80, 100),
+            None,
+            "random demand must not launch speculation"
+        );
+        state.plan(18 * PAGE_SIZE as u64, 19 * PAGE_SIZE as u64);
 
         for page in 19..64 {
             let _ = state.plan(page * PAGE_SIZE as u64, (page + 1) * PAGE_SIZE as u64);

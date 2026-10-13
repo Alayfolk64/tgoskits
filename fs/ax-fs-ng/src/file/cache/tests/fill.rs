@@ -3,6 +3,34 @@ use core::{io::BorrowedBuf, mem::MaybeUninit};
 use super::*;
 
 #[test]
+fn sequential_cache_hits_schedule_the_next_window_without_backing_io() {
+    with_test_page_provider(true, |_| {
+        crate::os::task::install_test_runtime_ops();
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE * 32]));
+        let cached = reopen_cached_file(backing.clone());
+        super::super::prefetch::tests::with_queue(|run_one| {
+            for page in 0..3 {
+                assert_eq!(
+                    read_bytes(&cached, (page * PAGE_SIZE) as u64, PAGE_SIZE),
+                    vec![0x5a; PAGE_SIZE]
+                );
+            }
+            // The cache-hit caller only queued work; it did not perform I/O.
+            assert_eq!(backing.state.lock().unwrap().read_calls, 1);
+            assert!(!cached.is_page_cached(4));
+            run_one();
+            assert!(cached.is_page_cached(4));
+            assert_eq!(backing.state.lock().unwrap().read_calls, 2);
+            assert_eq!(
+                read_bytes(&cached, 4 * PAGE_SIZE as u64, PAGE_SIZE),
+                vec![0x5a; PAGE_SIZE]
+            );
+            assert_eq!(backing.state.lock().unwrap().read_calls, 2);
+        });
+    });
+}
+
+#[test]
 fn missing_page_read_releases_both_owners_for_an_independent_miss() {
     with_test_page_provider(true, |_| {
         let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE * 12]));
