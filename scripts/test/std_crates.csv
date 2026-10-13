@@ -30,7 +30,9 @@ ax-net
 rd-net
 axklib
 sdmmc-protocol
+cqhci-host
 cv181x-clock
+sdhci-host
 dwmmc-host
 nvme-driver
 realtek-rtl8125

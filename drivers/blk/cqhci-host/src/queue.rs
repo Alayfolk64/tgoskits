@@ -564,9 +564,7 @@ impl Drop for CqhciQueue {
                 }
             }
         }
-        if !quiesced
-            && let Some(tables) = self.descriptors.take()
-        {
+        if !quiesced && let Some(tables) = self.descriptors.take() {
             core::mem::forget(tables);
         }
     }
