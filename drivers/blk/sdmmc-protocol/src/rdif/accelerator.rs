@@ -61,7 +61,12 @@ pub trait CommandQueueAccelerator: Send + 'static {
         config: &mut BlockConfig,
     ) -> Result<(), BlkError>;
 
-    /// Returns whether the accelerator owns the active block data path.
+    /// Returns whether successful activation transferred the card's data path.
+    ///
+    /// Ownership remains true after shutdown or a runtime failure: stopping
+    /// the host does not disable CMDQ_MODE_EN on the card. A closed accelerator
+    /// must keep rejecting requests instead of routing them to the legacy host.
+    /// Activation failure leaves ownership false for card-side rollback.
     fn is_active(&self) -> bool;
 
     /// Stages an ordered request prefix into free hardware tags.
