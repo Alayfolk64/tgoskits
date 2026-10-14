@@ -174,6 +174,8 @@ logical request [block_id, block_id + blocks)
 
 `BlockDeviceHandle::io_stats()` 返回本设备的 `BlockIoStats`，`root_block_stats()` 通过已挂载根设备句柄提供同一份统计，供 `/proc/diskstats` 使用。驱动接受请求到终结完成被消费之间累计在途数、忙碌时间及加权时间；read/write/flush 各有次数和耗时，成功传输扇区以 512 字节计数。失败请求增加请求数与失败数，但不计成功扇区，因此错误路径数值不保证与 Linux 块层完全一致。
 
+没有可导出的根块设备快照时，`root_block_stats()` 返回 `None`，StarryOS 的 `render_diskstats()` 输出空文件；这包括内存根、根设备记录尚不可用及 `Weak<BlockDeviceHandle>` 无法升级的情况。成功读取的空结果表示“无数据”，不能解释为零 I/O 活动、没有磁盘或读取错误。消费者应清除旧计数与速率基线，待设备行恢复后重新采样，不延续旧速率或猜测设备行。此处说明的是接口约定，不表示现有监控示例已经覆盖空结果及恢复后的速率计算。
+
 `BlockBatchStats` 和 runtime metrics 继续记录 dispatch batch、commit、channel/backpressure 等内部事实，用于区分：
 
 - 文件 cache 命中导致没有块请求；
