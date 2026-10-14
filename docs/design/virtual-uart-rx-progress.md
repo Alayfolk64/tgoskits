@@ -36,6 +36,8 @@ PL011 的 poll 路径因此不会产生 RX FIFO overrun，当前模型不再向�
 
 在途读期间，RBR/DR 可消费已提交字节，loopback 只能占用未预留空间。FCR 清除只删除已提交字节并保留预留；读返回时作为后续到达追加在清除之后的 loopback 字节后面。这样已接受字节的提交顺序和容量上限都由同一状态锁确定。宿主测试中的 backend unwind 由 `RxCompletion` 释放预留，接收读锁由 guard 释放，不留下永久 busy 状态。
 
+对于容量为 `N` 的 `RxFifo`，在途读取期间 loopback 可用的总容量上限为 `N - reserved`。因此，即使已提交字节尚未填满 FIFO，16550 的 loopback 写入也可能被拒绝并报告 overrun；该状态表示本次 loopback 字节被丢弃，不表示已提交字节被覆盖。即便 backend 随后返回零字节，写入时仍须保留其尚未释放的容量。
+
 ### 2.3 IRQ 发布
 
 锁顺序为接收读锁到短暂 UART 状态锁，或 IRQ 发布锁到短暂 UART 状态锁；持状态锁时不取得这两把外层锁。`refresh_irq()` 取得发布锁后才重新读取当前条件，然后在状态锁外调用 `IrqLine`，避免旧快照成为最后发布值。生产 sink 只进入控制器状态、事件队列和唤醒路径，不同步回入 UART；`IrqLine` 自身已有 source/input 串行门，同样不支持 sink 同步重入。
