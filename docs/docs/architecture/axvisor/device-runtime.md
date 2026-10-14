@@ -200,9 +200,13 @@ PL011 只通过固定 `0x1000` MMIO 寄存器块暴露，支持 Byte/Word/Dword�
 
 `SerialBackend` 只定义非阻塞 `read()`、`write()` 和带默认实现的 `try_write()`，不保存寄存器、FIFO 或 IRQ 状态。默认 `write()` 表示 backend 接收完整缓冲区；`try_write()` 返回本次接受的 accepted prefix 长度，受流控或队列容量限制的 backend 覆盖它，UART 模型据此保留未接受的字节。`NullSerialBackend` 丢弃输出并始终返回零输入。
 
-PL011 通过 `try_write()` 只丢弃 backend 接受的前缀，剩余字节留在 retained TX FIFO 中，由后续 poll 或寄存器访问重试。每次 vCPU0 poll 时，`SerialEndpoint` 先尝试排空 PL011 的 retained TX，再最多读取 64 字节 backend 输入送入核心 RX FIFO，随后按新的 UART 状态更新 `IrqLine`。16550 没有 retained TX FIFO，THR 写仍同步经 `write()` 送入 backend。
+PL011 通过 `try_write()` 只丢弃 backend 接受的前缀，剩余字节留在 retained TX FIFO 中，由后续 poll 或寄存器访问重试。指定 poll owner 调用 `Pl011::poll()` 时先尝试排空 retained TX，再接收输入；16550 没有 retained TX FIFO，THR 写仍同步经 `write()` 送入 backend。
 
-`SerialEndpoint` 把 `IrqLine::assert/deassert` 的错误翻译成带操作名的 `DeviceError::Backend`。UART 只发布“当前中断条件是否成立”，不直接注入 vCPU，也不拥有控制器的 pending/active 状态。
+两种 UART 的 `fill_rx()` 都先在状态锁内为 `RxFifo` 预留至多 64 字节空位，再释放状态锁调用 backend。FIFO 满时不取走 backend 字节；读取 RBR/DR 后 FIFO 为空，以及 16550 FCR 清 RX 后，都会尝试接收下一批，因此已入队输入的进展不依赖另一次 device-work 通知。后台 `poll()` 通过 `SerialEndpoint::rx_read` 等待已有读取结束，保留本次通知带来的检查义务；寄存器触发的续读只尝试取得读锁，避免 backend 回调重入寄存器时等待自身。backend 不得从读取回调递归调用同一 UART 的 `poll()`。
+
+FCR 只清已经提交到 RX FIFO 的字节，不撤销在途读取的容量预留；在途读返回的字节作为后续到达提交，loopback 只能使用尚未预留的空位。当前 16550 模型仍允许 loopback 期间接收外部 backend 输入，这不是完整的硬件 loopback 隔离。完整的进展、容量与锁顺序依据见[虚拟 UART 接收进展](../../../design/virtual-uart-rx-progress.md)。
+
+`SerialEndpoint::refresh_irq()` 先取得 IRQ 发布锁，再短暂读取当前 UART 状态，释放状态锁后调用 `IrqLine::assert/deassert`，避免较早取得的状态快照最后覆盖新的电平。错误仍翻译成带操作名的 `DeviceError::Backend`。UART 只发布“当前中断条件是否成立”，不直接注入 vCPU，也不拥有控制器的 pending/active 状态；顺序 THR 写的两阶段电平仍保留，但并发完成及控制器的同源 level 队列可以合并状态，不承诺每笔 TX 都形成端到端独立边沿。
 
 ### 5.4 factory 的精确创建条件
 
