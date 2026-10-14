@@ -12,7 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     time::Duration,
 };
 
@@ -67,21 +67,6 @@ const GROUP_STOPPING: u8 = 1;
 const GROUP_STOPPED: u8 = 2;
 
 static BLOCK_RUNTIME: OnceLock<Arc<BlockRuntime>> = OnceLock::new();
-static BLOCK_READS: AtomicU64 = AtomicU64::new(0);
-static BLOCK_SECTORS_READ: AtomicU64 = AtomicU64::new(0);
-static BLOCK_WRITES: AtomicU64 = AtomicU64::new(0);
-static BLOCK_SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(0);
-
-/// Cumulative completed block I/O counters. Sector counters use 512-byte
-/// sectors to retain the Linux `/proc/diskstats` convention.
-pub fn block_io_stats() -> (u64, u64, u64, u64) {
-    (
-        BLOCK_READS.load(Ordering::Relaxed),
-        BLOCK_SECTORS_READ.load(Ordering::Relaxed),
-        BLOCK_WRITES.load(Ordering::Relaxed),
-        BLOCK_SECTORS_WRITTEN.load(Ordering::Relaxed),
-    )
-}
 
 /// One platform IRQ resolved before the portable controller enters runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

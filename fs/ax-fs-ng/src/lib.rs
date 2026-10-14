@@ -43,7 +43,7 @@ pub use block::{
     BlockRegion,
     runtime::{
         BlockBatchStats, BlockDeviceHandle, BlockIoStats, CompletionGroup, CompletionSubscription,
-        block_batch_stats, block_io_stats, release_block_irqs_for_passthrough,
+        block_batch_stats, release_block_irqs_for_passthrough,
     },
 };
 pub use error::{BlockError, BlockResult};

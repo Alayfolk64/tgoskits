@@ -79,13 +79,13 @@ fn flush_barrier_waits_for_prior_data_and_holds_later_data() {
     assert!(flush_rx.recv_timeout(Duration::from_millis(20)).is_err());
     assert!(later_rx.recv_timeout(Duration::from_millis(20)).is_err());
 
-    inner.request_completed(RequestOp::Write, 1, Ok(()));
+    inner.request_completed(RequestOp::Write);
     flush_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(later_rx.recv_timeout(Duration::from_millis(20)).is_err());
 
-    inner.request_completed(RequestOp::Flush, 0, Ok(()));
+    inner.request_completed(RequestOp::Flush);
     later_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    inner.request_completed(RequestOp::Read, 1, Ok(()));
+    inner.request_completed(RequestOp::Read);
     flush_thread.join().unwrap();
     later_thread.join().unwrap();
 }
@@ -139,12 +139,12 @@ fn flush_completion_wakes_every_blocked_data_submitter() {
         thread::yield_now();
     }
 
-    inner.request_completed(RequestOp::Flush, 0, Ok(()));
+    inner.request_completed(RequestOp::Flush);
     for _ in 0..3 {
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
     for _ in 0..3 {
-        inner.request_completed(RequestOp::Read, 1, Ok(()));
+        inner.request_completed(RequestOp::Read);
     }
     for join in joins {
         join.join().unwrap();

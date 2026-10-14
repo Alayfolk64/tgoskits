@@ -3,7 +3,6 @@ use super::*;
 struct SubmissionMetadata {
     completion: CompletionSender,
     op: RequestOp,
-    block_count: u32,
 }
 
 struct AcceptedRequestIds {
@@ -231,13 +230,8 @@ fn split_submission_batch(
         } = submission;
         request.flags = request.flags.without(RequestFlags::NOWAIT);
         let op = request.op;
-        let block_count = request.block_count;
         requests.push_back(request);
-        metadata.push_back(SubmissionMetadata {
-            completion,
-            op,
-            block_count,
-        });
+        metadata.push_back(SubmissionMetadata { completion, op });
     }
 }
 
@@ -301,7 +295,6 @@ fn pending_from_metadata(metadata: SubmissionMetadata, deadline: Duration) -> Pe
     PendingRequest {
         completion: metadata.completion,
         op: metadata.op,
-        block_count: metadata.block_count,
         deadline,
     }
 }
@@ -332,12 +325,11 @@ fn clone_submission_channel(
 
 pub(super) fn reject_unsubmitted(submission: Submission, observer: &Weak<dyn HctxObserver>) {
     let op = submission.request.op;
-    let block_count = submission.request.block_count;
     let data = super::super::dma::complete_without_submit(submission.request.data);
     submission.completion.complete(CompletedRequest::new(
         RequestId::new(usize::MAX),
         Err(BlkError::Io),
         data,
     ));
-    notify_observer(observer, op, block_count, Err(BlkError::Io));
+    notify_observer(observer, op);
 }

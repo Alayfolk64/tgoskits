@@ -27,13 +27,9 @@ impl PrefetchJob {
         else {
             return;
         };
-        // Do not displace the demand window in a cache with a tiny retention
-        // target. No cache lock survives the backing read.
-        if self.file.shared.page_cache.lock().cap().get()
-            < 2 * super::readahead::MAX_READAHEAD_PAGES
-        {
-            return;
-        }
+        // Disk retention targets start at 512 pages, above two maximum
+        // windows. Admission and publication retain their existing limits;
+        // no cache lock is needed before entering the backing-read path.
         if let Err(error) = self.file.prefetch_page_window(first_page, window_pages) {
             // Speculation must not make a later demand inherit a stale error.
             // Its demand path retries backing I/O and reports any real failure.

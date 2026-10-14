@@ -172,11 +172,13 @@ logical request [block_id, block_id + blocks)
 
 ### 4.3 运行时统计
 
-`block_io_stats()` 按完成请求累计 read/write 次数和 512-byte sector 数，保持 `/proc/diskstats` 口径。`BlockBatchStats` 和 runtime metrics 记录 dispatch batch、commit、channel/backpressure 等内部事实，用于区分：
+`BlockDeviceHandle::io_stats()` 返回本设备的 `BlockIoStats`，`root_block_stats()` 通过已挂载根设备句柄提供同一份统计，供 `/proc/diskstats` 使用。驱动接受请求到终结完成被消费之间累计在途数、忙碌时间及加权时间；read/write/flush 各有次数和耗时，成功传输扇区以 512 字节计数。失败请求增加请求数与失败数，但不计成功扇区，因此错误路径数值不保证与 Linux 块层完全一致。
+
+`BlockBatchStats` 和 runtime metrics 继续记录 dispatch batch、commit、channel/backpressure 等内部事实，用于区分：
 
 - 文件 cache 命中导致没有块请求；
 - 请求进入 software channel 但未 dispatch；
 - driver 接收但没有 IRQ completion；
 - completion 正常但 flush barrier 未解除。
 
-统计使用 Relaxed 原子，只用于观测，不承担 request 所有权或生命周期同步。运行时仍以 `BlockDeviceHandle` 作为文件系统唯一设备入口，以 owned request 保存 DMA 生命周期，以当前 `DeviceInfo` epoch 验证 queue limit，并让 IRQ 只执行 latch/notify。相关生命周期同时受[驱动 IRQ](../driver/irq.md)和[内存 DMA](../memory/dma.md)的能力契约约束。
+设备统计在 `DeviceIoMetrics` 的 IRQ-safe 叶子锁内更新和生成快照，并在快照时累计尚未完成请求的时间；批量指标仍使用 Relaxed 原子。两类统计都只用于观测，不承担 request 所有权或生命周期同步。运行时仍以 `BlockDeviceHandle` 作为文件系统唯一设备入口，以 owned request 保存 DMA 生命周期，以当前 `DeviceInfo` epoch 验证 queue limit，并让 IRQ 只执行 latch/notify。相关生命周期同时受[驱动 IRQ](../driver/irq.md)和[内存 DMA](../memory/dma.md)的能力契约约束。

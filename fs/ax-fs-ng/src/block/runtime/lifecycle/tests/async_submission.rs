@@ -271,7 +271,7 @@ fn flush_drain_notification_between_check_and_wait_is_observed() {
     inner.lifecycle_gate.lock_irqsave().active_data = 1;
     let publisher = Arc::clone(&inner);
     inner.set_admission_wait_hook(move || {
-        publisher.request_completed(RequestOp::Read, 1, Ok(()));
+        publisher.request_completed(RequestOp::Read);
     });
 
     let mut future = Box::pin(inner.acquire_flush_async(false));
