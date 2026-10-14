@@ -41,6 +41,7 @@ pub struct CqhciQueue {
     staged: u32,
     active: bool,
     engine_armed: bool,
+    data_path_restore_pending: bool,
     poisoned: bool,
     depth: usize,
     next_flush_id: usize,
@@ -86,6 +87,7 @@ impl CqhciQueue {
             staged: 0,
             active: false,
             engine_armed: false,
+            data_path_restore_pending: false,
             poisoned: false,
             depth: 0,
             next_flush_id: usize::MAX / 2,
@@ -284,8 +286,9 @@ impl CqhciQueue {
         if !self.wait_control(CTL_HALT, CTL_HALT) {
             return false;
         }
-        // Halt stops the fetch engine; clear remaining tasks before disabling
-        // it so no descriptor can be fetched if firmware reuses the host.
+        // The HALT readback alone is not our DMA ownership handoff. Require
+        // the device to acknowledge task clear and read back CFG_ENABLE clear
+        // before releasing any descriptor or payload memory.
         write_u32(self.base, CTL, CTL_HALT | CTL_CLEAR_ALL_TASKS);
         if !self.wait_control(CTL_CLEAR_ALL_TASKS, 0) {
             return false;
@@ -297,6 +300,14 @@ impl CqhciQueue {
         rmb();
         self.engine_armed = false;
         true
+    }
+
+    fn restore_data_path(&mut self) -> Result<(), BlkError> {
+        if self.data_path_restore_pending {
+            self.platform.disable_data_path()?;
+            self.data_path_restore_pending = false;
+        }
+        Ok(())
     }
 
     fn complete_direct_command(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
@@ -398,10 +409,12 @@ impl CommandQueueAccelerator for CqhciQueue {
         self.engine_armed = true;
         write_u32(self.base, CFG, cfg | CFG_ENABLE);
         write_u32(self.base, CTL, 0);
+        // Even a failed enable may have changed platform registers.
+        self.data_path_restore_pending = true;
         if let Err(error) = self.platform.enable_data_path() {
             self.poisoned = true;
             if self.quiesce() {
-                self.platform.disable_data_path()?;
+                self.restore_data_path()?;
             }
             return Err(error);
         }
@@ -545,7 +558,7 @@ impl CommandQueueAccelerator for CqhciQueue {
         if !quiesced {
             return Err(BlkError::Io);
         }
-        self.platform.disable_data_path()
+        self.restore_data_path()
     }
 }
 
@@ -554,6 +567,11 @@ impl Drop for CqhciQueue {
         // Safe callers may drop a live queue without explicit shutdown.
         // A timed-out engine must retain all memory that it could still read.
         let quiesced = self.quiesce();
+        if quiesced && let Err(error) = self.restore_data_path() {
+            // DMA is stopped, but Drop cannot report platform teardown errors.
+            // Callers that need this result must use explicit shutdown.
+            warn!("cqhci: failed to restore the quiesced data path on drop: {error:?}");
+        }
         for slot in &mut self.slots {
             if let Some(dma) = slot.dma.take() {
                 if quiesced {
@@ -572,12 +590,12 @@ impl Drop for CqhciQueue {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{boxed::Box, vec, vec::Vec};
+    use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
     use core::{
         alloc::Layout,
         num::NonZeroUsize,
         ptr::NonNull,
-        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     };
     use std::alloc::{alloc_zeroed, dealloc};
 
@@ -595,15 +613,12 @@ mod tests {
         let mut registers = [0u32; 32];
         let base = NonNull::new(registers.as_mut_ptr().cast::<u8>()).unwrap();
         let dma = test_dma();
-        let (mut queue, mut irq) = unsafe {
-            crate::queue_and_irq(
-                base,
-                dma.clone(),
-                Box::new(TestPlatform::new(true)),
-                TestLegacyIrq,
-            )
-        }
-        .unwrap();
+        let mut platform = TestPlatform::new(true);
+        platform.disable_failures = 1;
+        let platform_state = Arc::clone(&platform.state);
+        let (mut queue, mut irq) =
+            unsafe { crate::queue_and_irq(base, dma.clone(), Box::new(platform), TestLegacyIrq) }
+                .unwrap();
         let mut config = BlockConfig::dma("cqhci-test", 1024, &dma);
         config.limits.supported_flags = RequestFlags::ALL_KNOWN;
         let activation = CommandQueueActivation {
@@ -772,11 +787,14 @@ mod tests {
         assert!(completed.0[2].data.is_some());
         assert!(completed.0[3].result.is_ok());
         assert!(completed.0[3].data.is_none());
+        assert_eq!(queue.shutdown(&mut completed), Err(BlkError::Io));
+        assert!(platform_state.data_path_enabled.load(Ordering::Relaxed));
+        assert_eq!(platform_state.disable_attempts.load(Ordering::Relaxed), 1);
         for _ in 0..2 {
             queue.shutdown(&mut completed).unwrap();
             assert!(
                 queue.is_active(),
-                "shutdown must not restore the legacy path"
+                "shutdown must keep card-session ownership"
             );
             let mut rejected = [flush_request()].into_iter().collect();
             let result = queue.submit_batch_owned(&mut rejected, &mut rejected_ids);
@@ -790,13 +808,81 @@ mod tests {
         }
         assert!(rejected_ids.0.is_empty());
         assert_eq!(completed.0.len(), 4);
+        drop(queue);
+        assert!(!platform_state.data_path_enabled.load(Ordering::Relaxed));
+        assert_eq!(
+            platform_state.disable_attempts.load(Ordering::Relaxed),
+            2,
+            "retry a failed restoration, but do not repeat a successful one"
+        );
+    }
+
+    #[test]
+    fn drop_restores_only_started_data_paths_and_reclaims_quiesced_dma() {
+        // None covers an untouched queue; the two results cover successful
+        // activation and failure after the platform has changed host state.
+        for enable_result in [None, Some(Ok(())), Some(Err(BlkError::Io))] {
+            let backend = Box::leak(Box::new(TestDma::default()));
+            let dma = DeviceDma::new(test_dma().info(), backend);
+            let mut registers = [0u32; 32];
+            let base = NonNull::new(registers.as_mut_ptr().cast::<u8>()).unwrap();
+            let mut platform = TestPlatform::new(true);
+            platform.fail_enable = enable_result == Some(Err(BlkError::Io));
+            let platform_state = Arc::clone(&platform.state);
+            // SAFETY: the aligned register array outlives both endpoints.
+            // All accesses are serialized and no physical DMA is performed.
+            let (mut queue, irq) = unsafe {
+                crate::queue_and_irq(base, dma.clone(), Box::new(platform), TestLegacyIrq)
+            }
+            .unwrap();
+            if let Some(expected) = enable_result {
+                assert_eq!(
+                    queue.activate(
+                        CommandQueueActivation {
+                            rca: 1,
+                            card_depth: 2,
+                            cache_enabled: false,
+                        },
+                        &mut BlockConfig::dma("drop-lifecycle", 1024, &dma),
+                    ),
+                    expected
+                );
+                if expected.is_ok() {
+                    let mut batch = [read_request(&dma, 0)].into_iter().collect();
+                    let mut submitted = SubmittedIds::default();
+                    assert_eq!(
+                        queue
+                            .submit_batch_owned(&mut batch, &mut submitted)
+                            .accepted(),
+                        1
+                    );
+                    queue.commit_submissions().unwrap();
+                    assert!(batch.is_empty());
+                } else {
+                    assert!(!queue.is_active());
+                    assert!(!platform_state.data_path_enabled.load(Ordering::Relaxed));
+                }
+            }
+            // In particular, the live queue has no explicit shutdown here.
+            drop(queue);
+            drop(irq);
+            assert!(!platform_state.data_path_enabled.load(Ordering::Relaxed));
+            assert_eq!(
+                platform_state.disable_attempts.load(Ordering::Relaxed),
+                usize::from(enable_result.is_some()),
+                "restore every attempted platform enable exactly once"
+            );
+            assert_eq!(
+                backend.deallocations.load(Ordering::Relaxed),
+                backend.allocations.load(Ordering::Relaxed),
+                "a quiesced queue must release both descriptors and any payload"
+            );
+        }
     }
 
     #[test]
     fn failed_quiesce_quarantines_descriptors_and_payload_and_closes_queue() {
-        let backend = Box::leak(Box::new(TestDma {
-            deallocations: AtomicUsize::new(0),
-        }));
+        let backend = Box::leak(Box::new(TestDma::default()));
         let dma = DeviceDma::new(
             DmaDeviceInfo::new(
                 DmaDomainId::Direct,
@@ -807,17 +893,13 @@ mod tests {
         );
         let mut registers = [0u32; 32];
         let base = NonNull::new(registers.as_mut_ptr().cast::<u8>()).unwrap();
+        let platform = TestPlatform::new(false);
+        let platform_state = Arc::clone(&platform.state);
         // SAFETY: the aligned register array outlives both endpoints and all
         // accesses are serialized by this test. No physical DMA is performed.
-        let (mut queue, mut irq) = unsafe {
-            crate::queue_and_irq(
-                base,
-                dma.clone(),
-                Box::new(TestPlatform::new(false)),
-                TestLegacyIrq,
-            )
-        }
-        .unwrap();
+        let (mut queue, mut irq) =
+            unsafe { crate::queue_and_irq(base, dma.clone(), Box::new(platform), TestLegacyIrq) }
+                .unwrap();
         queue
             .activate(
                 CommandQueueActivation {
@@ -866,7 +948,7 @@ mod tests {
         assert_eq!(queue.shutdown(&mut completed), Err(BlkError::Io));
         assert!(
             queue.is_active(),
-            "failed shutdown must not restore the legacy path"
+            "failed shutdown must keep card-session ownership"
         );
         let mut rejected = [flush_request()].into_iter().collect();
         let mut rejected_ids = SubmittedIds::default();
@@ -881,6 +963,14 @@ mod tests {
         assert_eq!(completed.0.len(), 1);
         drop(queue);
         drop(irq);
+        assert_eq!(
+            read_u32(base.as_ptr() as usize, CTL) & (CTL_HALT | CTL_CLEAR_ALL_TASKS),
+            CTL_HALT | CTL_CLEAR_ALL_TASKS,
+            "HALT readback cannot replace the device's task-clear acknowledgement"
+        );
+        assert_ne!(read_u32(base.as_ptr() as usize, CFG) & CFG_ENABLE, 0);
+        assert!(platform_state.data_path_enabled.load(Ordering::Relaxed));
+        assert_eq!(platform_state.disable_attempts.load(Ordering::Relaxed), 0);
         assert_eq!(
             backend.deallocations.load(Ordering::Relaxed),
             0,
@@ -934,10 +1024,19 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PlatformState {
+        data_path_enabled: AtomicBool,
+        disable_attempts: AtomicUsize,
+    }
+
     struct TestPlatform {
         base: usize,
         clear_tasks: bool,
         time: AtomicU64,
+        state: Arc<PlatformState>,
+        fail_enable: bool,
+        disable_failures: usize,
     }
 
     impl TestPlatform {
@@ -946,6 +1045,9 @@ mod tests {
                 base: 0,
                 clear_tasks,
                 time: AtomicU64::new(0),
+                state: Arc::new(PlatformState::default()),
+                fail_enable: false,
+                disable_failures: 0,
             }
         }
     }
@@ -966,10 +1068,24 @@ mod tests {
         }
 
         fn enable_data_path(&mut self) -> Result<(), BlkError> {
-            Ok(())
+            self.state.data_path_enabled.store(true, Ordering::Relaxed);
+            if self.fail_enable {
+                Err(BlkError::Io)
+            } else {
+                Ok(())
+            }
         }
 
         fn disable_data_path(&mut self) -> Result<(), BlkError> {
+            assert_ne!(self.base, 0, "an untouched platform must not be restored");
+            assert_eq!(read_u32(self.base, CTL) & CTL_CLEAR_ALL_TASKS, 0);
+            assert_eq!(read_u32(self.base, CFG) & CFG_ENABLE, 0);
+            self.state.disable_attempts.fetch_add(1, Ordering::Relaxed);
+            if self.disable_failures != 0 {
+                self.disable_failures -= 1;
+                return Err(BlkError::Io);
+            }
+            self.state.data_path_enabled.store(false, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -982,11 +1098,14 @@ mod tests {
         fn handle_irq(&mut self) -> Self::Event {}
     }
 
+    #[derive(Default)]
     struct TestDma {
+        allocations: AtomicUsize,
         deallocations: AtomicUsize,
     }
 
     static TEST_DMA: TestDma = TestDma {
+        allocations: AtomicUsize::new(0),
         deallocations: AtomicUsize::new(0),
     };
     static NEXT_DMA_ADDRESS: AtomicU64 = AtomicU64::new(0x1000_0000);
@@ -1001,7 +1120,9 @@ mod tests {
             constraints: DmaConstraints,
             layout: Layout,
         ) -> Option<DmaAllocHandle> {
-            allocate_test_dma(constraints, layout)
+            let handle = allocate_test_dma(constraints, layout)?;
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            Some(handle)
         }
 
         unsafe fn dealloc_contiguous(&self, handle: DmaAllocHandle) {
@@ -1016,7 +1137,9 @@ mod tests {
             constraints: DmaConstraints,
             layout: Layout,
         ) -> Option<DmaAllocHandle> {
-            allocate_test_dma(constraints, layout)
+            let handle = allocate_test_dma(constraints, layout)?;
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            Some(handle)
         }
 
         unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {

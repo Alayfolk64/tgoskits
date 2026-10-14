@@ -31,7 +31,10 @@ pub trait CqhciPlatform: Send + 'static {
     /// Routes the SDHCI data path and shared IRQ to CQHCI.
     fn enable_data_path(&mut self) -> Result<(), BlkError>;
 
-    /// Restores a quiesced legacy data path during shutdown or recovery.
+    /// Restores platform routing after CQHCI has stopped, including a failed
+    /// enable. An error leaves restoration pending and may be retried during
+    /// shutdown or drop. This does not disable CMDQ_MODE_EN on the card or
+    /// authorize submitting legacy commands to the still-owned card session.
     fn disable_data_path(&mut self) -> Result<(), BlkError>;
 }
 

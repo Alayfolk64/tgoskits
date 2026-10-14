@@ -60,7 +60,7 @@ stateDiagram-v2
     Disabled --> Active: 卡 CMDQ 已启用，主机激活完成
     Active --> Active: 接受、发布与完成请求
     Active --> Quiescing: 错误、关闭或析构
-    Quiescing --> Closed: halt、clear、disable 均确认
+    Quiescing --> Closed: clear-all 自清且 CFG_ENABLE 清零
     Quiescing --> Quarantined: 无法证明设备已停止
     Closed --> [*]
     Quarantined --> [*]: 保留可能被 DMA 访问的内存
@@ -72,7 +72,9 @@ stateDiagram-v2
 
 flush 是队列屏障：先等全部数据标签完成，再使用标签 31 发出 FLUSH_CACHE；缓存关闭时使用 SEND_STATUS。缓存打开时还需第二条 SEND_STATUS 确认卡回到可接收数据的 Transfer 状态，才返回 flush 成功。卡错误和 SWITCH_ERROR 均返回 I/O 错误。
 
-`quiesce()` 屏蔽 CQHCI 中断，停止 IRQ 快照接收，等待 halt 和 clear-all，再清除 enable 并读回。每次控制转换有 20 ms 上限。只有确认停止后才能返回 DMA 所有权；无法确认时，`quarantine_all()` 同时保留载荷与描述符内存，向所有等待者完成一次错误并关闭队列。析构也遵守这条规则。此策略以有限的内存保留换取错误设备下的内存安全，不承诺运行中自动重建损坏的卡会话。
+`quiesce()` 屏蔽 CQHCI 中断并停止 IRQ 快照接收，写入 HALT 并读回后请求 clear-all，等待设备将 clear-all 位自清，最后清除 `CFG_ENABLE` 并读回。HALT 位读回本身不作为 DMA 所有权交还的充分证据；必须继续确认任务清除及引擎关闭。每次控制转换有 20 ms 上限。只有确认停止后才能返回 DMA 所有权；无法确认时，`quarantine_all()` 同时保留载荷与描述符内存，向所有等待者完成一次错误并关闭队列。析构也遵守这条规则。此策略以有限的内存保留换取错误设备下的内存安全，不承诺运行中自动重建损坏的卡会话。
+
+平台数据通路恢复由独立的 `data_path_restore_pending` 管理：在调用 `enable_data_path()` 前登记，只有 `disable_data_path()` 成功才清除，覆盖启用期间部分失败。激活失败回滚、显式关闭及直接析构均在确认 CQHCI 停止后执行恢复；未启用的队列不调用恢复，重复关闭或关闭后析构不重复执行成功的恢复，恢复失败则保留重试状态。显式关闭返回错误；析构无法返回错误，只记录诊断。RK3588 适配器在这里清除响应中断并恢复保存的 legacy 中断使能，不承诺还原所有 SDHCI 寄存器，也不关闭卡端 CMDQ 或重新授权 legacy 请求。
 
 ## 4. 验证与回滚
 
