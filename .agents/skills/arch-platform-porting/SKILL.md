@@ -140,6 +140,7 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 - x86 QEMU 只初始化一次 LAPIC 或 x2APIC，并把 APIC 标识视为固件标识，不视为逻辑处理器索引。x2APIC 启用时使用模型特定寄存器；处理器间中断等待有界；xAPIC 拒绝高于 255 的次处理器启动或目标；外部输入输出中断控制器传统中断编程留在运行时 `X86IoApicIntc`。依赖完成 LAPIC 启用后，显式屏蔽并读回 LVT LINT0 和 LINT1，同时保留投递配置；写零会清除掩码位，不会设置。
 - AArch64 的 someboot `hv` 只用于异常级 2 内核。非 `hv` 异常级 1 启动按启动异常级选择定时器：异常级 2 可用时用 CNTP，否则用 CNTV，并让设备树中断索引一致。一次性间隔用 64 位 CVAL 和环绕绝对截止时间，不能在间隔可能越界时用 32 位 TVAL。次处理器入口跨内存管理单元启用和异常级转换辅助函数显式保存处理器元数据指针，裸汇编使用辅助函数返回寄存器，不假设暂存寄存器跨 Rust 调用保持。
 - RK3576 ROCK 4D 的固件、设备树、串口、对称多处理、时钟复位单元、电源管理单元和板卡验证遵循 `references/boot-debugging.md`，未确认完整交接契约前不要诊断存储或次处理器。
+- RK3588 eMMC 高速初始化遵循仓库 `docs/design/rk3588-cqhci-block-queue.md`：区分 VCC 与 VCCQ、SD CMD11 与 eMMC 直接信号选择，先确认 DLL 和实际调谐成功，再启用卡端与主机 CQE。不能把 Linux 的 HS400 能力当作本驱动 HS200 的验证结果；运行时停止失败必须同时保留描述符与载荷 DMA。修改此路径后先完成源码审核与定向验证，再按板卡恢复规范上板。
 - 页表覆盖体系结构需要的身份或固件访问、直接映射、内核高地址、设备资源和逐处理器数据；页表写入、启动参数和次处理器释放周围执行地址转换缓存、缓存维护和体系结构屏障。
 - 把硬件内存管理单元启用、直接映射或内核空间可寻址、最终内核重定位视为不同状态。通用重定位检测使用最终 `VM_LOAD_ADDRESS`，不能使用更宽的体系结构内核或直接映射范围。AArch64 从 SCTLR.M 启用到跳入重定位入口之间禁止串口日志，仍在重定位前路径执行时地址辅助函数不得切到重定位地址。LoongArch 直接映射窗口只提供早期可寻址，执行到最终高地址 `VM_LOAD_ADDRESS` 后才能认定重定位完成。
 - LoongArch 的四级 4 KiB 页表 walker 是构建期契约，CPUCFG `VALEN` 是运行期 canonical 地址能力，两者不能混为动态页表层数。平台按 Linux 的 `vm_map_base = 0 - (1 << cpu_vabits)` 原理发布类型化 lower/upper half：CPUCFG wrapper 返回的 `VALEN` 先减一得到 `cpu_vabits`；PGDL/PGDH 由 `VA[VALEN-1]` 选择。用户 `TASK_SIZE` 和 page-table-backed kernel allocator 必须消费同一不可变布局，不得用板卡 feature 维护第二套地址常量；位宽超出 walker 时返回类型化不支持并停止启动。DMW 的 `PABITS`、缓存属性和物理直映所有权保持独立，不能随 `VALEN` 裁剪。
