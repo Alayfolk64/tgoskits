@@ -1095,6 +1095,34 @@ pub(crate) fn try_publish_record(
     meta: ax_log::RecordMeta,
     args: fmt::Arguments<'_>,
 ) -> Option<ax_log::PublishStatus> {
+    publish_record(meta, args, true)
+}
+
+/// Queues a bounded diagnostic without waking the serial worker or sending IPI.
+///
+/// Used when notification transport itself has failed. The record is consumed
+/// on a later independent worker wake; no console or a full mailbox may drop it.
+/// Unlike emergency output, this does not take permanent ownership of the UART.
+#[cfg(any(
+    test,
+    all(
+        feature = "uspace",
+        not(feature = "host-test"),
+        any(feature = "ipi", feature = "wake-ipi")
+    )
+))]
+pub(crate) fn try_publish_deferred_record(
+    meta: ax_log::RecordMeta,
+    args: fmt::Arguments<'_>,
+) -> Option<ax_log::PublishStatus> {
+    publish_record(meta, args, false)
+}
+
+fn publish_record(
+    meta: ax_log::RecordMeta,
+    args: fmt::Arguments<'_>,
+    wake_worker: bool,
+) -> Option<ax_log::PublishStatus> {
     let index = ACTIVE_CONSOLE.load(Ordering::Acquire);
     let runtime = runtimes().get(index)?;
     let guard = ax_task::sync::PreemptIrqSaveGuard::new();
@@ -1131,6 +1159,7 @@ pub(crate) fn try_publish_record(
         outcome.published(),
         ax_hal::irq::in_irq_context(),
         log_wake_ready,
+        wake_worker,
     ) {
         RecordWakeContext::Interrupt => {
             runtime.shared.bridge.notify();
@@ -1160,8 +1189,9 @@ const fn record_wake_context(
     published: bool,
     in_irq_context: bool,
     log_wake_ready: bool,
+    wake_worker: bool,
 ) -> RecordWakeContext {
-    if !published || !log_wake_ready {
+    if !wake_worker || !published || !log_wake_ready {
         RecordWakeContext::None
     } else if in_irq_context {
         RecordWakeContext::Interrupt
@@ -1568,19 +1598,19 @@ mod tests {
     #[test]
     fn early_secondary_log_does_not_wake_before_log_wake_ready() {
         assert_eq!(
-            record_wake_context(true, false, false),
+            record_wake_context(true, false, false, true),
             RecordWakeContext::None
         );
         assert_eq!(
-            record_wake_context(true, false, true),
+            record_wake_context(true, false, true, true),
             RecordWakeContext::Task
         );
         assert_eq!(
-            record_wake_context(true, true, false),
+            record_wake_context(true, true, false, true),
             RecordWakeContext::None
         );
         assert_eq!(
-            record_wake_context(true, true, true),
+            record_wake_context(true, true, true, true),
             RecordWakeContext::Interrupt
         );
     }
@@ -1598,7 +1628,7 @@ mod tests {
         );
         assert!(early.published());
         assert_eq!(
-            record_wake_context(early.published(), false, mailbox.wake_ready(1)),
+            record_wake_context(early.published(), false, mailbox.wake_ready(1), true),
             RecordWakeContext::None
         );
 
@@ -1610,9 +1640,27 @@ mod tests {
         );
         assert!(ready.published());
         assert_eq!(
-            record_wake_context(ready.published(), false, mailbox.wake_ready(1)),
+            record_wake_context(ready.published(), false, mailbox.wake_ready(1), true),
             RecordWakeContext::Task
         );
+
+        let deferred = mailbox.try_publish(
+            1,
+            LogRecordMeta::log(3, Some(8)),
+            format_args!("IPI delivery failed\n"),
+        );
+        assert!(deferred.published());
+        for in_irq_context in [false, true] {
+            assert_eq!(
+                record_wake_context(
+                    deferred.published(),
+                    in_irq_context,
+                    mailbox.wake_ready(1),
+                    false,
+                ),
+                RecordWakeContext::None,
+            );
+        }
 
         let mut reader = mailbox.reader();
         assert!(
@@ -1624,6 +1672,11 @@ mod tests {
             reader
                 .take(OWNER)
                 .is_some_and(|record| record.record.bytes().ends_with(b"secondary init OK\r\n"))
+        );
+        assert!(
+            reader
+                .take(OWNER)
+                .is_some_and(|record| record.record.bytes().ends_with(b"IPI delivery failed\r\n"))
         );
         assert!(reader.take(OWNER).is_none());
     }

@@ -98,7 +98,9 @@ int main(void)
 
     /* Linux-compatible EL0 permits ordinary unaligned accesses to Normal
      * memory. Some firmware leaves SCTLR_EL1.A set, so this must be configured
-     * explicitly instead of inherited at boot. */
+     * explicitly instead of inherited at boot. This checks observable EL0
+     * behavior only: it does not force A=1 before kernel entry, so a pass with
+     * QEMU's default firmware cannot prove that the kernel cleared A. */
     _Alignas(uint64_t) const uint8_t bytes[] = {
         0xa5, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00
     };

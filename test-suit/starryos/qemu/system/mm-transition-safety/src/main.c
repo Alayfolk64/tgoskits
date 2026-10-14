@@ -363,8 +363,9 @@ static int private_discard_refault(void)
 }
 
 // Keep the parent on one CPU while the child leaves file mappings on the other
-// CPUs. Synchronization must make progress after the child exits. This system
-// case does not isolate those CPUs from unrelated userspace processes.
+// CPUs. This is a synchronization/content smoke check after exit, not a
+// discriminating test of proactive lazy-MM eviction: unrelated userspace can
+// run on those CPUs and release the leases even without the notification.
 static int exited_file_mapping_sync(int controller_cpu, const cpu_set_t *allowed)
 {
     char path[] = "/root/mm-exit-sync-XXXXXX";
@@ -391,8 +392,8 @@ static int exited_file_mapping_sync(int controller_cpu, const cpu_set_t *allowed
             if (page[0] != 'R')
                 _exit(13);
         }
-        // Exit with the dirty mapping present; munmap would hide the missing
-        // progress edge between lazy CPU ownership and MM reclamation.
+        // Leave the private file mapping alive until exit so synchronization
+        // also exercises teardown; the file was dirtied through pwrite above.
         _exit(0);
     }
     if (child < 0)

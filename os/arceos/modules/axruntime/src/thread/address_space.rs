@@ -211,6 +211,9 @@ impl AddressSpaceCpuState {
     /// counters become quiescent only after each CPU switches roots and flushes
     /// its translations. Call after ending user/pinned continuation ownership
     /// when teardown must progress without another user task being scheduled.
+    /// Notification failure retains both the request and all CPU leases. It
+    /// may delay reclamation until another IPI or address-space transition;
+    /// delivery is never treated as an acknowledgement of root replacement.
     pub fn request_lazy_reclaim(&self) {
         let first_request = !self.lazy_reclaim_requested.swap(true, Ordering::AcqRel);
         #[cfg(any(not(feature = "uspace"), test, feature = "host-test"))]
@@ -222,15 +225,7 @@ impl AddressSpaceCpuState {
                 // notify_cpu may select a self-directed physical IPI. Keep
                 // that CPU identity stable until all sends have completed.
                 let _preempt = crate::task::sync::PreemptGuard::new();
-                let mut cpus = self.active_mask();
-                while cpus != 0 {
-                    let cpu = cpus.trailing_zeros() as usize;
-                    cpus &= cpus - 1;
-                    match ax_ipi::notify_cpu(ax_hal::irq::CpuId(cpu)) {
-                        Ok(_) | Err(ax_hal::irq::IrqError::CpuOffline) => {}
-                        Err(error) => panic!("lazy MM reclaim notification failed: {error:?}"),
-                    }
-                }
+                self.notify_lazy_reclaim_cpus(|cpu| ax_ipi::notify_cpu(cpu).map(|_| ()));
             }
             #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
             {
@@ -238,6 +233,41 @@ impl AddressSpaceCpuState {
                 // request locally, without an interrupt transport.
                 let _irq = crate::task::sync::IrqSaveGuard::new();
                 reclaim_current_lazy_address_space();
+            }
+        }
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            feature = "uspace",
+            not(feature = "host-test"),
+            any(feature = "ipi", feature = "wake-ipi")
+        )
+    ))]
+    fn notify_lazy_reclaim_cpus(
+        &self,
+        mut notify: impl FnMut(ax_hal::irq::CpuId) -> Result<(), ax_hal::irq::IrqError>,
+    ) {
+        let mut cpus = self.active_mask();
+        while cpus != 0 {
+            let cpu = cpus.trailing_zeros() as usize;
+            cpus &= cpus - 1;
+            match notify(ax_hal::irq::CpuId(cpu)) {
+                Ok(()) | Err(ax_hal::irq::IrqError::CpuOffline) => {}
+                // This is an advisory kick, not a shootdown acknowledgement.
+                // Retain ownership and the permanent request on failure; a
+                // later IPI or scheduler transition can consume it safely.
+                // Ordinary logging could wake a remote serial worker through
+                // the same failed IPI transport, so only queue this diagnostic.
+                Err(error) => {
+                    let _ = crate::serial::try_publish_deferred_record(
+                        ax_log::RecordMeta::log(),
+                        format_args!(
+                            "lazy MM reclaim notification to CPU {cpu} failed: {error:?}\n"
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1411,15 +1441,38 @@ mod tests {
     }
 
     #[test]
-    fn shared_cpu_state_publishes_and_withdraws_cpu_footprints() {
+    fn lazy_reclaim_notification_failures_preserve_cpu_leases() {
         let tracker = AddressSpaceCpuState::new(PhysAddr::from(0x4000));
 
         tracker.activate(1);
+        tracker.activate(2);
         tracker.activate(3);
-        assert_eq!(tracker.active_mask(), (1usize << 1) | (1usize << 3));
+        tracker.request_lazy_reclaim();
+        let mut notified = alloc::vec::Vec::new();
+        tracker.notify_lazy_reclaim_cpus(|cpu| {
+            assert!(tracker.lazy_reclaim_requested.load(Ordering::Acquire));
+            notified.push(cpu.0);
+            match cpu.0 {
+                1 => Err(ax_hal::irq::IrqError::InvalidCpu),
+                2 => Err(ax_hal::irq::IrqError::CpuOffline),
+                3 => Ok(()),
+                _ => unreachable!(),
+            }
+        });
+
+        // A rejected/offline target cannot stop later targets from receiving
+        // the request, nor can notification success release a CPU's lease.
+        assert_eq!(notified, [1, 2, 3]);
+        assert!(tracker.lazy_reclaim_requested.load(Ordering::Acquire));
+        assert_eq!(
+            tracker.active_mask(),
+            (1usize << 1) | (1usize << 2) | (1usize << 3)
+        );
 
         tracker.deactivate(1);
-        assert_eq!(tracker.active_mask(), 1usize << 3);
+        tracker.deactivate(2);
+        tracker.deactivate(3);
+        assert_eq!(tracker.active_mask(), 0);
     }
 
     #[test]
