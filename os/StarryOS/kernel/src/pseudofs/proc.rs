@@ -2515,7 +2515,6 @@ mod tests {
             flush_ns: 5_999_999,
             failed_requests: 37,
             inflight: 3,
-            peak_inflight: 19,
             busy_ns: 8_000_000,
             weighted_ns: 13_999_999,
         };

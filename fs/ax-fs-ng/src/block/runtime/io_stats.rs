@@ -26,7 +26,6 @@ pub struct BlockIoStats {
     pub flush_ns: u64,
     pub failed_requests: u64,
     pub inflight: u64,
-    pub peak_inflight: u64,
     pub busy_ns: u64,
     pub weighted_ns: u64,
 }
@@ -66,7 +65,6 @@ impl IoState {
     fn begin(&mut self, now: Duration) {
         self.advance(now);
         self.counters.inflight += 1;
-        self.counters.peak_inflight = self.counters.peak_inflight.max(self.counters.inflight);
     }
 
     fn complete(
@@ -169,7 +167,6 @@ mod tests {
         assert_eq!(state.counters.busy_ns, 30_000_000);
         assert_eq!(state.counters.weighted_ns, 40_000_000);
         assert_eq!(state.counters.inflight, 0);
-        assert_eq!(state.counters.peak_inflight, 2);
         assert_eq!(state.counters.read_ns, 20_000_000);
         assert_eq!(state.counters.write_ns, 20_000_000);
         assert_eq!(state.counters.sectors_read, 8);
