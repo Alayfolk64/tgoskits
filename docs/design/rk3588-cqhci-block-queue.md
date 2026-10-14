@@ -34,6 +34,12 @@ RK3588 原有 SDHCI 路径以单一命令状态和 ADMA 表处理块请求，`ma
 
 外部时钟流程先停止 SD 时钟输出，设置 CRU 时钟并等待内部时钟稳定，再运行 RK3588 DLL 配置，最后开放 SD 时钟。低速采用 DLL bypass；高速执行 DLL reset、锁定等待、TX tap 和自动调谐延时配置。DLL 锁定失败返回错误，不能继续发布高速初始化成功。
 
+删除原 `init_rk3588_dwcmshc_phy_3v3()` 的依据是 Linux 的实际平台接线。在固定源码 `980ab36ae597` 中，[`sdhci_dwcmshc_rk3588_pdata`](https://github.com/torvalds/linux/blob/980ab36ae597/drivers/mmc/host/sdhci-of-dwcmshc.c#L2157-L2171) 选择 `sdhci_dwcmshc_rk35xx_ops`、`dwcmshc_rk35xx_init()` 与 revision 1；其 [`dwcmshc_rk3568_set_clock()`](https://github.com/torvalds/linux/blob/980ab36ae597/drivers/mmc/host/sdhci-of-dwcmshc.c#L752-L880) 同时服务 RK3588，低速写入 `0x800` 起的 DLL bypass、RX/TX、CMDOUT 与 STRBIN，高速在同一区域执行复位、锁定和采样配置。相反，`0x300` 起的 `PHY_CNFG_R`、pad RXSEL、pull、slew 和 Synopsys PHY DLL 配置属于 [`dwcmshc_phy_init()`](https://github.com/torvalds/linux/blob/980ab36ae597/drivers/mmc/host/sdhci-of-dwcmshc.c#L453-L520)，由 TH1520 的时序设置和电压切换回调使用；RK3588 的 ops 没有接入它。这支持移除 RK3588 路径中无对应 Linux 接线、且硬编码 3.3 V RXSEL 的写入，不是声称已用硬件手册证明 `0x300` 的所有偏移均不存在。
+
+低速 DLL 状态并未全部交给固件：本实现的 `init_rk3588_dwcmshc_after_reset()` 和 `configure_rk3588_dwcmshc_clock_regs()` 显式重设 Rockchip DLL bypass 及相关时钟寄存器。引脚复用、上下拉和驱动强度由 `rdrive::probe_fdt_matches()` 在设备 probe 前调用 `apply_default_pinctrl()`，按设备树默认状态交给已注册的 pinctrl 驱动；没有 pinctrl 设备时该步骤直接返回，未声明或未覆盖的 pad 设置仍依赖固件或复位默认值。固定 VQMMC 也只验证设备树契约，不测量实际电压、不替代稳压器控制。因此源码对照和寄存器夹具不能证明所有固件下的 3.3 V 低速启动、1.8 V 高速信号或冷启动电气状态，仍须在目标板核验。
+
+仓库的 RK3568 适配器仍保留 `0x300` 写入，它不是 RK3588 的寄存器依据；上述 Linux 版本中的 RK3568 同样选择 rk35xx 路径。本次只修改 RK3588，未审定或验证 RK3568 的既有 PHY 初始化，不能据此把两者差异解释为已经验证的硬件需求。
+
 `advance_host2_tuning()` 实际发出 CMD19 或 CMD21，块大小按协议和总线宽度选择 64 或 128 字节。只有已确认的 buffer-ready IRQ 才能推进调谐；定时唤醒只负责超时和 CMD19 的间隔。最多 40 次尝试，每次等待上限 50 ms。失败清理命令线和数据线，不用全控制器复位抹掉已经协商好的总线宽度与电压。降级时钟失败也向上返回，不假定降级已经完成。
 
 ## 3. 队列所有权
