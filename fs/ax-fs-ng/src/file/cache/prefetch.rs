@@ -4,7 +4,10 @@ use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc};
 use core::ops::Range;
 
 use super::CachedFile;
-use crate::os::{BlockNotification, BlockRuntimeOps, BlockThread, runtime_ops, sync::Mutex};
+use crate::{
+    BlockError, BlockResult,
+    os::{BlockNotification, BlockRuntimeOps, BlockThread, runtime_ops, sync::Mutex},
+};
 
 const MAX_QUEUED_WINDOWS: usize = 16;
 
@@ -56,13 +59,17 @@ impl PrefetchWorker {
         }
     }
 
-    fn start(&'static self, runtime: &'static dyn BlockRuntimeOps) -> bool {
+    fn start(
+        &'static self,
+        runtime: &'static dyn BlockRuntimeOps,
+    ) -> BlockResult<Arc<dyn BlockNotification>> {
         let mut resources = self.resources.lock();
-        if resources.is_some() {
-            return true;
+        if let Some(resources) = resources.as_ref() {
+            return Ok(Arc::clone(&resources.notification));
         }
-        if runtime.online_cpu_count() == 0 {
-            return false;
+        let online_cpus = runtime.online_cpu_count();
+        if online_cpus == 0 {
+            return Err(BlockError::RuntimeUnavailable);
         }
         let notification = runtime.notification();
         let waiter = Arc::clone(&notification);
@@ -76,15 +83,13 @@ impl PrefetchWorker {
                 }
             }
         });
-        let cpu = runtime.current_cpu() % runtime.online_cpu_count();
-        let Ok(thread) = runtime.spawn_pinned(String::from("axfs-readahead"), cpu, entry) else {
-            return false;
-        };
+        let cpu = runtime.current_cpu() % online_cpus;
+        let thread = runtime.spawn_pinned(String::from("axfs-readahead"), cpu, entry)?;
         *resources = Some(WorkerResources {
-            notification,
+            notification: Arc::clone(&notification),
             _thread: thread,
         });
-        true
+        Ok(notification)
     }
 
     fn push(&self, job: PrefetchJob) -> bool {
@@ -96,15 +101,13 @@ impl PrefetchWorker {
         true
     }
 
-    fn request(&self, job: PrefetchJob) {
-        let notification = self
-            .resources
-            .lock()
-            .as_ref()
-            .map(|r| Arc::clone(&r.notification));
-        if let Some(notification) = notification
-            && self.push(job)
-        {
+    fn request(&'static self, job: PrefetchJob, runtime: &'static dyn BlockRuntimeOps) {
+        // Failed startup publishes no resources, so a later request can retry.
+        // Dropping this speculative window does not change the completed read.
+        let Ok(notification) = self.start(runtime) else {
+            return;
+        };
+        if self.push(job) {
             notification.notify();
         }
     }
@@ -112,13 +115,19 @@ impl PrefetchWorker {
 
 static PREFETCH: PrefetchWorker = PrefetchWorker::new();
 
-pub(crate) fn start_background_readahead(runtime: &'static dyn BlockRuntimeOps) -> bool {
-    PREFETCH.start(runtime)
+pub(crate) fn start_background_readahead(runtime: &'static dyn BlockRuntimeOps) -> BlockResult<()> {
+    PREFETCH.start(runtime).map(|_| ())
 }
 
 impl CachedFile {
     pub(super) fn prefetch_after_read(&self, number: u32) {
-        if self.in_memory || !runtime_ops().is_ok_and(|runtime| runtime.can_block()) {
+        if self.in_memory {
+            return;
+        }
+        let Ok(runtime) = runtime_ops() else {
+            return;
+        };
+        if !runtime.can_block() {
             return;
         }
         let pages = self.shared.len().div_ceil(super::PAGE_SIZE as u64);
@@ -130,7 +139,7 @@ impl CachedFile {
             pages,
         };
         #[cfg(not(test))]
-        PREFETCH.request(job);
+        PREFETCH.request(job, runtime);
         #[cfg(test)]
         tests::enqueue(job);
     }
@@ -138,41 +147,155 @@ impl CachedFile {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use core::cell::RefCell;
+    use core::{
+        cell::Cell,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use super::*;
 
+    static WORKER: PrefetchWorker = PrefetchWorker::new();
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+    static RUNTIME: QueueRuntime = QueueRuntime {
+        state: Mutex::new(QueueRuntimeState {
+            spawn_attempts: 0,
+            notification: None,
+        }),
+    };
+
     std::thread_local! {
-        static QUEUED: RefCell<Option<Arc<PrefetchWorker>>> = const { RefCell::new(None) };
+        static QUEUED: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn enqueue(job: PrefetchJob) {
-        QUEUED.with(|queue| {
-            if let Some(worker) = queue.borrow().as_ref() {
-                worker.push(job);
-            } else {
-                PREFETCH.request(job);
+        // Cache tests opt in to an isolated executor. Never start a global
+        // host thread that could consume another test's page provider.
+        QUEUED.with(|enabled| {
+            if enabled.get() {
+                WORKER.request(job, &RUNTIME);
             }
         });
     }
 
-    pub(in super::super) fn with_queue(run: impl FnOnce(&dyn Fn())) {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                QUEUED.with(|queue| *queue.borrow_mut() = None);
-            }
+    struct QueueNotification {
+        pending: AtomicBool,
+    }
+
+    impl BlockNotification for QueueNotification {
+        fn notify(&self) {
+            self.pending.store(true, Ordering::Release);
         }
-        let worker = Arc::new(PrefetchWorker::new());
-        QUEUED.with(|queue| *queue.borrow_mut() = Some(Arc::clone(&worker)));
-        let _reset = Reset;
-        run(&|| {
-            let job = worker
+
+        fn wait(&self) {
+            panic!("the isolated executor drains jobs explicitly");
+        }
+
+        fn wait_timeout(&self, _duration: Duration) -> bool {
+            panic!("the isolated executor drains jobs explicitly");
+        }
+    }
+
+    struct QueuedThread {
+        _entry: Mutex<Box<dyn FnOnce() + Send + 'static>>,
+    }
+
+    impl BlockThread for QueuedThread {
+        fn join(&self) {
+            panic!("the isolated executor does not run a host thread");
+        }
+    }
+
+    #[derive(Default)]
+    struct QueueRuntimeState {
+        spawn_attempts: usize,
+        notification: Option<Arc<QueueNotification>>,
+    }
+
+    struct QueueRuntime {
+        state: Mutex<QueueRuntimeState>,
+    }
+
+    impl BlockRuntimeOps for QueueRuntime {
+        fn current_cpu(&self) -> usize {
+            0
+        }
+
+        fn online_cpu_count(&self) -> usize {
+            1
+        }
+
+        fn can_block(&self) -> bool {
+            true
+        }
+
+        fn notification(&self) -> Arc<dyn BlockNotification> {
+            let notification = Arc::new(QueueNotification {
+                pending: AtomicBool::new(false),
+            });
+            self.state.lock().notification = Some(Arc::clone(&notification));
+            notification
+        }
+
+        fn spawn_pinned(
+            &self,
+            _name: String,
+            _cpu: usize,
+            entry: Box<dyn FnOnce() + Send + 'static>,
+        ) -> BlockResult<Box<dyn BlockThread>> {
+            let mut state = self.state.lock();
+            state.spawn_attempts += 1;
+            if state.spawn_attempts == 1 {
+                return Err(BlockError::NoMemory);
+            }
+            Ok(Box::new(QueuedThread {
+                _entry: Mutex::new(entry),
+            }))
+        }
+    }
+
+    pub(in super::super) struct TestQueue;
+
+    impl TestQueue {
+        pub(in super::super) fn start(&self) -> BlockResult<()> {
+            WORKER.start(&RUNTIME).map(|_| ())
+        }
+
+        pub(in super::super) fn spawn_attempts(&self) -> usize {
+            RUNTIME.state.lock().spawn_attempts
+        }
+
+        pub(in super::super) fn run_one(&self) {
+            let notification = RUNTIME.state.lock().notification.clone().unwrap();
+            assert!(
+                notification.pending.swap(false, Ordering::AcqRel),
+                "queued readahead was not notified"
+            );
+            let job = WORKER
                 .queue
                 .lock()
                 .pop_front()
                 .expect("read did not queue readahead");
             job.run();
-        });
+        }
+    }
+
+    pub(in super::super) fn with_queue(run: impl FnOnce(&TestQueue)) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                QUEUED.with(|enabled| enabled.set(false));
+                let jobs = core::mem::take(&mut *WORKER.queue.lock());
+                drop(jobs);
+                let resources = WORKER.resources.lock().take();
+                drop(resources);
+                *RUNTIME.state.lock() = QueueRuntimeState::default();
+            }
+        }
+        assert!(!QUEUED.with(Cell::get), "nested prefetch executor");
+        let _exclusive = EXCLUSIVE.lock();
+        QUEUED.with(|enabled| enabled.set(true));
+        let _reset = Reset;
+        run(&TestQueue);
     }
 }

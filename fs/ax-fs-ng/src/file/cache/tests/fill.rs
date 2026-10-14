@@ -6,9 +6,11 @@ use super::*;
 fn sequential_cache_hits_schedule_the_next_window_without_backing_io() {
     with_test_page_provider(true, |_| {
         crate::os::task::install_test_runtime_ops();
-        let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE * 32]));
+        let backing = Arc::new(CacheTestFile::new(vec![0x5a; PAGE_SIZE * 64]));
         let cached = reopen_cached_file(backing.clone());
-        super::super::prefetch::tests::with_queue(|run_one| {
+        super::super::prefetch::tests::with_queue(|queue| {
+            // Installation may fail before the first sequential request.
+            assert_eq!(queue.start(), Err(crate::BlockError::NoMemory));
             for page in 0..3 {
                 assert_eq!(
                     read_bytes(&cached, (page * PAGE_SIZE) as u64, PAGE_SIZE),
@@ -18,14 +20,27 @@ fn sequential_cache_hits_schedule_the_next_window_without_backing_io() {
             // The cache-hit caller only queued work; it did not perform I/O.
             assert_eq!(backing.state.lock().unwrap().read_calls, 1);
             assert!(!cached.is_page_cached(4));
-            run_one();
+            assert_eq!(queue.spawn_attempts(), 2);
+            queue.run_one();
             assert!(cached.is_page_cached(4));
             assert_eq!(backing.state.lock().unwrap().read_calls, 2);
+            for page in 3..=20 {
+                assert_eq!(
+                    read_bytes(&cached, (page * PAGE_SIZE) as u64, PAGE_SIZE),
+                    vec![0x5a; PAGE_SIZE]
+                );
+            }
+            // Later windows reuse the running worker and still defer I/O.
+            assert_eq!(queue.spawn_attempts(), 2);
+            assert_eq!(backing.state.lock().unwrap().read_calls, 2);
+            assert!(!cached.is_page_cached(36));
+            queue.run_one();
+            assert!(cached.is_page_cached(36));
             assert_eq!(
-                read_bytes(&cached, 4 * PAGE_SIZE as u64, PAGE_SIZE),
+                read_bytes(&cached, 36 * PAGE_SIZE as u64, PAGE_SIZE),
                 vec![0x5a; PAGE_SIZE]
             );
-            assert_eq!(backing.state.lock().unwrap().read_calls, 2);
+            assert_eq!(backing.state.lock().unwrap().read_calls, 3);
         });
     });
 }
