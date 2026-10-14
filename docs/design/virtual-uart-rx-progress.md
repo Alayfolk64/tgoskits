@@ -32,6 +32,8 @@ QEMU v10.1.0 的 [16550 RBR 读取](https://github.com/qemu/qemu/blob/v10.1.0/hw
 
 持有接收读锁后，`RxFifo::begin_read()` 在短暂状态锁内预留 `min(64, FIFO 剩余容量)`，`SerialEndpoint::poll_rx()` 只给 backend 这一长度的切片。`RxFifo::finish_read()` 把实际返回的前缀提交到 FIFO 后释放预留；FIFO 满时不调用 backend，余量保留在原队列。正常接收不会先从 backend 取走字节再因本地容量不足丢弃。
 
+PL011 的 poll 路径因此不会产生 RX FIFO overrun，当前模型不再向客户机上报 OE。`SerialBackend::read()` 只传递字节，没有物理接收错误元数据；`Pl011State::receive_error` 仅初始化为零和清零，DR/RSR 读取的接收错误状态保持为零。这一边界不等于物理串口没有溢出，也不影响 16550 对本地 loopback 写入容量不足的既有 overrun 处理。
+
 在途读期间，RBR/DR 可消费已提交字节，loopback 只能占用未预留空间。FCR 清除只删除已提交字节并保留预留；读返回时作为后续到达追加在清除之后的 loopback 字节后面。这样已接受字节的提交顺序和容量上限都由同一状态锁确定。宿主测试中的 backend unwind 由 `RxCompletion` 释放预留，接收读锁由 guard 释放，不留下永久 busy 状态。
 
 ### 2.3 IRQ 发布
