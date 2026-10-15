@@ -44,7 +44,12 @@ fn lazy_mm_failed_notification_retries_on_the_production_reclaimer() {
     let user = unsafe {
         prepare_user_thread(
             builder("lazy-reclaim-user".into()).affinity(target_affinity.clone()),
-            move || assert_eq!(ax_hal::cpu::mmu::read_user_page_table(), root),
+            move || {
+                assert_eq!(ax_hal::cpu::mmu::read_user_page_table(), root);
+                // Match Starry do_exit: release the task-scoped MM pin before
+                // generic thread exit, retaining only the CPU's lazy lease.
+                ax_runtime::thread::detach_current_address_space().unwrap();
+            },
             UserContextOptions::new(user_mm),
         )
     }.unwrap().publish().unwrap();
