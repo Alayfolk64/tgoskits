@@ -19,7 +19,7 @@ pub use uart16550::Uart16550;
 mod tests {
     use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
     use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     use axdevice_base::{
         AccessWidth, ControllerInputId, InterruptControllerId, InterruptTriggerMode, IrqLine,
@@ -33,6 +33,7 @@ mod tests {
         input: Mutex<VecDeque<u8>>,
         output: Mutex<Vec<u8>>,
         blocked: AtomicBool,
+        write_pause: Mutex<Option<Arc<(Barrier, Barrier)>>>,
     }
 
     impl TestBackend {
@@ -51,7 +52,13 @@ mod tests {
         }
 
         fn try_write(&self, bytes: &[u8]) -> usize {
-            if self.blocked.load(Ordering::Acquire) {
+            let blocked = self.blocked.load(Ordering::Acquire);
+            let pause = self.write_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.0.wait();
+                pause.1.wait();
+            }
+            if blocked {
                 return 0;
             }
             self.output.lock().unwrap().extend_from_slice(bytes);
@@ -145,7 +152,7 @@ mod tests {
 
         let backend = Arc::new(TestBackend::default());
         let sink = Arc::new(TestIrqSink::default());
-        let uart = Uart16550::new(backend.clone(), level_irq(sink.clone(), 4));
+        let uart = Arc::new(Uart16550::new(backend.clone(), level_irq(sink.clone(), 4)));
 
         uart.write(1, AccessWidth::Byte, 1 << 1).unwrap();
         assert_eq!(sink.levels.lock().unwrap().as_slice(), [true]);
@@ -198,6 +205,74 @@ mod tests {
         uart.poll().unwrap();
         assert_eq!(backend.output.lock().unwrap().as_slice(), b"PQR");
         assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 2);
+
+        // Reset must not let an old completion remove a newly queued byte.
+        let pause = Arc::new((Barrier::new(2), Barrier::new(2)));
+        *backend.write_pause.lock().unwrap() = Some(pause.clone());
+        let writer = std::thread::spawn({
+            let uart = uart.clone();
+            move || uart.write(0, AccessWidth::Byte, b'S' as u64).unwrap()
+        });
+        pause.0.wait();
+        uart.write(2, AccessWidth::Byte, 1 << 2).unwrap();
+        uart.write(0, AccessWidth::Byte, b'T' as u64).unwrap();
+        pause.1.wait();
+        writer.join().unwrap();
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"PQRST");
+
+        // Capacity can be released while a rejected submission is returning.
+        backend.set_blocked(true);
+        let pause = Arc::new((Barrier::new(2), Barrier::new(2)));
+        *backend.write_pause.lock().unwrap() = Some(pause.clone());
+        let writer = std::thread::spawn({
+            let uart = uart.clone();
+            move || uart.write(0, AccessWidth::Byte, b'U' as u64).unwrap()
+        });
+        pause.0.wait();
+        backend.set_blocked(false);
+        uart.poll().unwrap();
+        pause.1.wait();
+        writer.join().unwrap();
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"PQRSTU");
+        assert_eq!(
+            uart.read(5, AccessWidth::Byte).unwrap() & TX_EMPTY,
+            TX_EMPTY
+        );
+        assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 2);
+
+        backend.set_blocked(true);
+        uart.write(2, AccessWidth::Byte, 1).unwrap();
+        for &byte in b"0123456789abcdef" {
+            uart.write(0, AccessWidth::Byte, byte as u64).unwrap();
+        }
+        uart.write(1, AccessWidth::Byte, 0).unwrap();
+        uart.write(1, AccessWidth::Byte, 1 << 1).unwrap();
+        assert_eq!(uart.read(5, AccessWidth::Byte).unwrap() & TX_EMPTY, 0);
+        assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 1);
+        backend.set_blocked(false);
+        uart.poll().unwrap();
+        assert_eq!(
+            backend.output.lock().unwrap().as_slice(),
+            b"PQRSTU0123456789abcdef"
+        );
+        assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 2);
+
+        backend.set_blocked(true);
+        uart.write(0, AccessWidth::Byte, b'X' as u64).unwrap();
+        uart.write(2, AccessWidth::Byte, 1 << 2).unwrap();
+        uart.write(4, AccessWidth::Byte, 1 << 4).unwrap();
+        uart.write(0, AccessWidth::Byte, b'Y' as u64).unwrap();
+        assert_eq!(uart.read(0, AccessWidth::Byte).unwrap(), b'Y' as u64);
+        assert_eq!(
+            uart.read(5, AccessWidth::Byte).unwrap() & TX_EMPTY,
+            TX_EMPTY
+        );
+        backend.set_blocked(false);
+        uart.poll().unwrap();
+        assert_eq!(
+            backend.output.lock().unwrap().as_slice(),
+            b"PQRSTU0123456789abcdef"
+        );
     }
 
     #[test]

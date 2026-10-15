@@ -34,10 +34,6 @@ impl SerialEndpoint {
         self.set_irq_level(receive(&bytes[..count]))
     }
 
-    pub(super) fn write(&self, bytes: &[u8]) {
-        self.backend.write(bytes);
-    }
-
     pub(super) fn try_write(&self, bytes: &[u8]) -> usize {
         self.backend.try_write(bytes).min(bytes.len())
     }
