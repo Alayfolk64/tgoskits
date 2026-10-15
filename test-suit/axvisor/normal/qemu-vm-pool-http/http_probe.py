@@ -485,9 +485,19 @@ class WebSocket:
         self.stream = stream
         self.buffered = buffered
 
-    def recv_exact(self, length):
+    def recv_exact(self, length, deadline):
         while len(self.buffered) < length:
-            chunk = self.stream.recv(length - len(self.buffered))
+            timeout = self.stream.gettimeout()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WebSocket frame incomplete at the deadline")
+            self.stream.settimeout(remaining if timeout is None else min(timeout, remaining))
+            try:
+                chunk = self.stream.recv(length - len(self.buffered))
+            except socket.timeout as error:
+                raise TimeoutError("WebSocket frame receive timed out within its deadline") from error
+            finally:
+                self.stream.settimeout(timeout)
             if not chunk:
                 raise AssertionError("WebSocket closed while receiving a frame")
             self.buffered += chunk
@@ -495,22 +505,22 @@ class WebSocket:
         self.buffered = self.buffered[length:]
         return output
 
-    def recv_frame(self):
-        first, second = self.recv_exact(2)
+    def recv_frame(self, deadline):
+        first, second = self.recv_exact(2, deadline)
         opcode = first & 0x0F
         length = second & 0x7F
         if length == 126:
-            length = struct.unpack("!H", self.recv_exact(2))[0]
+            length = struct.unpack("!H", self.recv_exact(2, deadline))[0]
         elif length == 127:
-            length = struct.unpack("!Q", self.recv_exact(8))[0]
+            length = struct.unpack("!Q", self.recv_exact(8, deadline))[0]
         if second & 0x80:
-            mask = self.recv_exact(4)
+            mask = self.recv_exact(4, deadline)
             payload = bytes(
                 byte ^ mask[index % 4]
-                for index, byte in enumerate(self.recv_exact(length))
+                for index, byte in enumerate(self.recv_exact(length, deadline))
             )
         else:
-            payload = self.recv_exact(length)
+            payload = self.recv_exact(length, deadline)
         return opcode, payload
 
     def close(self):
@@ -559,12 +569,11 @@ def expect_websocket(path):
 
 
 def read_json_frame(websocket, deadline):
-    """Return the next frame decoded as JSON, waiting until `deadline` to start.
+    """Return the next JSON frame, including partial reads, before `deadline`.
 
-    Complete buffered frames need no socket readiness. The deadline bounds
-    waiting between frames, not completion of an incomplete frame: recv_exact()
-    uses the configured socket timeout for each additional recv(), which may
-    extend beyond the deadline. EOF and socket errors still propagate.
+    Complete buffered frames need no socket readiness. Every additional recv()
+    uses the remaining deadline, capped by the configured socket timeout.
+    EOF and incomplete-frame timeouts remain failures.
     """
     while True:
         remaining = deadline - time.monotonic()
@@ -576,7 +585,7 @@ def read_json_frame(websocket, deadline):
             ready, _, _ = select.select([websocket.stream], [], [], min(remaining, 1.0))
             if not ready:
                 continue
-        opcode, payload = websocket.recv_frame()
+        opcode, payload = websocket.recv_frame(deadline)
         if opcode == 8:
             raise AssertionError("event socket closed while waiting for a frame")
         if opcode not in (1, 2):

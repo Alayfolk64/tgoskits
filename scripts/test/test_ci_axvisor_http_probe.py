@@ -96,6 +96,47 @@ class ProbeFrameTests(unittest.TestCase):
                         server.sendall(frame[buffered_length:])
                         self.assertEqual(receive(probe, reader, websocket), expected)
 
+    def test_partial_frames_cannot_extend_the_reader_deadline(self):
+        frame = text_frame({"type": "snapshot", "vms": []})
+        readers = ((POOL, "read_json_frame"), (WEB, "receive_text"),
+                   (WEB, "receive_some"), (WEB, "drain_available"))
+        for probe, reader in readers:
+            for progress in (False, True):
+                with self.subTest(reader=reader, progress=progress):
+                    client, server = socket.socketpair()
+                    with client, server:
+                        client.settimeout(0.2)
+                        stream = Mock(wraps=client)
+                        websocket = probe.WebSocket(stream, frame[:1])
+                        clock = [100.0]
+                        if progress:
+                            server.sendall(frame[1:])
+
+                            def recv_fragment(length):
+                                chunk = client.recv(min(length, 1))
+                                clock[0] += 0.02
+                                return chunk
+
+                            stream.recv.side_effect = recv_fragment
+                            clock_source = lambda: clock[0]
+                            deadline = clock[0] + 0.05
+                        else:
+                            clock_source = time.monotonic
+                            deadline = clock_source() + 0.01
+                        duration = deadline - clock_source()
+                        bound = duration if reader == "drain_available" else deadline
+                        with patch.object(probe.time, "monotonic", side_effect=clock_source):
+                            with self.assertRaisesRegex(TimeoutError, "frame.*deadline"):
+                                getattr(probe, reader)(websocket, bound)
+                        if not progress:
+                            waits = [call.args[0] for call in stream.settimeout.call_args_list
+                                     if call.args[0] != 0.2]
+                            self.assertTrue(waits, "partial reads must use the remaining budget")
+                            self.assertTrue(all(0 < wait <= duration for wait in waits))
+                        # A failed partial read must not leave a shorter socket
+                        # timeout installed for later cleanup or diagnostics.
+                        self.assertEqual(client.gettimeout(), 0.2)
+
     def test_quiet_and_closed_event_streams_still_fail(self):
         for probe, reader in ((POOL, "read_json_frame"), (WEB, "receive_text")):
             with self.subTest(reader=reader, state="quiet"):
