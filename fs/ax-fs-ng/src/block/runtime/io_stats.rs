@@ -16,7 +16,8 @@ use crate::os::{monotonic_time, sync::RawSpinLock};
 /// In-flight and busy time cover read/write requests. `Flush` is the separate
 /// hardware flush command, like Linux's internal `flush_rq`, not its containing
 /// write/PREFLUSH request. Weighted time sums completed read/write/flush latency;
-/// snapshots never charge unfinished request latency to that field.
+/// snapshots never charge unfinished request latency to that field. A cancelled
+/// pre-enqueue admission releases in-flight state without completing an I/O.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BlockIoStats {
     pub reads: u64,
@@ -68,6 +69,13 @@ impl IoState {
         }
     }
 
+    fn cancel(&mut self, now: Duration, op: RequestOp) {
+        self.advance(now);
+        if op != RequestOp::Flush {
+            self.counters.inflight -= 1;
+        }
+    }
+
     fn complete(
         &mut self,
         now: Duration,
@@ -111,7 +119,8 @@ fn nanos(duration: Duration) -> u64 {
 
 /// Moves with the sole completion sender from runtime admission onward.
 /// Dropping a receiver cannot stop accounting. Validation and admission errors
-/// precede construction; later queue/hardware failures terminate this lease.
+/// precede construction. A pre-enqueue return/cancellation abandons this lease;
+/// accepted requests must publish a terminal completion, even on failure.
 pub(super) struct RequestAccounting {
     metrics: Arc<DeviceIoMetrics>,
     op: RequestOp,
@@ -136,23 +145,22 @@ impl RequestAccounting {
     }
 
     pub(super) fn complete(&mut self, failed: bool) {
-        self.finish(failed, self.sectors);
-    }
-
-    fn finish(&mut self, failed: bool, sectors: u64) {
         if let Some(started) = self.started.take() {
             let mut state = self.metrics.state.lock_irqsave();
-            state.complete(monotonic_time(), started, self.op, sectors, failed);
+            state.complete(monotonic_time(), started, self.op, self.sectors, failed);
         }
     }
 }
 
 impl Drop for RequestAccounting {
     fn drop(&mut self) {
-        // A submission returned to its caller or cancelled before enqueue has
-        // no retired device bytes. Hctx shutdown/protocol failures instead
-        // publish terminal completions, including the full request length.
-        self.finish(true, 0);
+        // Only pre-enqueue returns/cancellation abandon accounting. Accepted
+        // requests publish terminal completions through the hctx, including
+        // shutdown/protocol failures; dropping a receiver does not own this lease.
+        if self.started.take().is_some() {
+            let mut state = self.metrics.state.lock_irqsave();
+            state.cancel(monotonic_time(), self.op);
+        }
     }
 }
 
@@ -191,5 +199,22 @@ mod tests {
             "failed retirement still accounts request bytes"
         );
         assert_eq!(state.counters.failed_requests, 1);
+        let completed = state.counters;
+        state.begin(ms(110), RequestOp::Read);
+        state.begin(ms(120), RequestOp::Write);
+        state.begin(ms(125), RequestOp::Flush);
+        state.cancel(ms(130), RequestOp::Write);
+        assert_eq!(state.counters.inflight, 1);
+        state.cancel(ms(140), RequestOp::Read);
+        state.cancel(ms(150), RequestOp::Flush);
+        state.advance(ms(200));
+        assert_eq!(
+            state.counters,
+            BlockIoStats {
+                busy_ns: completed.busy_ns + 30_000_000,
+                ..completed
+            },
+            "pre-enqueue cancellation only closes the observed busy interval"
+        );
     }
 }

@@ -575,6 +575,7 @@ mod tests {
             "terminal I/O error retires the full request"
         );
 
+        let completed = metrics.snapshot();
         let (receiver, mut sender) = pair();
         sender.account(RequestAccounting::new(
             Arc::clone(&metrics),
@@ -584,13 +585,15 @@ mod tests {
         drop(receiver);
         drop(sender);
         let stats = metrics.snapshot();
-        assert_eq!(stats.writes, 2);
         assert_eq!(
-            stats.sectors_written, 8,
-            "abandoned admission did not retire device bytes"
+            stats,
+            super::super::io_stats::BlockIoStats {
+                busy_ns: stats.busy_ns,
+                ..completed
+            },
+            "abandoned admission must not count as a terminal I/O or failure"
         );
-        assert_eq!(stats.failed_requests, 2);
-        assert_eq!(stats.inflight, 0);
+        assert!(stats.busy_ns >= completed.busy_ns);
     }
 
     #[derive(Default)]

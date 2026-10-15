@@ -849,6 +849,15 @@ fn async_submit_waits_for_full_channel_and_rolls_back_on_cancel() {
     drop(future);
     assert!(!handle.inner.lifecycle_gate.lock_irqsave().flush_active);
     assert_eq!(replacement.queued_len(), 1);
+    let stats = handle.io_stats();
+    assert_eq!(
+        stats,
+        crate::block::runtime::BlockIoStats {
+            busy_ns: stats.busy_ns,
+            ..Default::default()
+        },
+        "a request cancelled or returned before enqueue is not completed I/O"
+    );
     let _ = handle.shutdown();
 }
 
@@ -870,9 +879,19 @@ fn async_data_submit_waits_for_full_channel_and_rolls_back_on_cancel() {
     assert_eq!(handle.inner.lifecycle_gate.lock_irqsave().active_data, 1);
     assert_eq!(replacement.queued_len(), 1);
 
+    assert_eq!(handle.io_stats().inflight, 1);
     drop(future);
     assert_eq!(handle.inner.lifecycle_gate.lock_irqsave().active_data, 0);
     assert_eq!(replacement.queued_len(), 1);
+    let stats = handle.io_stats();
+    assert_eq!(
+        stats,
+        crate::block::runtime::BlockIoStats {
+            busy_ns: stats.busy_ns,
+            ..Default::default()
+        },
+        "a request cancelled or returned before enqueue is not completed I/O"
+    );
     let _ = handle.shutdown();
 }
 
@@ -996,6 +1015,23 @@ fn async_submit_nowait_returns_request_when_channel_is_full() {
     assert!(!handle.inner.lifecycle_gate.lock_irqsave().flush_active);
     assert_eq!(replacement.queued_len(), 1);
     drop(future);
+    let error = match handle.submit_owned(flush_request(RequestFlags::NOWAIT)) {
+        Err(error) => error,
+        Ok(_) => panic!("synchronous NOWAIT request entered a full channel"),
+    };
+    assert_eq!(error.error, BlkError::Retry);
+    assert_eq!(error.into_request().op, RequestOp::Flush);
+    assert!(!handle.inner.lifecycle_gate.lock_irqsave().flush_active);
+    assert_eq!(replacement.queued_len(), 1);
+    let stats = handle.io_stats();
+    assert_eq!(
+        stats,
+        crate::block::runtime::BlockIoStats {
+            busy_ns: stats.busy_ns,
+            ..Default::default()
+        },
+        "a request cancelled or returned before enqueue is not completed I/O"
+    );
     let _ = handle.shutdown();
 }
 
