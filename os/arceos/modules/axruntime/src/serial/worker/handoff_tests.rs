@@ -72,6 +72,8 @@ fn fixture() -> (SerialRuntimeHandle, SerialWorker, Arc<Wire>) {
             irq: None,
         },
         owner_cpu: 0,
+        #[cfg(feature = "fault-injection")]
+        deferred_test_consumed: AtomicU8::new(0),
         polling: false,
         port: RawSpinLock::new(Box::new(Port(wire.clone()))),
         register_gate: Arc::new(UartRegisterGate::new(Emergency)),

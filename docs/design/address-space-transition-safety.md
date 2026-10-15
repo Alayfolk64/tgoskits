@@ -135,13 +135,23 @@ MM 加入 `RETIRE_QUEUE`；最后一个 runtime lease 释放所产生的 ax-task
 active handle 清零后，下次用户切换无法命中 same-mm
 保留根恢复分支，必须按不同地址空间重新安装，因此没有扩大上文省略 TLBI 的适用范围。
 
-该通知仅加快回收，不是 shootdown 完成确认。IPI 发送失败时，通过
-`try_publish_deferred_record()` 向有界串口 mailbox 尽力写入诊断，继续通知其余目标；不立即唤醒
-串口 worker，避免日志再次使用同一故障 IPI 通道。诊断等待后续独立唤醒消费，mailbox 满或没有
-runtime console 时可以丢弃。永久请求与全部 CPU lease 始终保留，不在析构或 IRQ 路径上因此
-急停，也不提前释放页表。
-后续普通 IPI、进入 lazy 的切换或离开该 mm 可继续推进；若目标没有后续执行机会，回收仍可能
-延迟，不能把保留标志写成保证有限时间完成。`CpuOffline` 沿既有 CPU offline 释放协议处理。
+该通知不是 shootdown 完成确认。`lazy_reclaim_requested` 只表达永久逻辑请求，不再禁止
+后续物理通知。`MmInner` 在首次通知前通过独立的 `lazy_reclaim_link` 将自己加入
+`LAZY_CPU_RECLAIM_QUEUE`；已有 sleepable reclaimer 每轮最多重试 16 个 MM，轮间休眠
+10 ms。只要仍是 `Retiring` 且没有 pin、仍有 active CPU，就重新排队并通知。即使第一次
+发送失败，或返回 `Coalesced` 的原发送者随后失败，也不依赖外部再次释放 owner 或普通 IPI
+才能重新尝试。独立链允许 activation 回调同时加入退休队列，不能与 destruction/repair 共用链接。
+
+发送失败通过 `try_publish_deferred_record()` 向有界串口 mailbox 尽力写入诊断，不立即
+唤醒串口 worker，避免日志再次进入同一故障 IPI 通道；每个 MM/CPU 最多报告一次，重试不会刷屏。
+支持 lazy 驱逐的运行时仅为当前活动控制台保留一秒本地等待超时，由 CPU-affine worker
+睡前注册，超时后重新检查 mailbox。其他 IRQ 串口仍按普通通知休眠；轮询串口使用既有轮询路径。
+mailbox 满或没有 runtime console 时仍可丢弃，并沿既有丢弃统计报告。
+
+`CpuOffline` 沿既有 CPU offline 释放协议处理。重试成功也不减少 lease；必须等目标安装安全根、
+刷新 TLB 并归还引用后才回收。永久控制器故障或目标 CPU 永远不能执行时仍保留全部资源，
+不能承诺故障硬件下有限时间完成。这里与 Linux v7.1 `cleanup_lazy_tlbs()` 同样要求目标完成
+根切换后才能释放；Starry 使用有界后台重试承接可报告失败的 IPI 接口。
 
 ### 3.2 跨 mm 失效、FullFlush 与混合模式 ASID 0 卫生
 
@@ -555,7 +565,26 @@ TLB 缓存留存当作架构保证，或假定 AT 必然读取真实缓存。
 证据，不能证明主动驱逐路径已执行或在没有新用户任务的情况下及时回收。组件用例
 `lazy_reclaim_notification_failures_preserve_cpu_leases()` 通过实际通知遍历逻辑注入失败，验证
 失败不会急停或阻断剩余目标、请求仍有效、通知不会代替 CPU 释放 lease；它不证明硬件 IPI
-投递或真实调度时序。主动驱逐的确定性端到端判别仍需隔离目标 CPU 并观测实际 lease 归零。
+投递或真实调度时序。`lazy_reclaim_retries_failed_and_unacknowledged_kicks_until_lease_release()`
+进一步验证错误后仍可重试，未确认的成功通知不能提前释放 runtime lease，实际 lease 归还后
+产生回收通知。Starry 的 `last_user_owner_cannot_reclaim_an_active_address_space()` 验证未确认
+activation 的重试项跨 worker 批次保留、完成后清除及退休回收；其中 activation 为受控的逻辑
+租约，不作为硬件根切换证据。
+
+AArch64 内核 axtest `lazy_mm_failed_notification_retries_on_the_production_reclaimer()` 使用
+真实 `MmHandle::scheduler_address_space()` 与 user-context 任务实际安装页表，然后切换到
+同 CPU 的 kernel-lazy 任务。按 MM/CPU 限定的故障注入仅使首次 lazy 通知返回 `Timeout`，
+不改变普通调度和串口 IPI。目标用三秒硬截止的 IRQ 关闭握手保留现场；协调者不再次调用
+request/retry/reap，而由固定在另一 CPU、运行同一 `run_reclaimer()` 的可停止工作线程
+自主重试。解除握手后，测试观察真实 IPI consumer 完成 root/TLB/lease 释放、MM 进入 `Freed`
+和 backing 最终释放；失败分支也先解除握手并停止工作线程，再报告断言。该用例不进入 EL0，
+证明的是 user-context 安装与 kernel-lazy 生命周期，不是用户指令执行或硬件控制器故障本身。
+
+`serial-rx` 先等待旧日志离开 mailbox，再用既有 output drain 排空当前日志和 UART；
+在真实 IRQ worker 已进入 `Blocked` 且持有已登记 IRQ waiter 后，只发布 deferred 诊断。注入时禁止日志订阅，以免 `publish_log()` 直接转发绕过 mailbox；消费证明来自实际
+`LogReader::take()` 之后对唯一完整记录的观测。随后无 RX/TX/control 门铃，必须由本地超时
+让 worker 取得记录。该回归通过 `fault-injection` 暴露状态观察与故障日志入口，不改变普通
+发行构建的公共接口。
 
 `qemu/system/test-aarch64-cpu-feat` 的普通未对齐 LDR 及搬移后 LDP Q 检查验证 EL0 访存及内容。
 用例没有在进入内核前强制设置 `SCTLR_EL1.A=1`；默认固件已清零时，删除内核显式清零仍可能

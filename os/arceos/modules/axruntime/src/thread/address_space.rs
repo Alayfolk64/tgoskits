@@ -159,6 +159,21 @@ pub struct AddressSpaceCpuState {
     active_mask: ActiveCpuMask,
     membarrier_bits: AtomicU32,
     lazy_reclaim_requested: AtomicBool,
+    #[cfg(feature = "fault-injection")]
+    lazy_reclaim_test_cpu: AtomicUsize,
+    #[cfg(feature = "fault-injection")]
+    lazy_reclaim_test_attempts: AtomicUsize,
+    #[cfg(feature = "fault-injection")]
+    lazy_reclaim_test_completed_cpu: AtomicUsize,
+    #[cfg(any(
+        test,
+        all(
+            feature = "uspace",
+            not(feature = "host-test"),
+            any(feature = "ipi", feature = "wake-ipi")
+        )
+    ))]
+    lazy_reclaim_failures_reported: AtomicUsize,
 }
 
 enum ActiveCpuMask {
@@ -174,6 +189,21 @@ impl AddressSpaceCpuState {
             active_mask: ActiveCpuMask::Runtime(AtomicUsize::new(0)),
             membarrier_bits: AtomicU32::new(0),
             lazy_reclaim_requested: AtomicBool::new(false),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_cpu: AtomicUsize::new(usize::MAX),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_attempts: AtomicUsize::new(0),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_completed_cpu: AtomicUsize::new(usize::MAX),
+            #[cfg(any(
+                test,
+                all(
+                    feature = "uspace",
+                    not(feature = "host-test"),
+                    any(feature = "ipi", feature = "wake-ipi")
+                )
+            ))]
+            lazy_reclaim_failures_reported: AtomicUsize::new(0),
         }
     }
 
@@ -185,6 +215,21 @@ impl AddressSpaceCpuState {
             active_mask: ActiveCpuMask::Mm(active_mask),
             membarrier_bits: AtomicU32::new(0),
             lazy_reclaim_requested: AtomicBool::new(false),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_cpu: AtomicUsize::new(usize::MAX),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_attempts: AtomicUsize::new(0),
+            #[cfg(feature = "fault-injection")]
+            lazy_reclaim_test_completed_cpu: AtomicUsize::new(usize::MAX),
+            #[cfg(any(
+                test,
+                all(
+                    feature = "uspace",
+                    not(feature = "host-test"),
+                    any(feature = "ipi", feature = "wake-ipi")
+                )
+            ))]
+            lazy_reclaim_failures_reported: AtomicUsize::new(0),
         }
     }
 
@@ -211,30 +256,76 @@ impl AddressSpaceCpuState {
     /// counters become quiescent only after each CPU switches roots and flushes
     /// its translations. Call after ending user/pinned continuation ownership
     /// when teardown must progress without another user task being scheduled.
-    /// Notification failure retains both the request and all CPU leases. It
-    /// may delay reclamation until another IPI or address-space transition;
-    /// delivery is never treated as an acknowledgement of root replacement.
+    /// Notification failure retains both the request and all CPU leases. Each
+    /// call retries the physical kick, including a previous coalesced send whose
+    /// original sender later failed. The MM owner must retry from a bounded
+    /// worker until its activation counters drain; delivery is never an
+    /// acknowledgement of root replacement.
     pub fn request_lazy_reclaim(&self) {
-        let first_request = !self.lazy_reclaim_requested.swap(true, Ordering::AcqRel);
-        #[cfg(any(not(feature = "uspace"), test, feature = "host-test"))]
-        let _ = first_request;
-        #[cfg(all(feature = "uspace", not(any(test, feature = "host-test"))))]
-        if first_request {
-            #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+        self.request_lazy_reclaim_with(|| {
+            #[cfg(all(feature = "uspace", not(any(test, feature = "host-test"))))]
             {
-                // notify_cpu may select a self-directed physical IPI. Keep
-                // that CPU identity stable until all sends have completed.
-                let _preempt = crate::task::sync::PreemptGuard::new();
-                self.notify_lazy_reclaim_cpus(|cpu| ax_ipi::notify_cpu(cpu).map(|_| ()));
+                #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+                {
+                    // notify_cpu may select a self-directed physical IPI. Keep
+                    // that CPU identity stable until all sends have completed.
+                    let _preempt = crate::task::sync::PreemptGuard::new();
+                    self.notify_lazy_reclaim_cpus(|cpu| {
+                        #[cfg(feature = "fault-injection")]
+                        if self.lazy_reclaim_test_cpu.load(Ordering::Acquire) == cpu.0
+                            && self
+                                .lazy_reclaim_test_attempts
+                                .fetch_add(1, Ordering::AcqRel)
+                                == 0
+                        {
+                            return Err(ax_hal::irq::IrqError::Timeout);
+                        }
+                        ax_ipi::notify_cpu(cpu).map(|_| ())
+                    });
+                }
+                #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
+                {
+                    // SMP enables wake-ipi. A UP runtime consumes the same
+                    // request locally, without an interrupt transport.
+                    let _irq = crate::task::sync::IrqSaveGuard::new();
+                    reclaim_current_lazy_address_space();
+                }
             }
-            #[cfg(not(any(feature = "ipi", feature = "wake-ipi")))]
-            {
-                // SMP enables wake-ipi. A UP runtime can consume the same
-                // request locally, without an interrupt transport.
-                let _irq = crate::task::sync::IrqSaveGuard::new();
-                reclaim_current_lazy_address_space();
-            }
+        });
+    }
+
+    /// Fails only this MM's first lazy-reclaim notification to `cpu`.
+    /// Scheduler, console and other MM notifications retain their real path.
+    #[cfg(feature = "fault-injection")]
+    pub fn fail_first_lazy_reclaim_for_test(&self, cpu: usize) -> Result<(), TaskError> {
+        if cpu >= crate::CPU_CAPACITY {
+            return Err(TaskError::InvalidConfiguration);
         }
+        self.lazy_reclaim_test_cpu
+            .compare_exchange(usize::MAX, cpu, Ordering::Release, Ordering::Relaxed)
+            .map(|_| ())
+            .map_err(|_| TaskError::InvalidConfiguration)
+    }
+
+    /// Returns actual notification attempts for the configured MM/CPU pair.
+    #[cfg(feature = "fault-injection")]
+    pub fn lazy_reclaim_attempts_for_test(&self) -> usize {
+        self.lazy_reclaim_test_attempts.load(Ordering::Acquire)
+    }
+
+    /// Observes the IPI consumer after real root replacement, full TLB flush
+    /// and activation/runtime lease release on the configured CPU.
+    #[cfg(feature = "fault-injection")]
+    pub fn lazy_reclaim_completed_for_test(&self, cpu: usize) -> bool {
+        self.lazy_reclaim_test_completed_cpu.load(Ordering::Acquire) == cpu
+    }
+
+    fn request_lazy_reclaim_with(&self, kick: impl FnOnce()) {
+        // Publishing logical intent and requesting physical delivery are
+        // separate obligations. In particular, an earlier Ok(Coalesced)
+        // cannot discharge the latter on behalf of a failed sender.
+        self.lazy_reclaim_requested.store(true, Ordering::Release);
+        kick();
     }
 
     #[cfg(any(
@@ -255,12 +346,21 @@ impl AddressSpaceCpuState {
             cpus &= cpus - 1;
             match notify(ax_hal::irq::CpuId(cpu)) {
                 Ok(()) | Err(ax_hal::irq::IrqError::CpuOffline) => {}
-                // This is an advisory kick, not a shootdown acknowledgement.
-                // Retain ownership and the permanent request on failure; a
-                // later IPI or scheduler transition can consume it safely.
-                // Ordinary logging could wake a remote serial worker through
-                // the same failed IPI transport, so only queue this diagnostic.
+                // Retain ownership until root replacement, even if a send
+                // coalesced with another sender which subsequently failed.
+                // Report at most once per MM/CPU; the owner's retry worker may
+                // keep trying indefinitely after a permanent controller fault.
                 Err(error) => {
+                    if self
+                        .lazy_reclaim_failures_reported
+                        .fetch_or(1usize << cpu, Ordering::Relaxed)
+                        & (1usize << cpu)
+                        != 0
+                    {
+                        continue;
+                    }
+                    // Ordinary logging can recurse into the failed transport.
+                    // The serial owner's local timeout drains this diagnostic.
                     let _ = crate::serial::try_publish_deferred_record(
                         ax_log::RecordMeta::log(),
                         format_args!(
@@ -1107,7 +1207,14 @@ pub(crate) fn reclaim_current_lazy_address_space() {
             {
                 return false;
             }
-            release_active_address_space(pin)
+            #[cfg(feature = "fault-injection")]
+            let test_state = Arc::clone(&active.cpu_state);
+            let ready = release_active_address_space(pin);
+            #[cfg(feature = "fault-injection")]
+            test_state
+                .lazy_reclaim_test_completed_cpu
+                .store(pin.area().cpu_index().as_usize(), Ordering::Release);
+            ready
         })
     };
     if reclaim_ready {
@@ -1473,6 +1580,64 @@ mod tests {
         tracker.deactivate(2);
         tracker.deactivate(3);
         assert_eq!(tracker.active_mask(), 0);
+    }
+
+    #[test]
+    fn lazy_reclaim_retries_failed_and_unacknowledged_kicks_until_lease_release() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let tracker = Arc::new(AddressSpaceCpuState::new(PhysAddr::from(0x4000)));
+        let mut token = TaskAddressSpace::new_with_task_detach(
+            PhysAddr::from(0x4000),
+            tracker.clone(),
+            CountDrop(drops.clone()),
+            |_| {},
+        )
+        .unwrap();
+        let handle = token.handle();
+        let runtime = runtime_address_space(handle).unwrap();
+        runtime.active_leases.fetch_add(1, Ordering::AcqRel);
+        tracker.activate(1);
+        let owned = token.take_token();
+        assert_eq!(
+            arm_runtime_address_space_reclaim(handle),
+            AddressSpaceReclaimArmOutcome::Armed
+        );
+
+        let mut attempts = 0;
+        // First fail, then coalesce with an in-flight sender whose send also
+        // fails, and finally deliver. Neither Err nor Ok acknowledges a root
+        // switch: the callback below models only physical transport outcomes.
+        for outcome in [Err(ax_hal::irq::IrqError::Timeout), Ok(()), Ok(())] {
+            tracker.request_lazy_reclaim_with(|| {
+                tracker.notify_lazy_reclaim_cpus(|cpu| {
+                    assert_eq!(cpu.0, 1);
+                    attempts += 1;
+                    outcome
+                });
+            });
+            assert_eq!(tracker.active_mask(), 1 << 1);
+            assert_eq!(
+                destroy_runtime_address_space(handle),
+                AddressSpaceDestroyOutcome::Active
+            );
+        }
+        assert_eq!(
+            attempts, 3,
+            "a sticky logical request must not suppress later physical kicks"
+        );
+        // Only the target's completed root/TLB transition permits release.
+        tracker.deactivate(1);
+        assert!(
+            release_active_cpu(runtime),
+            "the armed runtime reaper must be notified"
+        );
+        assert_eq!(tracker.active_mask(), 0);
+        assert_eq!(
+            destroy_runtime_address_space(handle),
+            AddressSpaceDestroyOutcome::Released
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(!owned.is_none());
     }
 
     #[test]
