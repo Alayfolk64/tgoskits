@@ -569,10 +569,13 @@ def read_json_frame(websocket, deadline):
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError()
-        ready, _, _ = select.select([websocket.stream], [], [], min(remaining, 1.0))
-        if not ready:
-            continue
+            raise TimeoutError("no event frame arrived before the deadline")
+        # The upgrade read may already contain the snapshot frame. Socket
+        # readiness does not include bytes held in our userspace buffer.
+        if not websocket.buffered:
+            ready, _, _ = select.select([websocket.stream], [], [], min(remaining, 1.0))
+            if not ready:
+                continue
         opcode, payload = websocket.recv_frame()
         if opcode == 8:
             raise AssertionError("event socket closed while waiting for a frame")

@@ -353,9 +353,11 @@ def receive_text(websocket, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AssertionError("no event frame arrived before the deadline")
-        ready, _, _ = select.select([websocket.stream], [], [], remaining)
-        if not ready:
-            raise AssertionError("no event frame arrived before the deadline")
+        # Consume upgrade/read-ahead bytes before waiting on the socket.
+        if not websocket.buffered:
+            ready, _, _ = select.select([websocket.stream], [], [], remaining)
+            if not ready:
+                raise AssertionError("no event frame arrived before the deadline")
         opcode, payload = websocket.recv_frame()
         if opcode == 1:
             return json.loads(payload.decode("utf-8"))
@@ -430,9 +432,11 @@ def receive_some(websocket, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AssertionError("no console output arrived before the deadline")
-        ready, _, _ = select.select([websocket.stream], [], [], remaining)
-        if not ready:
-            continue
+        # Consume upgrade/read-ahead bytes before waiting on the socket.
+        if not websocket.buffered:
+            ready, _, _ = select.select([websocket.stream], [], [], remaining)
+            if not ready:
+                continue
         opcode, payload = websocket.recv_frame()
         if opcode == 8:
             raise AssertionError("the console closed before the output arrived")
@@ -451,9 +455,11 @@ def drain_available(websocket, seconds):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return out
-        ready, _, _ = select.select([websocket.stream], [], [], remaining)
-        if not ready:
-            return out
+        # Consume upgrade/read-ahead bytes before waiting on the socket.
+        if not websocket.buffered:
+            ready, _, _ = select.select([websocket.stream], [], [], remaining)
+            if not ready:
+                return out
         opcode, payload = websocket.recv_frame()
         if opcode in (1, 2):
             out += payload
