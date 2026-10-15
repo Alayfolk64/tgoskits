@@ -7,7 +7,7 @@ from pathlib import Path
 import socket
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,11 +49,27 @@ class ProbeFrameTests(unittest.TestCase):
                 client, server = socket.socketpair()
                 with client, server:
                     server.sendall(response)
-                    with patch.object(probe.socket, "create_connection", return_value=client):
+                    # Force one legal coalesced recv result, independently of
+                    # how the OS splits a stream write into reads. The bytes
+                    # still travel through the real socket; only chunking is
+                    # controlled, not the production handshake/frame parser.
+                    def receive_upgrade(length):
+                        self.assertGreaterEqual(length, len(response))
+                        data = b""
+                        while len(data) < len(response):
+                            chunk = client.recv(len(response) - len(data))
+                            if not chunk:
+                                raise AssertionError("fixture socket closed during upgrade")
+                            data += chunk
+                        return data
+
+                    stream = Mock(wraps=client)
+                    stream.recv.side_effect = receive_upgrade
+                    with patch.object(probe.socket, "create_connection", return_value=stream):
                         upgraded = probe.open_websocket("/ws/events")
                     websocket = upgraded[0] if isinstance(upgraded, tuple) else upgraded
-                    # The server sent both frames before the upgrade reader ran;
-                    # this verifies that this run exercises the coalesced input.
+                    # This is a precondition for the coalesced-input regression;
+                    # the decoded messages below are the observable verdict.
                     self.assertEqual(websocket.buffered, frames)
                     self.assertEqual(receive(probe, reader, websocket), snapshot)
                     self.assertEqual(receive(probe, reader, websocket), change)

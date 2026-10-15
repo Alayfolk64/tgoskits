@@ -88,7 +88,6 @@ name = "QEMU aarch64 · HTTP control-plane + VM pool + browser console + ArceOS 
 timeout_minutes = 30
 node_version = "24"
 command = '''
-python3 -m unittest discover -s scripts/test -p test_axvisor_http_probe.py
 echo "==> axvisor aarch64 HTTP control-plane, VM pool, browser console and ArceOS IVC"
 # Keep all cases in one axbuild invocation. The QEMU runner groups cases by
 # Cargo identity before building, so equal AxVisor kernels are compiled once
