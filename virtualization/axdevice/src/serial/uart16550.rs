@@ -282,10 +282,12 @@ impl Uart16550 {
         }
 
         let byte = value as u8;
-        let (drain_tx, completes_loopback) = {
+        let mut drain_tx = false;
+        let mut completes_loopback = false;
+        // Publish the consumed level before a concurrent drainer can publish
+        // completion, so an edge-triggered controller can rearm THRE.
+        let consumed_result = self.endpoint.refresh_irq(|| {
             let mut state = self.state();
-            let mut drain_tx = false;
-            let mut completes_loopback = false;
             match register {
                 REG_RBR_THR_DLL if state.dlab() => state.dll = byte,
                 REG_RBR_THR_DLL => {
@@ -327,10 +329,8 @@ impl Uart16550 {
                 REG_SCR => state.scr = byte,
                 _ => {}
             }
-            (drain_tx, completes_loopback)
-        };
-
-        let consumed_result = self.refresh_irq();
+            state.irq_asserted()
+        });
         if drain_tx {
             return consumed_result.and(self.drain_tx());
         }
