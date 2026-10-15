@@ -559,12 +559,12 @@ def expect_websocket(path):
 
 
 def read_json_frame(websocket, deadline):
-    """Return the next frame decoded as JSON, or fail once `deadline` passes.
+    """Return the next frame decoded as JSON, waiting until `deadline` to start.
 
-    Waiting for readability with a short `select` rather than relying on the
-    socket timeout keeps a quiet channel a clear `TimeoutError` at the frame
-    boundary: the caller reports "no event arrived" instead of a transport
-    error, and a frame cannot be truncated by a timeout in the middle of it.
+    Complete buffered frames need no socket readiness. The deadline bounds
+    waiting between frames, not completion of an incomplete frame: recv_exact()
+    uses the configured socket timeout for each additional recv(), which may
+    extend beyond the deadline. EOF and socket errors still propagate.
     """
     while True:
         remaining = deadline - time.monotonic()

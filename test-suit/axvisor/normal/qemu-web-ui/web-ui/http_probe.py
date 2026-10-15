@@ -348,7 +348,12 @@ def expect_upgrade(path, expected):
 
 
 def receive_text(websocket, deadline):
-    """One Text frame (the event channel sends JSON texts and nothing else)."""
+    """One Text frame (the event channel sends JSON texts and nothing else).
+
+    The deadline bounds waiting between frames. An incomplete buffered frame
+    is completed by recv_exact(), with the socket timeout applied to each recv()
+    rather than the caller's deadline; EOF and socket errors still propagate.
+    """
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -427,6 +432,10 @@ def receive_some(websocket, deadline):
     BusyBox's line editor asks the *terminal* for the cursor position and waits
     for the answer, so a console that never replies can look exactly like a
     console whose input is broken.
+
+    The deadline bounds waiting between frames. Completing an incomplete frame
+    uses the socket timeout for each recv(), so it may exceed that deadline.
+    EOF and socket errors still propagate.
     """
     while True:
         remaining = deadline - time.monotonic()
@@ -448,7 +457,12 @@ def receive_some(websocket, deadline):
 
 
 def drain_available(websocket, seconds):
-    """Everything that arrives within `seconds`; an idle lane returns b""."""
+    """Collect frames while the time window is open; an idle lane returns b"".
+
+    Once a frame starts, recv_exact() completes it using the socket timeout for
+    each recv(). An incomplete frame can therefore extend beyond `seconds`;
+    EOF and socket errors propagate rather than returning a partial frame.
+    """
     out = b""
     deadline = time.monotonic() + seconds
     while True:
