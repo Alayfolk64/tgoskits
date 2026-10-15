@@ -100,11 +100,6 @@ pub(super) fn submit_available(
             && context.scratch.accepted.ids.len() == removed;
 
         if removed != 0 {
-            // Charge only the driver-owned prefix, before publishing it to
-            // hardware. Requests returned for retry remain unaccounted.
-            for metadata in context.scratch.metadata.iter_mut().take(removed) {
-                metadata.completion.start_io();
-            }
             let commit_result = queue.commit_submissions();
             super::super::metrics::record_commit(commit_result);
             if commit_result.is_err() {

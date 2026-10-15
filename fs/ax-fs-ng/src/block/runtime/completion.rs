@@ -257,15 +257,9 @@ impl CompletionSender {
         self.accounting = Some(accounting);
     }
 
-    pub(super) fn start_io(&mut self) {
-        if let Some(accounting) = self.accounting.as_mut() {
-            accounting.start();
-        }
-    }
-
     pub(super) fn complete(mut self, request: CompletedRequest) {
         if let Some(accounting) = self.accounting.as_mut() {
-            accounting.finish(request.result.is_err());
+            accounting.complete(request.result.is_err());
         }
         let unclaimed = {
             let mut state = self.cell.state.lock_irqsave();
@@ -544,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn io_accounting_outlives_cancelled_receiver_and_ignores_unsubmitted_drop() {
+    fn io_accounting_outlives_cancelled_receiver_and_releases_abandoned_admission() {
         use rdif_block::RequestOp;
 
         use super::super::io_stats::{DeviceIoMetrics, RequestAccounting};
@@ -556,7 +550,6 @@ mod tests {
             RequestOp::Read,
             8,
         ));
-        sender.start_io();
         drop(receiver);
         assert_eq!(metrics.snapshot().inflight, 1);
         sender.complete(completed(1));
@@ -571,9 +564,33 @@ mod tests {
             8,
         ));
         drop(receiver);
+        sender.complete(CompletedRequest::new(
+            RequestId::new(2),
+            Err(BlkError::Io),
+            None,
+        ));
+        assert_eq!(
+            metrics.snapshot().sectors_written,
+            8,
+            "terminal I/O error retires the full request"
+        );
+
+        let (receiver, mut sender) = pair();
+        sender.account(RequestAccounting::new(
+            Arc::clone(&metrics),
+            RequestOp::Write,
+            8,
+        ));
+        drop(receiver);
         drop(sender);
-        assert_eq!(metrics.snapshot().writes, 0);
-        assert_eq!(metrics.snapshot().inflight, 0);
+        let stats = metrics.snapshot();
+        assert_eq!(stats.writes, 2);
+        assert_eq!(
+            stats.sectors_written, 8,
+            "abandoned admission did not retire device bytes"
+        );
+        assert_eq!(stats.failed_requests, 2);
+        assert_eq!(stats.inflight, 0);
     }
 
     #[derive(Default)]

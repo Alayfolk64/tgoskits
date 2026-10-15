@@ -1,9 +1,8 @@
 //! Bounded speculative I/O. Demand uses the same validated fill ownership.
 
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc};
-use core::ops::Range;
 
-use super::CachedFile;
+use super::{CachedFile, readahead::PrefetchRequest};
 use crate::{
     BlockError, BlockResult,
     os::{BlockNotification, BlockRuntimeOps, BlockThread, runtime_ops, sync::Mutex},
@@ -13,18 +12,19 @@ const MAX_QUEUED_WINDOWS: usize = 16;
 
 struct PrefetchJob {
     file: CachedFile,
-    pages: Range<u64>,
+    attempt: PrefetchRequest,
 }
 
 impl PrefetchJob {
     fn run(self) {
-        let Ok(first_page) = u32::try_from(self.pages.start) else {
+        let Ok(first_page) = u32::try_from(self.attempt.pages.start) else {
             return;
         };
         let Some(window_pages) = self
+            .attempt
             .pages
             .end
-            .checked_sub(self.pages.start)
+            .checked_sub(self.attempt.pages.start)
             .filter(|count| *count != 0)
             .and_then(|count| usize::try_from(count).ok())
         else {
@@ -33,10 +33,13 @@ impl PrefetchJob {
         // Disk retention targets start at 512 pages, above two maximum
         // windows. Admission and publication retain their existing limits;
         // no cache lock is needed before entering the backing-read path.
-        if let Err(error) = self.file.prefetch_page_window(first_page, window_pages) {
-            // Speculation must not make a later demand inherit a stale error.
-            // Its demand path retries backing I/O and reports any real failure.
-            log::debug!("file readahead deferred: {error:?}");
+        match self.file.prefetch_page_window(first_page, window_pages) {
+            Ok(true) => self.file.readahead.lock().prefetched(&self.attempt),
+            Ok(false) => {}
+            Err(error) => {
+                // Demand retries backing I/O and reports any real failure.
+                log::debug!("file readahead deferred: {error:?}");
+            }
         }
     }
 }
@@ -136,7 +139,7 @@ impl CachedFile {
         };
         let job = PrefetchJob {
             file: self.clone(),
-            pages,
+            attempt: pages,
         };
         #[cfg(not(test))]
         PREFETCH.request(job, runtime);
@@ -254,6 +257,7 @@ pub(super) mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub(in super::super) struct TestQueue;
 
     impl TestQueue {
@@ -276,7 +280,14 @@ pub(super) mod tests {
                 .lock()
                 .pop_front()
                 .expect("read did not queue readahead");
+            if !WORKER.queue.lock().is_empty() {
+                notification.notify();
+            }
             job.run();
+        }
+
+        pub(in super::super) fn queued_len(&self) -> usize {
+            WORKER.queue.lock().len()
         }
     }
 

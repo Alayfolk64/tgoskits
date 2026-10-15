@@ -1204,6 +1204,16 @@ fn async_reads_respect_single_hardware_inflight_slot_and_return_dma() {
     };
     drop(second_submit);
     assert_eq!(submission_channel.queued_len(), 1);
+    let stats = handle.io_stats();
+    assert_eq!(
+        stats.inflight, 2,
+        "software-queued requests must be visible before driver acceptance"
+    );
+    assert_eq!(stats.reads, 0);
+    assert_eq!(
+        stats.weighted_ns, 0,
+        "snapshots must not bill unfinished request latency"
+    );
 
     let first_wake = Arc::new(WakeCounter::default());
     let first_waker = Waker::from(Arc::clone(&first_wake));

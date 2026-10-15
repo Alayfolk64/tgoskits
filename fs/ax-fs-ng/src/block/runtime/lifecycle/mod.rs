@@ -1110,7 +1110,7 @@ impl BlockDeviceHandle {
         self.inner.published_device_info()
     }
 
-    /// Snapshots this physical device's dispatch-to-completion counters.
+    /// Snapshots this physical device's admission-to-completion counters.
     pub fn io_stats(&self) -> super::io_stats::BlockIoStats {
         self.inner.io_metrics.snapshot()
     }
