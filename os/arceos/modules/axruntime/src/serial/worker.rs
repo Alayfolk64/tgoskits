@@ -364,7 +364,16 @@ impl SerialWorker {
             } else {
                 let next = match path {
                     RxPath::Irq => self.irq_rx.pop(),
-                    RxPath::Port => self.shared.with_port(|port| port.read_rx()).flatten(),
+                    RxPath::Port => self
+                        .shared
+                        .with_port(|port| {
+                            // An IRQ may have consumed an older prefix after
+                            // this path was selected. Check its queue under the
+                            // same register gate as the hardware read so that
+                            // no IRQ can insert an older sample between them.
+                            self.irq_rx.pop().or_else(|| port.read_rx())
+                        })
+                        .flatten(),
                 };
                 let Some(sample) = next else {
                     source_drained = true;
