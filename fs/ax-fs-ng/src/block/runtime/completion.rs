@@ -569,13 +569,18 @@ mod tests {
             Err(BlkError::Io),
             None,
         ));
+        let completed = metrics.snapshot();
         assert_eq!(
-            metrics.snapshot().sectors_written,
-            8,
-            "terminal I/O error retires the full request"
+            (
+                completed.writes,
+                completed.failed_requests,
+                completed.inflight,
+                completed.sectors_written,
+            ),
+            (1, 1, 0, 8),
+            "terminal I/O error completes one failed write and retires its full length"
         );
 
-        let completed = metrics.snapshot();
         let (receiver, mut sender) = pair();
         sender.account(RequestAccounting::new(
             Arc::clone(&metrics),
