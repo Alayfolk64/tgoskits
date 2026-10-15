@@ -32,6 +32,10 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 
 ## 对称多处理前的运行时控制台
 
+派生客户机设备树过滤 CPU 依赖节点时，同时移除失效的 `cpu-idle-states` 与 `next-level-cache` 引用。客户机已有有效 `stdout-path` 时，不根据 runtime 自动分配的 ttyS 编号硬编码 `console=ttyS<n>`；显式串口参数需要对应的固件 serial 别名，解析失败不应由操作系统侧单串口兜底掩盖。
+
+带直通设备的 IVC 客户机仅允许不覆盖现有地址的新增映射；撤销映射仍需要驱动或 IOMMU 的 DMA 停稳证明。应用逻辑关闭后，由原有管理器端点和映射 lease 保留地址区域与 backing，不能另建第二份退休状态或把逻辑关闭当作物理回收。映射事务恢复执行后发布最新 VM 状态；缺少安全回收能力时使用板级复位重跑；停止、重置和删除必须在关闭运行入口或拆除设备前拒绝，不能只凭 Stopping 状态绕过 DMA 保护。
+
 - 中断处理和多任务调度是强制运行时能力。先初始化调度器与中断框架，探测串口，创建按所有者处理器亲和的串口工作任务，尝试完成公共运行时控制台移交，再释放任何次处理器。不得增加独立 `serial` 或 `runtime-console` 功能。探测后全部运行时保持休眠；可以注册禁用的控制器中断，但选中或显式打开串口前不得屏蔽、复位或重新配置硬件。
 - 没有匹配的运行时串口时，底层硬件抽象层控制台继续独占，并通过同一任务控制台能力输出。只有底层控制台具备中断时才能提供任务输入：公共层在硬中断中把接收数据排入有界队列并唤醒 `WaitQueue`。没有控制台中断时，`take_input` 返回不支持，消费者关闭交互入口；禁止通过 `yield_now` 轮询伪造可休眠能力，也禁止用亲和性保留一个处理器。底层任务写入先取得可休眠任务锁，再取得中断安全硬件锁；早期次处理器和硬中断日志没有有效当前任务，只能非阻塞尝试硬件锁。一旦选中运行时进入 `Preparing`，任何失败都进入封闭状态；成功提交后，对称多处理代码不得退回早期串口。
 - 固件选中的硬件 `DeviceId` 必须精确匹配。只有 `NotSpecified` 可以退回通用 Linux `ttyS0` 编号。`Preparing` 前找不到匹配项时保留底层所有者，不得猜测其他运行时串口；移交已经开始后才采用失败封闭。
@@ -61,6 +65,7 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
   LoongArch 的 `KS4` 和 `KS5` 保留给虚拟处理器暂存。RISC-V 的 `gp` 恢复为普通全局指针；位置无关可执行重定位需要时，目标规格仍使用 `--no-relax`，但不得把 `gp` 描述为处理器局部存储。`CpuPin<'scope>` 只能在检查实时处理器基址、区域自指针、索引和当前上下文指针后，通过不逃逸受保护回调创建。原子标量要求排除迁移；共享 `T: Sync` 还依赖对象自身同步；可变局部对象还需在排除中断、重入和冲突远端访问后取得 `ExclusiveCpu`。上下文切换保持中断关闭，并消费准备与前序事务令牌。AArch64 借出 `SP_EL0` 给用户空间前，把唯一当前上下文指针保存到固定内核栈，返回 Rust 前恢复。抢占令牌为线性令牌。装载或存储型体系结构跨迁移保留当前上下文所有者；x86_64 使用处理器锚点，暂停的切换保护在另一处理器恢复时必须消费旧证明并接管目的处理器外出上下文留下的等价深度。运行时释放最后抢占深度前必须取得调度器接力棒；任务策略和接力棒状态不属于 `cpu-local`。处理器拥有抢占状态的体系结构中，新上下文首次进入尾部必须完成切换深度；上下文拥有状态的体系结构从深度零开始。
 - **构建系统**：接入 `scripts/axbuild` 的体系结构与目标映射、动态平台默认值、功能传播、内核格式转换、统一可扩展固件接口或二进制转换、根文件系统和各操作系统测试发现。
 - **QEMU 与固件**：核验 QEMU 程序、机器类型、处理器、对称多处理数量、闪存或 OVMF 文件、串口、磁盘与根文件系统设备、`-snapshot`、调试参数、超时和成功或失败匹配规则。通过 `cargo xtask ovmf --arch <arch>` 取得 OVMF CODE 与 VARS；该命令复用 Ostool 固定版本、镜像探测、SHA-256 校验和 `$TMPDIR/ostool/ovmf` 缓存。`TGOS_OVMF_DIR` 只用于选择另一 Ostool 格式缓存根目录，不能给各消费者新增固件变量或扫描发行版 `/usr/share`。`qemu-*.toml` 中的 `uefi`、`to_bin`、加速、处理器功能和设备选择属于用例契约，axbuild 不得按目标体系结构或宿主 `/dev/kvm` 可用性推断或覆盖。Axvisor x86_64 运行时按 CPUID 选择 VMX 或 SVM，通用 QEMU 板卡与构建配置保持后端中立；持续集成保留 Intel/VMX 与 AMD/SVM 两个用例，但都不得选择 Cargo `vmx` 或 `svm` 功能，并使用同一后端中立客户机基线。
+- **Axvisor 客户机启动选择**：Build TOML 的 `vm_configs` 只产生 initramfs `/guest/builtin` 的不可变配置索引；启动时不因归档存在而创建客户机。需要开机创建和启动的 ID 必须写入宿主 QEMU `-append`、UEFI LoadOptions 或 U-Boot `bootargs` 的 `axvisor.vm_start=1,2`；该参数只能属于宿主 cmdline，不能混入 guest `[kernel].cmdline`。缺少 selector 表示零个 VM，`/guest` 下的动态 pool 由 Web/shell 按需创建，`/guest/builtin` 不参与动态扫描。检查每个 QEMU/board case 的 VM ID、selector 与 shell/HTTP 启动步骤是否一致，避免把旧的默认自动启动假设带入新目标。
 - **测试资产 prebuild 回退**：无 qemu-user 时由 `ArchSpec::linux_qemu` 选择 `qemu-system-*`，以 snapshot 根盘启动 rootfs 的 `/guest/linux/linux-qemu`，通过 9P 执行 `prebuild.sh`；失败必须传播。
 - **someboot 体系结构层**：实现或审计入口、重定位、未初始化数据段清理、栈、内存映射、分页、陷阱向量、定时器、中断、电源、对称多处理和地址转换。
 - **处理器局部启动**：最终可执行与可链接格式文件恰好含一个 `.percpu.template`、`.percpu.init` 和 `.percpu.align`，不含已链接运行时区域或兼容别名。发现运行时处理器数后，按模板几何动态分配所有最终区域，在最终地址构造一次全部类型化值，冻结布局，再在处理器离线时用 `CpuAreaRef` 绑定；只有之后运行时代码才能取得有作用域 `CpuPin`。所有可能失败的准备成功后才发布寄存器。丢弃未提交的准备切换令牌必须回滚下一任务绑定；进入尾部必须消费前一绑定代数后，任务才能在其他处理器运行。AArch64 最终别名按共享属性维护缓存；RISC-V 次处理器初始化 `sscratch`；LoongArch 保持 r21 与 KS3 一致。
@@ -136,6 +141,7 @@ Starry perf 使用 `ax_cpu::pmu::Pmu` 的有作用域会话；Linux event/cache 
 - x86 QEMU 只初始化一次 LAPIC 或 x2APIC，并把 APIC 标识视为固件标识，不视为逻辑处理器索引。x2APIC 启用时使用模型特定寄存器；处理器间中断等待有界；xAPIC 拒绝高于 255 的次处理器启动或目标；外部输入输出中断控制器传统中断编程留在运行时 `X86IoApicIntc`。依赖完成 LAPIC 启用后，显式屏蔽并读回 LVT LINT0 和 LINT1，同时保留投递配置；写零会清除掩码位，不会设置。
 - AArch64 的 someboot `hv` 只用于异常级 2 内核。非 `hv` 异常级 1 启动按启动异常级选择定时器：异常级 2 可用时用 CNTP，否则用 CNTV，并让设备树中断索引一致。一次性间隔用 64 位 CVAL 和环绕绝对截止时间，不能在间隔可能越界时用 32 位 TVAL。次处理器入口跨内存管理单元启用和异常级转换辅助函数显式保存处理器元数据指针，裸汇编使用辅助函数返回寄存器，不假设暂存寄存器跨 Rust 调用保持。
 - RK3576 ROCK 4D 的固件、设备树、串口、对称多处理、时钟复位单元、电源管理单元和板卡验证遵循 `references/boot-debugging.md`，未确认完整交接契约前不要诊断存储或次处理器。
+- RK3588 eMMC 高速初始化遵循仓库 `docs/design/rk3588-cqhci-block-queue.md`：区分 VCC 与 VCCQ、SD CMD11 与 eMMC 直接信号选择，先确认 DLL 和实际调谐成功，再启用卡端与主机 CQE。不能把 Linux 的 HS400 能力当作本驱动 HS200 的验证结果；运行时停止失败必须同时保留描述符与载荷 DMA。修改此路径后先完成源码审核与定向验证，再按板卡恢复规范上板。
 - 页表覆盖体系结构需要的身份或固件访问、直接映射、内核高地址、设备资源和逐处理器数据；页表写入、启动参数和次处理器释放周围执行地址转换缓存、缓存维护和体系结构屏障。
 - 把硬件内存管理单元启用、直接映射或内核空间可寻址、最终内核重定位视为不同状态。通用重定位检测使用最终 `VM_LOAD_ADDRESS`，不能使用更宽的体系结构内核或直接映射范围。AArch64 从 SCTLR.M 启用到跳入重定位入口之间禁止串口日志，仍在重定位前路径执行时地址辅助函数不得切到重定位地址。LoongArch 直接映射窗口只提供早期可寻址，执行到最终高地址 `VM_LOAD_ADDRESS` 后才能认定重定位完成。
 - LoongArch 的四级 4 KiB 页表 walker 是构建期契约，CPUCFG `VALEN` 是运行期 canonical 地址能力，两者不能混为动态页表层数。平台按 Linux 的 `vm_map_base = 0 - (1 << cpu_vabits)` 原理发布类型化 lower/upper half：CPUCFG wrapper 返回的 `VALEN` 先减一得到 `cpu_vabits`；PGDL/PGDH 由 `VA[VALEN-1]` 选择。用户 `TASK_SIZE` 和 page-table-backed kernel allocator 必须消费同一不可变布局，不得用板卡 feature 维护第二套地址常量；位宽超出 walker 时返回类型化不支持并停止启动。DMW 的 `PABITS`、缓存属性和物理直映所有权保持独立，不能随 `VALEN` 裁剪。

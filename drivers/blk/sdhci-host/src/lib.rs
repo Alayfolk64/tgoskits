@@ -8,16 +8,20 @@
 //!
 //! # Scope
 //!
-//! - **Implemented**: **ADMA2 (32-bit) transfers**, 1-bit /
-//!   4-bit / 8-bit bus, default-speed and high-speed clocking, 32-bit response
-//!   slots, 136-bit R2 reconstruction, software reset / clock setup.
-//! - **Out of scope (for now)**: 64-bit ADMA2, HS200 / SDR50 / SDR104
-//!   clocking, and tuning (CMD19 / CMD21). Protocol data commands, including
-//!   eMMC `SEND_EXT_CSD`, use the same ADMA2 path as normal block I/O. 1.8 V
-//!   signaling is wired up at the register level but is gated behind
-//!   [`Sdhci::enable_1v8_signaling`] — platforms that haven't plumbed the
-//!   IO-rail regulator MUST leave it off so the protocol layer falls back
-//!   instead of corrupting transfers.
+//! - **Implemented**: 32-bit and pre-v4 64-bit ADMA2 transfers, 1-bit /
+//!   4-bit / 8-bit buses, default/high-speed and HS200 host timing, bounded
+//!   interrupt-driven CMD19 / CMD21 tuning, response reconstruction, and
+//!   reset / clock transitions. Tuning disables DMA while the controller
+//!   consumes the tuning pattern; normal block I/O remains ADMA2-only.
+//! - **Platform responsibilities**: external clock and DLL setup, power rails,
+//!   and permission to use 1.8 V signaling. Platforms must leave
+//!   [`Sdhci::enable_1v8_signaling`] disabled until the IO-rail contract is
+//!   established; register capability alone does not prove safe signaling.
+//! - **Out of scope**: SDHCI v4 64-bit descriptor layout, HS400 timing and
+//!   enhanced strobe. V4 register-mode selection alone does not provide the
+//!   v4 64-bit transfer contract. Hardware command
+//!   queueing belongs to the separate `cqhci-host` backend; legacy SDHCI still
+//!   owns at most one data request at a time.
 //!
 //! # Usage
 //!
@@ -194,7 +198,7 @@ enum BusRequestState {
     PowerOff,
     SetClock(SdhciClockState),
     SetBusWidth(BusWidth),
-    SetSignalVoltage(SdhciVoltageState),
+    SetSignalVoltage(SdhciVoltageState, VoltageProtocol),
     ExecuteTuning(SdhciTuningState),
 }
 
@@ -213,7 +217,8 @@ enum SdhciClockState {
     ExternalStart {
         target_hz: u32,
     },
-    ExternalEnable {
+    ExternalWaitStable {
+        target_hz: u32,
         deadline_ns: u64,
     },
     InternalWaitStable {
@@ -223,24 +228,48 @@ enum SdhciClockState {
 
 enum SdhciVoltageState {
     DisableClock(SignalVoltage),
-    SwitchControllerAndRail(SignalVoltage),
+    SelectSignaling(SignalVoltage),
     WaitVsw {
         voltage: SignalVoltage,
         deadline_ms: Option<u64>,
     },
     EnableClock(SignalVoltage),
-    VerifyDatLines(SignalVoltage),
+    VerifyDatLines {
+        voltage: SignalVoltage,
+        deadline_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VoltageProtocol {
+    Direct,
+    SdCmd11,
 }
 
 enum SdhciTuningState {
-    Start { cmd_index: u8, block_size: u16 },
-    Wait { cmd_index: u8, polls: u32 },
+    Start {
+        cmd_index: u8,
+        block_size: u16,
+    },
+    Wait {
+        cmd_index: u8,
+        block_size: u16,
+        remaining: u8,
+        deadline_ms: u64,
+    },
+    Delay {
+        cmd_index: u8,
+        block_size: u16,
+        remaining: u8,
+        deadline_ms: u64,
+    },
 }
 
 const SDHCI_RESET_POLLS: u32 = 1_000;
 // Linux `sdhci_enable_clk()` bounds this transition by monotonic elapsed time.
 const SDHCI_CLOCK_TIMEOUT_NS: u64 = 150_000_000;
-const SDHCI_TUNING_POLLS: u32 = 1_000_000;
+const SDHCI_TUNING_ATTEMPTS: u8 = 40;
+const SDHCI_TUNING_TIMEOUT_MS: u64 = 50;
 const SDHCI_VOLTAGE_SWITCH_DELAY_MS: u64 = 5;
 const SDHCI_REGISTER_RETRY_DELAY: Duration = Duration::from_micros(100);
 
@@ -458,11 +487,9 @@ fn handle_irq_core(irq: &host::IrqCore) -> Event {
         host::read_irq_register(irq.base_addr, REG_NORMAL_INT_SIGNAL_ENABLE);
 
     let normal_enabled = raw_normal & normal_status_enable;
-    let error_enabled = if normal_enabled & NORMAL_INT_ERROR != 0 {
-        raw_error & error_status_enable
-    } else {
-        0
-    };
+    // Error status has its own enable bits. The normal error bit is only a
+    // summary, so Linux-compatible masks need not enable that bit separately.
+    let error = raw_error & error_status_enable;
 
     // STATUS_ENABLE controls which latched bits the driver owns and
     // SIGNAL_ENABLE gates assertion of the external IRQ line. A CARD_INT can
@@ -470,7 +497,6 @@ fn handle_irq_core(irq: &host::IrqCore) -> Event {
     // facts in this snapshot before masking the level source below.
     let visible_card = normal_enabled & signal_enable & NORMAL_INT_CARD_INTERRUPT;
     let normal = (normal_enabled & !NORMAL_INT_CARD_INTERRUPT) | visible_card;
-    let error = error_enabled;
 
     let normal_to_ack = raw_normal & !NORMAL_INT_CARD_INTERRUPT;
     if normal_to_ack != 0 || raw_error != 0 {
@@ -485,7 +511,7 @@ fn handle_irq_core(irq: &host::IrqCore) -> Event {
     let normal = if error == 0 {
         normal & !NORMAL_INT_ERROR
     } else {
-        normal
+        normal | NORMAL_INT_ERROR
     };
     if normal & NORMAL_INT_CARD_INTERRUPT != 0 {
         // Linux's SDHCI `ier` is written to both INT_ENABLE and
