@@ -138,7 +138,12 @@ active handle 清零后，下次用户切换无法命中 same-mm
 该通知不是 shootdown 完成确认。`lazy_reclaim_requested` 只表达永久逻辑请求，不再禁止
 后续物理通知。`MmInner` 在首次通知前通过独立的 `lazy_reclaim_link` 将自己加入
 `LAZY_CPU_RECLAIM_QUEUE`；已有 sleepable reclaimer 每轮最多重试 16 个 MM，轮间休眠
-10 ms。只要仍是 `Retiring` 且没有 pin、仍有 active CPU，就重新排队并通知。即使第一次
+10 ms。只要仍是 `Retiring` 且没有 pin、仍有 active CPU，就重新排队。
+`MmInner::lazy_reclaim_retry` 的 IRQ-safe 锁串行化 `LazyReclaimRetry::claim()`：首次立即通知，
+后续间隔从 10 ms 倍增并封顶于 1 秒，只有到期才发送；重复生命周期回调也使用同一准入。
+每个 MM 独立计时，新退休 MM 不受其他故障 MM 的退避影响。通知在重试锁外执行，避免本地
+释放回调重入。退避不设置重试次数上限、不撤销 lease，也不阻止已完成 MM 出队和析构；
+永久故障仍不能保证回收完成，但不会对同一 MM 每 10 ms 持续发送。即使第一次
 发送失败，或返回 `Coalesced` 的原发送者随后失败，也不依赖外部再次释放 owner 或普通 IPI
 才能重新尝试。独立链允许 activation 回调同时加入退休队列，不能与 destruction/repair 共用链接。
 
@@ -574,7 +579,10 @@ activation 的重试项跨 worker 批次保留、完成后清除及退休回收�
 AArch64 内核 axtest `lazy_mm_failed_notification_retries_on_the_production_reclaimer()` 使用
 真实 `MmHandle::scheduler_address_space()` 与 user-context 任务实际安装页表，然后切换到
 同 CPU 的 kernel-lazy 任务。按 MM/CPU 限定的故障注入仅使首次 lazy 通知返回 `Timeout`，
-不改变普通调度和串口 IPI。目标用三秒硬截止的 IRQ 关闭握手保留现场；协调者不再次调用
+不改变普通调度和串口 IPI。目标用 250 ms 硬截止的 IRQ 关闭握手保留现场，恢复 IRQ 后的禁抢占观察最多 100 ms；
+正常路径观察到自主重试后立即解除握手，不用固定时长忙等作为成功条件。
+纯状态机用例 `notification_backoff_bounds_traffic_without_abandoning_retries()` 使用受控时间
+验证到期边界、倍增、封顶后持续重试及 MM 之间互不延迟。协调者不再次调用
 request/retry/reap，而由固定在另一 CPU、运行同一 `run_reclaimer()` 的可停止工作线程
 自主重试。解除握手后，测试观察真实 IPI consumer 完成 root/TLB/lease 释放、MM 进入 `Freed`
 和 backing 最终释放；失败分支也先解除握手并停止工作线程，再报告断言。该用例不进入 EL0，
@@ -587,6 +595,11 @@ request/retry/reap，而由固定在另一 CPU、运行同一 `run_reclaimer()` 
 发行构建的公共接口。
 
 `qemu/system/test-aarch64-cpu-feat` 的普通未对齐 LDR 及搬移后 LDP Q 检查验证 EL0 访存及内容。
-用例没有在进入内核前强制设置 `SCTLR_EL1.A=1`；默认固件已清零时，删除内核显式清零仍可能
-通过。这不构成固件遗留 A 位场景的红绿证明。后续需可控引导夹具或对应固件场景验证，现有
-成功结果仅按可观察用户态行为记录，不扩大为所有启动初态均已覆盖。
+该用户态用例保留端到端访存检查；固件初值的判别由 ArceOS `cpu/paging` 的
+`alignment::run()` 补足。它在本 CPU 屏蔽 IRQ 后主动设置并读回 `SCTLR_EL1.A=1`，调用
+生产 `El1::enable_mmu_and_caches()`，检查 A 已清零、SPAN 已设置，并在该控制状态下实际
+执行 Normal memory 的非对齐 LDR、核对内容。恢复原寄存器后才断言，错误实现不会污染
+后续执行。删除生产入口清 A 的操作会使同一测试明确失败。该用例复用已经安装的合法页表、
+MAIR 和 TCR，证明的是启动入口对该寄存器初值的处理；不把它描述为某个实体固件的完整启动
+实验。主次核调用同一生产入口，仍保留 SMP 启动及 Starry EL0 访存的独立覆盖。
+该控制位语义依据 [Arm AArch64 memory attributes and properties：Alignment](https://support.arm.com/documentation/102376/latest/Alignment-and-endianness/Alignment)。

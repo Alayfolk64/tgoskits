@@ -33,6 +33,9 @@ mod lazy_reclaim_axtest;
 mod populate;
 pub(crate) use populate::PopulateAccess;
 
+mod retry;
+use retry::LazyReclaimRetry;
+
 mod work_queue;
 use work_queue::{MmWorkLink, MmWorkQueue};
 
@@ -359,6 +362,7 @@ struct MmInner {
     work_link: RawSpinLock<MmWorkLink>,
     /// Independent of destruction: an IPI can complete while retry is queued.
     lazy_reclaim_link: RawSpinLock<MmWorkLink>,
+    lazy_reclaim_retry: RawSpinLock<LazyReclaimRetry>,
     /// Reclaim publishes Freed/NeedsRepair before waking task-context cache
     /// invalidators. Waiting retains metadata, not a kernel pin or activation.
     reclaim_done: WaitQueue,
@@ -419,7 +423,15 @@ impl MmInner {
             // coalesced send is not a completion; only activation release may
             // retire the MM. This also covers a coalesced sender failing later.
             enqueue_mm_work(&LAZY_CPU_RECLAIM_QUEUE, self.clone());
-            self.runtime_cpu_state.request_lazy_reclaim();
+            let send = self
+                .lazy_reclaim_retry
+                .lock_irqsave()
+                .claim(ax_hal::time::monotonic_time());
+            // Release the retry lock before local release callbacks or IPI.
+            // Queued ownership survives a deferred attempt or a failed send.
+            if send {
+                self.runtime_cpu_state.request_lazy_reclaim();
+            }
         }
     }
 
@@ -787,6 +799,7 @@ impl MmHandle {
                 retire_queued: AtomicBool::new(false),
                 work_link: RawSpinLock::new(MmWorkLink::default()),
                 lazy_reclaim_link: RawSpinLock::new(MmWorkLink::default()),
+                lazy_reclaim_retry: RawSpinLock::new(LazyReclaimRetry::default()),
                 reclaim_done: WaitQueue::new(),
             }),
             owner: AtomicBool::new(true),

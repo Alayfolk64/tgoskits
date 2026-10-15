@@ -75,7 +75,7 @@ fn lazy_mm_failed_notification_retries_on_the_production_reclaimer() {
             let start = ax_hal::time::monotonic_time();
             irq_held.store(true, Ordering::Release);
             while !release_irq.load(Ordering::Acquire) {
-                if ax_hal::time::monotonic_time().saturating_sub(start) >= Duration::from_secs(3) {
+                if ax_hal::time::monotonic_time().saturating_sub(start) >= Duration::from_millis(250) {
                     irq_timed_out.store(true, Ordering::Release);
                     break;
                 }
@@ -88,7 +88,7 @@ fn lazy_mm_failed_notification_retries_on_the_production_reclaimer() {
             // missing retry still restores the guard and lets the task exit.
             let delivery_start = ax_hal::time::monotonic_time();
             while !cpu_state.lazy_reclaim_completed_for_test(1) {
-                if ax_hal::time::monotonic_time().saturating_sub(delivery_start) >= Duration::from_secs(1) {
+                if ax_hal::time::monotonic_time().saturating_sub(delivery_start) >= Duration::from_millis(100) {
                     break;
                 }
                 spin_loop();
@@ -113,7 +113,7 @@ fn lazy_mm_failed_notification_retries_on_the_production_reclaimer() {
     drop(permit);
     // Neither this thread nor the target calls request/retry/reap here. Only
     // the production worker implementation can create the second attempt.
-    let retried = wait_until(Duration::from_secs(1), || cpu_state.lazy_reclaim_attempts_for_test() >= 2);
+    let retried = wait_until(Duration::from_millis(100), || cpu_state.lazy_reclaim_attempts_for_test() >= 2);
     release_irq.store(true, Ordering::Release);
     let target_result = target.join();
     let completed = wait_until(Duration::from_secs(3), || {
