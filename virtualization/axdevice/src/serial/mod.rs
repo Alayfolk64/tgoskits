@@ -84,11 +84,17 @@ mod tests {
     #[derive(Default)]
     struct TestIrqSink {
         levels: Mutex<Vec<bool>>,
+        pause_next: Mutex<Option<Arc<(Barrier, Barrier)>>>,
     }
 
     impl WiredIrqSink for TestIrqSink {
         fn set_level(&self, _input: ControllerInputId, asserted: bool) -> IrqResult {
             self.levels.lock().unwrap().push(asserted);
+            let pause = self.pause_next.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.0.wait();
+                pause.1.wait();
+            }
             Ok(())
         }
 
@@ -322,6 +328,50 @@ mod tests {
         assert_eq!(
             backend.output.lock().unwrap().as_slice(),
             b"PQRSTU0123456789abcdef"
+        );
+
+        // A notified poll must not finish TX before its consumed IRQ level
+        // reaches the controller, even when another IRQ publication is busy.
+        let backend = Arc::new(TestBackend::default());
+        let sink = Arc::new(TestIrqSink::default());
+        let uart = Uart16550::new(backend.clone(), level_irq(sink.clone(), 4));
+        let pause = Arc::new((Barrier::new(2), Barrier::new(2)));
+        *sink.pause_next.lock().unwrap() = Some(pause.clone());
+        std::thread::scope(|scope| {
+            let enable = scope.spawn(|| uart.write(1, AccessWidth::Byte, 1 << 1));
+            pause.0.wait();
+
+            let (writer_events, writer_received) = mpsc::channel();
+            let uart = &uart;
+            let writer = scope.spawn(move || {
+                let _observer = MutexWaitObserver::new(writer_events.clone());
+                let result = uart.write(0, AccessWidth::Byte, b'Z' as u64);
+                writer_events.send(false).unwrap();
+                result
+            });
+            let writer_waited = writer_received.recv().unwrap();
+
+            let (poll_events, poll_received) = mpsc::channel();
+            let poll = scope.spawn(move || {
+                let _observer = MutexWaitObserver::new(poll_events.clone());
+                let result = uart.poll();
+                poll_events.send(false).unwrap();
+                result
+            });
+            let poll_waited = poll_received.recv().unwrap();
+
+            pause.1.wait();
+            enable.join().unwrap().unwrap();
+            writer.join().unwrap().unwrap();
+            poll.join().unwrap().unwrap();
+            assert!(writer_waited && poll_waited);
+        });
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"Z");
+        let levels = sink.levels.lock().unwrap().clone();
+        assert_eq!(
+            levels,
+            [true, false, true],
+            "concurrent completion must preserve the consumed-to-empty IRQ transition"
         );
     }
 
