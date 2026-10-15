@@ -47,14 +47,14 @@ mod tests {
 
     impl SerialBackend for TestBackend {
         fn write(&self, bytes: &[u8]) {
-            self.output.lock().unwrap().extend_from_slice(bytes);
+            let _ = self.try_write(bytes);
         }
 
         fn try_write(&self, bytes: &[u8]) -> usize {
             if self.blocked.load(Ordering::Acquire) {
                 return 0;
             }
-            self.write(bytes);
+            self.output.lock().unwrap().extend_from_slice(bytes);
             bytes.len()
         }
 
@@ -141,6 +141,8 @@ mod tests {
 
     #[test]
     fn uart16550_thr_write_rearms_empty_irq_after_tx_completion() {
+        const TX_EMPTY: u64 = (1 << 5) | (1 << 6);
+
         let backend = Arc::new(TestBackend::default());
         let sink = Arc::new(TestIrqSink::default());
         let uart = Uart16550::new(backend.clone(), level_irq(sink.clone(), 4));
@@ -164,6 +166,38 @@ mod tests {
             [true, false, true],
             "TX completion must not depend on an unrelated backend input poll"
         );
+
+        backend.set_blocked(true);
+        uart.write(0, AccessWidth::Byte, b'Q' as u64).unwrap();
+        uart.poll().unwrap();
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"P");
+        let blocked_status = uart.read(5, AccessWidth::Byte).unwrap();
+        let blocked_interrupt = uart.read(2, AccessWidth::Byte).unwrap();
+        let blocked_level = sink.levels.lock().unwrap().last().copied();
+
+        backend.set_blocked(false);
+        uart.poll().unwrap();
+        assert_eq!(
+            backend.output.lock().unwrap().as_slice(),
+            b"PQ",
+            "a backend capacity notification must drain the retained byte"
+        );
+        assert_eq!(blocked_status & TX_EMPTY, 0);
+        assert_eq!(blocked_interrupt & 0x0f, 1);
+        assert_eq!(blocked_level, Some(false));
+        assert_eq!(
+            uart.read(5, AccessWidth::Byte).unwrap() & TX_EMPTY,
+            TX_EMPTY
+        );
+        assert_eq!(sink.levels.lock().unwrap().last(), Some(&true));
+        assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 2);
+        assert_eq!(sink.levels.lock().unwrap().last(), Some(&false));
+
+        uart.poll().unwrap();
+        uart.write(0, AccessWidth::Byte, b'R' as u64).unwrap();
+        uart.poll().unwrap();
+        assert_eq!(backend.output.lock().unwrap().as_slice(), b"PQR");
+        assert_eq!(uart.read(2, AccessWidth::Byte).unwrap() & 0x0f, 2);
     }
 
     #[test]
