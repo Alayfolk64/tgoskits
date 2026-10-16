@@ -500,7 +500,7 @@ def receive_output_until(websocket, marker, deadline, label):
             )
         try:
             output += receive_some(websocket, deadline)
-        except AssertionError as error:
+        except (AssertionError, TimeoutError) as error:
             raise AssertionError("%s: %s; last output was %r" % (label, error, output[-12000:])) from error
     print("  web-ui probe: %s -> %r" % (label, marker.decode("utf-8", "replace")))
     return output

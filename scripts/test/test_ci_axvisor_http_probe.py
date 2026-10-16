@@ -145,6 +145,19 @@ class ProbeFrameTests(unittest.TestCase):
                         # timeout installed for later cleanup or diagnostics.
                         self.assertEqual(client.gettimeout(), 0.2)
 
+        # A complete console message followed by a stalled frame must retain
+        # both the lane label and the last output in the caller's diagnostic.
+        client, server = socket.socketpair()
+        with client, server:
+            client.settimeout(0.2)
+            output = {"phase": "before timeout"}
+            websocket = WEB.WebSocket(client, text_frame(output) + frame[:1])
+            with patch.object(WEB.time, "monotonic", return_value=100.0):
+                with self.assertRaisesRegex(AssertionError, "guest console:.*frame.*deadline") as caught:
+                    WEB.receive_output_until(websocket, b"never arrives", 100.01, "guest console")
+            self.assertIn(repr(json.dumps(output).encode("utf-8")), str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+
     def test_quiet_and_closed_event_streams_still_fail(self):
         for probe, reader in ((POOL, "read_json_frame"), (WEB, "receive_text")):
             with self.subTest(reader=reader, state="quiet"):
