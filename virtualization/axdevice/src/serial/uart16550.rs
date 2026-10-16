@@ -296,6 +296,11 @@ impl Uart16550 {
                         state.push_rx(byte);
                         completes_loopback = true;
                     } else {
+                        // This model retains at most 16 queued TX bytes and,
+                        // with FIFOs disabled, admits a byte only when empty.
+                        // Excess writes discard the newest byte, preserving
+                        // queued output. Guests must honor THRE and FIFO depth;
+                        // host backpressure does not create unbounded storage.
                         if state.fcr & FCR_ENABLE_FIFO != 0 || state.tx_fifo.is_empty() {
                             state.tx_fifo.push(byte);
                         }
