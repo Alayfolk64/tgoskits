@@ -122,8 +122,10 @@ class ProbeFrameTests(unittest.TestCase):
                             clock_source = lambda: clock[0]
                             deadline = clock[0] + 0.05
                         else:
-                            clock_source = time.monotonic
-                            deadline = clock_source() + 0.01
+                            # Only socket I/O consumes real time here. Scheduling
+                            # before the read must not exhaust the test budget.
+                            clock_source = lambda: clock[0]
+                            deadline = clock[0] + 0.01
                         duration = deadline - clock_source()
                         bound = duration if reader == "drain_available" else deadline
                         with patch.object(probe.time, "monotonic", side_effect=clock_source):
@@ -145,18 +147,39 @@ class ProbeFrameTests(unittest.TestCase):
                         # timeout installed for later cleanup or diagnostics.
                         self.assertEqual(client.gettimeout(), 0.2)
 
-        # A complete console message followed by a stalled frame must retain
-        # both the lane label and the last output in the caller's diagnostic.
-        client, server = socket.socketpair()
-        with client, server:
-            client.settimeout(0.2)
-            output = {"phase": "before timeout"}
-            websocket = WEB.WebSocket(client, text_frame(output) + frame[:1])
-            with patch.object(WEB.time, "monotonic", return_value=100.0):
-                with self.assertRaisesRegex(AssertionError, "guest console:.*frame.*deadline") as caught:
-                    WEB.receive_output_until(websocket, b"never arrives", 100.01, "guest console")
-            self.assertIn(repr(json.dumps(output).encode("utf-8")), str(caught.exception))
-            self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+    def test_failed_expectations_retain_operation_and_received_output(self):
+        output = {"phase": "before failure"}
+        operations = (
+            (WEB, "guest console", lambda ws: WEB.receive_output_until(ws, b"missing", 100.01, "guest console")),
+            (WEB, "shell prompt", lambda ws: WEB.receive_until_prompt(ws, 0.01)),
+            (WEB, "missing", lambda ws: WEB.receive_until(ws, b"missing", 0.01)),
+            (WEB, "console isolation", lambda ws: WEB.drain_available(ws, 0.01, "console isolation")),
+            (WEB, "create event", lambda ws: WEB.expect_event(ws, "created", 2, 100.01, "create event")),
+            (WEB, "VM 2", lambda ws: WEB.expect_started_event(ws, 2, 100.01)),
+            (POOL, "pool start", lambda ws: POOL.expect_frame(lambda frame: False, "pool start")),
+        )
+        for probe, label, operation in operations:
+            for failure in ("timeout", "eof", "close"):
+                with self.subTest(label=label, failure=failure):
+                    client, server = socket.socketpair()
+                    with client, server:
+                        client.settimeout(0.01)
+                        tail = b"\x88\x00" if failure == "close" else b"\x81"
+                        websocket = probe.WebSocket(client, text_frame(output) + tail)
+                        if failure == "eof":
+                            server.shutdown(socket.SHUT_WR)
+                        with patch.object(probe.time, "monotonic", return_value=100.0), \
+                                patch.object(POOL, "EVENTS_SOCKET", websocket):
+                            with self.assertRaises(AssertionError) as caught:
+                                operation(websocket)
+                        message = str(caught.exception)
+                        self.assertIn(label, message)
+                        self.assertIn("before failure", message)
+                        if failure == "timeout":
+                            self.assertIn("deadline", message)
+                            self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+                        else:
+                            self.assertIn("closed", message)
 
     def test_quiet_and_closed_event_streams_still_fail(self):
         for probe, reader in ((POOL, "read_json_frame"), (WEB, "receive_text")):

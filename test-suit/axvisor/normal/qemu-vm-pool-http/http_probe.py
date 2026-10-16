@@ -600,11 +600,10 @@ def expect_frame(predicate, description):
     while True:
         try:
             frame = read_json_frame(EVENTS_SOCKET, deadline)
-        except TimeoutError:
+        except (AssertionError, TimeoutError) as error:
             raise AssertionError(
-                "no event matched %s within %.0fs; frames seen: %r"
-                % (description, EVENT_TIMEOUT, seen)
-            )
+                "waiting for %s: %s; frames seen: %r" % (description, error, seen)
+            ) from error
         seen.append(frame)
         if predicate(frame):
             print("  pool http probe: event %s -> %r" % (description, frame))
@@ -810,7 +809,10 @@ def phase_events():
     """The event channel follows the same create/close cycle."""
     global EVENTS_SOCKET
     EVENTS_SOCKET = open_websocket("/ws/events")
-    snapshot = read_json_frame(EVENTS_SOCKET, time.monotonic() + EVENT_TIMEOUT)
+    try:
+        snapshot = read_json_frame(EVENTS_SOCKET, time.monotonic() + EVENT_TIMEOUT)
+    except (AssertionError, TimeoutError) as error:
+        raise AssertionError("initial event snapshot: %s" % error) from error
     check("event snapshot type", snapshot.get("type"), "snapshot")
     check(
         "event snapshot list",

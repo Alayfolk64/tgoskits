@@ -382,8 +382,15 @@ def receive_text(websocket, deadline):
 
 def expect_event(websocket, expected_type, vm_id, deadline, label):
     """Read frames until the expected one arrives, ignoring the others."""
+    frame = None
     while True:
-        frame = receive_text(websocket, deadline)
+        try:
+            frame = receive_text(websocket, deadline)
+        except (AssertionError, TimeoutError) as error:
+            raise AssertionError(
+                "%s: waiting for %s on VM %d: %s; last event was %r"
+                % (label, expected_type, vm_id, error, frame)
+            ) from error
         if frame.get("type") == expected_type and frame.get("id") == vm_id:
             print("  web-ui probe: %s -> %r" % (label, frame))
             return frame
@@ -391,8 +398,15 @@ def expect_event(websocket, expected_type, vm_id, deadline, label):
 
 def expect_started_event(websocket, vm_id, deadline):
     """Accept either diff shape when lazy create and start overlap one poll."""
+    frame = None
     while True:
-        frame = receive_text(websocket, deadline)
+        try:
+            frame = receive_text(websocket, deadline)
+        except (AssertionError, TimeoutError) as error:
+            raise AssertionError(
+                "waiting for VM %d running/ready event: %s; last event was %r"
+                % (vm_id, error, frame)
+            ) from error
         if frame.get("id") != vm_id or frame.get("type") not in ("created", "status"):
             continue
         if frame.get("status") not in ("running", "ready"):
@@ -412,12 +426,16 @@ def receive_until_prompt(websocket, timeout=REQUEST_TIMEOUT):
     while not re.search(rb"axvisor:[^\r\n]*\$ ", output):
         if time.monotonic() >= deadline:
             raise AssertionError("management shell prompt never arrived: %r" % (output[-200:],))
-        opcode, payload = websocket.recv_frame(deadline)
+        try:
+            opcode, payload = websocket.recv_frame(deadline)
+            if opcode == 8:
+                raise AssertionError("WebSocket closed before the shell prompt")
+        except (AssertionError, TimeoutError) as error:
+            raise AssertionError(
+                "management shell prompt: %s; last output was %r" % (error, output[-12000:])
+            ) from error
         if opcode in (1, 2):
             output += payload
-            continue
-        if opcode == 8:
-            raise AssertionError("WebSocket closed before the shell prompt")
     return output
 
 
@@ -426,13 +444,20 @@ def receive_until(websocket, marker, timeout=REQUEST_TIMEOUT):
     deadline = time.monotonic() + timeout
     while marker not in output:
         if time.monotonic() >= deadline:
-            raise AssertionError("WebSocket output did not contain %r" % marker)
-        opcode, payload = websocket.recv_frame(deadline)
+            raise AssertionError(
+                "WebSocket output did not contain %r; last output was %r" % (marker, output[-12000:])
+            )
+        try:
+            opcode, payload = websocket.recv_frame(deadline)
+            if opcode == 8:
+                raise AssertionError("WebSocket closed before output marker")
+        except (AssertionError, TimeoutError) as error:
+            raise AssertionError(
+                "waiting for output marker %r: %s; last output was %r"
+                % (marker, error, output[-12000:])
+            ) from error
         if opcode in (1, 2):
             output += payload
-            continue
-        if opcode == 8:
-            raise AssertionError("WebSocket closed before output marker %r" % marker)
     return output
 
 
@@ -484,8 +509,12 @@ def drain_available(websocket, seconds, label):
                 return out
         try:
             opcode, payload = websocket.recv_frame(deadline)
-        except TimeoutError as error:
-            raise AssertionError("%s: %s" % (label, error)) from error
+            if opcode == 8:
+                raise AssertionError("WebSocket closed during the observation window")
+        except (AssertionError, TimeoutError) as error:
+            raise AssertionError(
+                "%s: %s; last output was %r" % (label, error, out[-12000:])
+            ) from error
         if opcode in (1, 2):
             out += payload
 
@@ -970,7 +999,10 @@ def main():
     check_manifest()
 
     events = expect_upgrade("/ws/events", 101)
-    snapshot = receive_text(events, time.monotonic() + EVENT_TIMEOUT)
+    try:
+        snapshot = receive_text(events, time.monotonic() + EVENT_TIMEOUT)
+    except (AssertionError, TimeoutError) as error:
+        raise AssertionError("initial event snapshot: %s" % error) from error
     if snapshot.get("type") != "snapshot":
         raise AssertionError("first event frame was %r, expected a snapshot" % (snapshot,))
     listed = {vm.get("id"): vm.get("status") for vm in snapshot.get("vms", [])}
