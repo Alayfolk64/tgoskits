@@ -2,6 +2,8 @@
 //! Run separately from `all`, which starts block and network queue services.
 //! Linux sched_cpu_wait_empty() follows smpboot/device hotplug teardown; this
 //! probe tests the final quiescent-owner transaction, not that orchestration.
+//! The reaper is deliberately kept on CPU 0: offlining a target with runnable
+//! background services remains outside this test's coverage.
 use std::{
     println,
     sync::{
@@ -39,6 +41,7 @@ impl Drop for ReaperAffinity {
 struct ReaperMigrationProbe {
     observed_cpu: AtomicUsize,
     release: AtomicBool,
+    timed_out: AtomicBool,
 }
 
 struct ReaperMigrationCallback(Arc<ReaperMigrationProbe>);
@@ -52,10 +55,12 @@ impl Drop for ReaperMigrationCallback {
             self.0
                 .observed_cpu
                 .store(ax_hal::percpu::this_cpu_id(), Ordering::Release);
-            assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "reaper migration callback must be released"
-            );
+            if started.elapsed() >= Duration::from_secs(3) {
+                // Report through the probe instead of panicking inside the
+                // production reaper while it owns execution reclamation.
+                self.0.timed_out.store(true, Ordering::Release);
+                return;
+            }
             thread::yield_now();
         }
     }
@@ -81,6 +86,7 @@ fn isolate_reaper_from_offline_targets() -> ReaperAffinity {
         // Failed preparation may drop the capture on this caller. Arm its
         // rendezvous only after the unpublished thread was created successfully.
         release: AtomicBool::new(true),
+        timed_out: AtomicBool::new(false),
     });
     let callback = ReaperMigrationCallback(probe.clone());
     let prepared = ax_runtime::thread::builder("reaper-offline-isolation".into())
@@ -89,7 +95,7 @@ fn isolate_reaper_from_offline_targets() -> ReaperAffinity {
     let cancelled = prepared.thread_handle();
     probe.release.store(false, Ordering::Release);
     drop(prepared);
-    wait_for(|| probe.observed_cpu.load(Ordering::Acquire) == 1);
+    wait_for_reaper_cpu(&probe, 1);
 
     // Execution reclamation and join do not park the background service. Linux
     // CPU hotplug moves workers before sched_cpu_wait_empty(); this final-owner
@@ -97,10 +103,31 @@ fn isolate_reaper_from_offline_targets() -> ReaperAffinity {
     let mut housekeeping = CpuSet::empty(ax_hal::cpu_num());
     housekeeping.insert(CpuId::new(0));
     saved.thread.set_affinity_and_wait(housekeeping).unwrap();
-    wait_for(|| probe.observed_cpu.load(Ordering::Acquire) == 0);
+    wait_for_reaper_cpu(&probe, 0);
     probe.release.store(true, Ordering::Release);
     cancelled.join().unwrap();
+    assert!(
+        !probe.timed_out.load(Ordering::Acquire),
+        "reaper migration callback timed out before release"
+    );
     saved
+}
+
+fn wait_for_reaper_cpu(probe: &ReaperMigrationProbe, cpu: usize) {
+    let started = std::time::Instant::now();
+    while probe.observed_cpu.load(Ordering::Acquire) != cpu
+        && !probe.timed_out.load(Ordering::Acquire)
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "reaper migration callback did not run on CPU {cpu}"
+        );
+        thread::yield_now();
+    }
+    assert!(
+        !probe.timed_out.load(Ordering::Acquire),
+        "reaper migration callback timed out before reaching CPU {cpu}"
+    );
 }
 
 fn idle_polling_ends_before_task_execution() {
