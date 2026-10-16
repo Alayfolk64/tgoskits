@@ -464,11 +464,11 @@ def receive_some(websocket, deadline):
         return payload
 
 
-def drain_available(websocket, seconds):
+def drain_available(websocket, seconds, label):
     """Collect frames while the time window is open; an idle lane returns b"".
 
-    Frame completion shares this time window. EOF and incomplete-frame timeouts
-    propagate rather than returning a partial frame or silently losing bytes.
+    Frame completion shares this time window. An incomplete frame fails the
+    labeled isolation check instead of silently returning partial output.
     """
     out = b""
     deadline = time.monotonic() + seconds
@@ -481,7 +481,10 @@ def drain_available(websocket, seconds):
             ready, _, _ = select.select([websocket.stream], [], [], remaining)
             if not ready:
                 return out
-        opcode, payload = websocket.recv_frame(deadline)
+        try:
+            opcode, payload = websocket.recv_frame(deadline)
+        except TimeoutError as error:
+            raise AssertionError("%s: %s" % (label, error)) from error
         if opcode in (1, 2):
             out += payload
 
@@ -870,14 +873,14 @@ def check_lifecycle(events):
         time.monotonic() + GUEST_BOOT_DEADLINE,
         "guest ran a second command with the management lane attached",
     )
-    stray = drain_available(shell, 2.0)
+    stray = drain_available(shell, 2.0, "management lane while guest command runs")
     if GUEST_ISOLATION_RESULT in stray:
         raise AssertionError("guest output leaked into the management lane: %r" % (stray[-200:],))
     shell.send_binary(b"vm list\r")
     receive_output_until(
         shell, b"VM ID", time.monotonic() + REQUEST_TIMEOUT * 3, "management lane lists VMs"
     )
-    stray = drain_available(guest, 2.0)
+    stray = drain_available(guest, 2.0, "guest lane while management command runs")
     if b"VM ID" in stray or b"linux-web-ui" in stray:
         raise AssertionError("management output leaked into the guest lane: %r" % (stray[-200:],))
     shell.close()

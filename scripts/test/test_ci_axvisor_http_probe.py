@@ -35,7 +35,8 @@ def text_frame(value):
 def receive(probe, reader, websocket):
     # drain_available takes a duration; the other readers take a deadline.
     bound = 0.1 if reader == "drain_available" else time.monotonic() + 1.0
-    return getattr(probe, reader)(websocket, bound)
+    args = ("console isolation",) if reader == "drain_available" else ()
+    return getattr(probe, reader)(websocket, bound, *args)
 
 
 class ProbeFrameTests(unittest.TestCase):
@@ -126,8 +127,15 @@ class ProbeFrameTests(unittest.TestCase):
                         duration = deadline - clock_source()
                         bound = duration if reader == "drain_available" else deadline
                         with patch.object(probe.time, "monotonic", side_effect=clock_source):
-                            with self.assertRaisesRegex(TimeoutError, "frame.*deadline"):
-                                getattr(probe, reader)(websocket, bound)
+                            if reader == "drain_available":
+                                with self.assertRaisesRegex(
+                                    AssertionError, "console isolation:.*frame.*deadline"
+                                ) as caught:
+                                    probe.drain_available(websocket, bound, "console isolation")
+                                self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+                            else:
+                                with self.assertRaisesRegex(TimeoutError, "frame.*deadline"):
+                                    getattr(probe, reader)(websocket, bound)
                         if not progress:
                             waits = [call.args[0] for call in stream.settimeout.call_args_list
                                      if call.args[0] != 0.2]
